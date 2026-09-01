@@ -665,3 +665,5 @@ export { ActivityCache } from './services/activity-cache.js';
 
 export { BacktestRunner } from './services/backtest-runner.js';
 export type { BacktestConfig, BacktestResult } from './services/backtest-runner.js';
+export { SignalAuditStore, signalAuditStore } from './services/signal-audit-store.js';
+export type { EdgeStats, FiredSignal, SignalSide, SignalOutcome } from './services/signal-audit-store.js';
