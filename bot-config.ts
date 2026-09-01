@@ -1021,9 +1021,19 @@ async function main() {
   console.log('║  All Features: Smart Money | Arb | DipArb | OnChain | Binance      ║');
   console.log('╚════════════════════════════════════════════════════════════════════╝\n');
 
-  if (!process.env.POLYMARKET_PRIVATE_KEY) {
-    log('ERROR', 'POLYMARKET_PRIVATE_KEY not found');
+  // Paper mode: DRY_RUN defaults to true (process.env.DRY_RUN !== 'false').
+  // A missing key boots with an ephemeral read-only wallet — the bot runs
+  // the full quorum pipeline (ingest → screen → seed → funnel logs) but
+  // cannot and will not place orders. Live mode requires a real key.
+  const hasKey = Boolean(process.env.POLYMARKET_PRIVATE_KEY);
+  if (!hasKey && !CONFIG.dryRun) {
+    log('ERROR', 'POLYMARKET_PRIVATE_KEY required for live trading (DRY_RUN=false). Set it in Zeabur → Service → Variables.');
     process.exit(1);
+  }
+  if (!hasKey) {
+    log('WARN', 'POLYMARKET_PRIVATE_KEY not set — booting in PAPER MODE (read-only, no orders).');
+    log('WARN', 'Set POLYMARKET_PRIVATE_KEY in Zeabur → Service → Variables to enable live copy trading.');
+    process.env.POLYMARKET_PRIVATE_KEY = '0x' + '11'.repeat(32);  // ephemeral, never funds anything
   }
 
   log('INFO', 'Configuration', {
