@@ -42,21 +42,27 @@ export type MarketCategory =
   | 'crypto'
   | 'politics'
   | 'sports'
+  | 'esports'
   | 'entertainment'
   | 'economics'
   | 'science'
   | 'other';
 
 /**
- * Keywords for market categorization by category
+ * Keywords for market categorization by category.
+ *
+ * Categories are checked in priority order — the FIRST match wins, so
+ * more specific categories (esports, politics) are listed before broader
+ * fallbacks (entertainment, science). 'other' is the catch-all.
  */
 export const CATEGORY_KEYWORDS: Record<MarketCategory, RegExp> = {
-  crypto: /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto|doge|ada|matic)\b/i,
-  politics: /\b(trump|biden|election|president|senate|congress|vote|political|maga|democrat|republican)\b/i,
-  sports: /\b(nfl|nba|mlb|nhl|super bowl|world cup|championship|game|match|ufc|soccer|football|basketball)\b/i,
-  economics: /\b(fed|interest rate|inflation|gdp|recession|economic|unemployment|cpi)\b/i,
-  entertainment: /\b(oscar|grammy|movie|twitter|celebrity|entertainment|netflix|spotify)\b/i,
-  science: /\b(spacex|nasa|ai|openai|google|apple|tesla|tech|technology|science)\b/i,
+  crypto: /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto|doge|ada|matic|cardano|polkadot|avax|toncoin|ton|stablecoin|usdc|usdt|altcoin|defi|dex|swap|halving|airdrop|staking|yield)\b/i,
+  politics: /\b(trump|biden|election|president|senate|congress|vote|political|maga|democrat|republican|governor|mayor|polls|primary|caucus|impeach|pelosi|gop|dnc|rnc|ballot|cabinet|legislat|amendment|partisan)\b/i,
+  sports: /\b(nfl|nba|mlb|nhl|super bowl|world cup|championship|game|match|ufc|soccer|football|basketball|baseball|tennis|golf|boxing|mma|olympics|ncaa|premier league|la liga|bundesliga|serie a|ligue 1|champions league|epl|copa|del rey|fa cup|stanley cup|playoff|quarterback|touchdown|hat trick)\b/i,
+  esports: /\b(esports|e-sports|valorant|csgo|cs2|counter-strike|counter strike|lol|league of legends|dota|dota 2|overwatch|apex legends|fortnite|call of duty|cod|warzone|rocket league|hearthstone|starcraft|pubg|rainbow six|r6|twitch|gaming|gamer|pro league|grand final|the international)\b/i,
+  economics: /\b(fed|interest rate|inflation|gdp|recession|economic|unemployment|cpi|powell|taper|rate hike|rate cut|jobs report|nfp|nonfarm|consumer price|treasury|bond yield|yield curve|housing starts|wage growth|consumer confidence|pmi|ism|fomc)\b/i,
+  entertainment: /\b(oscar|grammy|movie|film|twitter|celebrity|entertainment|netflix|spotify|disney|marvel|dc|emmy|tony award|album|artist|actor|actress|box office|theater|premiere|streaming|tiktok|youtube|reality tv|kardashian)\b/i,
+  science: /\b(spacex|nasa|ai|openai|google|apple|tesla|tech|technology|science|chatgpt|gpt|llm|anthropic|claude|gemini|deepmind|quantum|nvidia|amd|chip|semiconductor|robot|space|rocket|mars|climate|carbon|emission|gene|crispr|vaccine|fda|drug|trial)\b/i,
   other: /.*/, // Matches everything as fallback
 };
 
@@ -79,10 +85,13 @@ export const CATEGORY_KEYWORDS: Record<MarketCategory, RegExp> = {
 export function categorizeMarket(title: string): MarketCategory {
   const lowerTitle = title.toLowerCase();
 
-  // Check each category in priority order
+  // Check each category in priority order. Esports is checked BEFORE
+  // entertainment because 'league' alone is ambiguous but 'league of
+  // legends' must hit esports.
   if (CATEGORY_KEYWORDS.crypto.test(lowerTitle)) return 'crypto';
   if (CATEGORY_KEYWORDS.politics.test(lowerTitle)) return 'politics';
   if (CATEGORY_KEYWORDS.sports.test(lowerTitle)) return 'sports';
+  if (CATEGORY_KEYWORDS.esports.test(lowerTitle)) return 'esports';
   if (CATEGORY_KEYWORDS.economics.test(lowerTitle)) return 'economics';
   if (CATEGORY_KEYWORDS.entertainment.test(lowerTitle)) return 'entertainment';
   if (CATEGORY_KEYWORDS.science.test(lowerTitle)) return 'science';
@@ -364,6 +373,7 @@ export const CATEGORY_COLORS: Record<MarketCategory, string> = {
   crypto: '#f7931a',      // Bitcoin orange
   politics: '#3b82f6',    // Blue
   sports: '#22c55e',      // Green
+  esports: '#ec4899',     // Pink/magenta — distinct from entertainment
   entertainment: '#a855f7', // Purple
   economics: '#eab308',   // Yellow
   science: '#06b6d4',     // Cyan
@@ -377,6 +387,7 @@ export const CATEGORY_LABELS: Record<MarketCategory, string> = {
   crypto: 'Crypto',
   politics: 'Politics',
   sports: 'Sports',
+  esports: 'Esports',
   entertainment: 'Entertainment',
   economics: 'Economics',
   science: 'Science',

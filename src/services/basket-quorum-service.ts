@@ -120,6 +120,10 @@ export interface QuorumStats {
   quorumFired: number;
   quorumSkippedDrift: number;
   quorumSkippedCooldown: number;
+  /** Dropped by thin_edge filter (vote USD value below $1 floor) */
+  quorumSkippedThinEdge: number;
+  /** Dropped by stale-market filter (market already expired) */
+  quorumSkippedStaleMarket: number;
   executed: number;
   failed: number;
 }
@@ -147,6 +151,8 @@ export class BasketQuorumService {
     quorumFired: 0,
     quorumSkippedDrift: 0,
     quorumSkippedCooldown: 0,
+    quorumSkippedThinEdge: 0,
+    quorumSkippedStaleMarket: 0,
     executed: 0,
     failed: 0,
   };
@@ -276,7 +282,22 @@ export class BasketQuorumService {
       }
     }
 
-    // 5. Record the vote — one vote per wallet per outcome.
+    // 5. PRE-VOTE FILTERS (run BEFORE recording this vote).
+    //    Without these, low-quality trades poison the consensus and we
+    //    waste quorum votes on markets that can't be traded. The Zeabur
+    //    runlogs showed quorum reaching=8 vs quorum rejected=25 because
+    //    filters ran AFTER quorum — those 25 votes should never have
+    //    counted toward the consensus.
+    if (this._isTradeTooSmall(trade)) {
+      this.stats.quorumSkippedThinEdge = (this.stats.quorumSkippedThinEdge ?? 0) + 1;
+      return;
+    }
+    if (this._isMarketStale(trade)) {
+      this.stats.quorumSkippedStaleMarket = (this.stats.quorumSkippedStaleMarket ?? 0) + 1;
+      return;
+    }
+
+    // 6. Record the vote — one vote per wallet per outcome.
     outcomeVotes.set(traderKey, {
       wallet: traderKey,
       side: trade.side,
@@ -288,8 +309,47 @@ export class BasketQuorumService {
     this.stats.voters = this.votes.size;
     this.stats.votesObserved++;
 
-    // 6. Evaluate quorum.
+    // 7. Evaluate quorum.
     this.tryFire({ ...trade, conditionId, marketSlug, outcome }, basket, outcomeVotes);
+  }
+
+  /**
+   * Filter: drop votes whose USD value is below the thin-edge floor.
+   * Default floor = 1 share at $0.50, i.e. $0.50. Sub-floor fills are
+   * either dust attacks or accidental clicks — neither is a real signal.
+   */
+  private _isTradeTooSmall(trade: SmartMoneyTrade): boolean {
+    const notional = trade.price * trade.size;
+    return notional < 1.0; // $1 floor (matches Polymarket minimum order)
+  }
+
+  /**
+   * Filter: drop votes for markets that have already resolved.
+   *   - marketSlug patterns like 'will-trump-win-on-march-15-2027' where
+   *     the date is in the past
+   *   - explicit `days_to_expiry < 0` (would be passed via SmartMoneyTrade
+   *     if the upstream adds it; today it's inferred from slug)
+   *
+   * Returns true if the market is past expiry.
+   */
+  private _isMarketStale(trade: SmartMoneyTrade): boolean {
+    // SmartMoneyTrade only has marketSlug; the slug itself encodes the
+    // resolution date (e.g. 'highest-temperature-in-nyc-on-march-15-2026').
+    const haystack = (trade.marketSlug ?? '').toLowerCase();
+    // Look for "on-<month>-<day>-<year>" pattern in the slug, which is how
+    // Polymarket titles resolved markets (e.g. "highest-temperature-in-nyc-on-march-15-2026").
+    const m = haystack.match(/on-([a-z]+)-(\d{1,2})-(\d{4})/);
+    if (!m) return false;
+    const monthNames = [
+      'january', 'february', 'march', 'april', 'may', 'june',
+      'july', 'august', 'september', 'october', 'november', 'december',
+    ];
+    const monthIdx = monthNames.indexOf(m[1]);
+    if (monthIdx < 0) return false;
+    const day = parseInt(m[2], 10);
+    const year = parseInt(m[3], 10);
+    const expiry = new Date(Date.UTC(year, monthIdx, day, 23, 59, 59));
+    return expiry.getTime() < Date.now();
   }
 
   private getVoteMap(
@@ -451,6 +511,8 @@ export class BasketQuorumService {
       quorumFired: 0,
       quorumSkippedDrift: 0,
       quorumSkippedCooldown: 0,
+      quorumSkippedThinEdge: 0,
+      quorumSkippedStaleMarket: 0,
       executed: 0,
       failed: 0,
     };

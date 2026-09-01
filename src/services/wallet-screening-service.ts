@@ -329,6 +329,7 @@ export class WalletScreeningService {
       'crypto',
       'politics',
       'sports',
+      'esports',
       'economics',
       'science',
       'entertainment',
