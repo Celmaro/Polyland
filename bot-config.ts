@@ -80,7 +80,7 @@ const CONFIG = {
   },
 
   smartMoney: {
-    enabled: true,
+    enabled: true,  // basket-quorum copy trading — do NOT disable
     topN: 20,
     // 🔴 FIXED: Stricter criteria
     minWinRate: 0.60,  // Up from 0.50 to 60%
@@ -1066,10 +1066,10 @@ async function main() {
   // subscribeSmartMoneyTrades feed; BasketQuorumService filters onTrade for
   // wallets it owns and routes through its own consensus logic).
   await setupBasketQuorum(sdk);
-  await setupSmartMoney(sdk);
-  await setupArbitrage(sdk);
-  await setupDipArb(sdk);
-  await setupDirectTrading(sdk);
+  // setupSmartMoney(sdk); // disabled — only basket quorum copy trading runs
+  // setupArbitrage(sdk);  // disabled — arbitrage not used
+  // setupDipArb(sdk);     // disabled — dipArb not used
+  // await setupDirectTrading(sdk);  // disabled — directTrading not used
 
   displayStatus();
   setInterval(displayStatus, 60000);
