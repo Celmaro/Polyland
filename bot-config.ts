@@ -502,6 +502,7 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);
   basketQuorum.setStateStore(stateStore);
+  basketQuorum.setGammaApi(sdk.gammaApi);
 
   // Collect wallets from all sources (manual + auto)
   log('QUORUM', 'Collecting wallets...');

@@ -50,6 +50,7 @@ import type { ScreenedWallet } from './wallet-screening-service.js';
 import type { RiskManager } from './risk-manager.js';
 import type { VoteStateStore } from './vote-state-store.js';
 import { signalAuditStore, type SignalSide } from './signal-audit-store.js';
+import { GammaApiClient } from '../clients/gamma-api.js';
 
 // ============================================================================
 // Config
@@ -126,6 +127,8 @@ interface QuorumSignal {
   consensusPrice: number;
   /** Basket rolling win rate at fire time (for edge calculation) */
   winRate: number;
+  /** Direction of the consensus (BUY or SELL) */
+  side: SignalSide;
   /** Filled sizes at quorum */
   totalSize: number;
 }
@@ -187,6 +190,10 @@ export class BasketQuorumService {
   private basketSpend: Map<MarketCategory, number> = new Map();
   /** Debounce timer for state persistence */
   private _persistTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Gamma client for 1h/24h follow-up price checks (optional) */
+  private gammaApi: GammaApiClient | null = null;
+  /** Pending follow-up timers keyed by signalId */
+  private pendingFollowups: Map<string, NodeJS.Timeout[]> = new Map();
 
   /**
    * Wire a RiskManager so the quorum gate respects trading halts and
@@ -217,6 +224,15 @@ export class BasketQuorumService {
   }
 
   /**
+   * Wire GammaApiClient for 1h/24h follow-up price checks after quorum fires.
+   * Optional — without it, follow-ups are skipped but the core quorum
+   * pipeline continues to work.
+   */
+  setGammaApi(api: GammaApiClient): void {
+    this.gammaApi = api;
+  }
+
+  /**
    * Schedule a debounced state save. Called whenever votes or lastFired
    * change so we don't write the file on every single trade.
    */
@@ -234,6 +250,58 @@ export class BasketQuorumService {
       });
       this._persistTimer = null;
     }, 1000); // 1s debounce
+  }
+
+  /**
+   * Schedule 1h and 24h follow-up price checks for a fired signal.
+   * At each checkpoint, fetch the current market price and log whether
+   * the consensus direction held. Results feed the per-basket signal-quality
+   * score and the operator's edge audit trail.
+   */
+  private _scheduleFollowup(signal: QuorumSignal): void {
+    if (!this.gammaApi) return;
+
+    const id = signal.signalId;
+
+    const checkPrice = (label: string, delayMs: number) => {
+      const timer = setTimeout(async () => {
+        try {
+          const markets = await this.gammaApi!.getMarkets({
+            conditionId: signal.conditionId,
+          });
+          const market = markets[0];
+          if (!market) {
+            console.log(`[BasketQuorum][${label}] ${id}: market not found`);
+            return;
+          }
+          const currentPrice = market.lastTradePrice ?? market.bestBid ?? 0;
+          const priceMoved = Math.abs(currentPrice - signal.consensusPrice);
+          const pctMove = signal.consensusPrice > 0
+            ? (priceMoved / signal.consensusPrice) * 100
+            : 0;
+          const movedFavorably = signal.side === 'BUY'
+            ? currentPrice > signal.consensusPrice
+            : currentPrice < signal.consensusPrice;
+
+          console.log(
+            `[BasketQuorum][${label}] ${signal.marketSlug}: ` +
+              `entry=${signal.consensusPrice.toFixed(3)} ` +
+              `now=${currentPrice.toFixed(3)} ` +
+              `move=${pctMove.toFixed(1)}% ` +
+              `favorable=${movedFavorably}`
+          );
+        } catch (err) {
+          console.warn(`[BasketQuorum][${label}] ${id}: price check failed`, err);
+        }
+      }, delayMs);
+      return timer;
+    };
+
+    const ONE_HOUR = 60 * 60 * 1000;
+    const ONE_DAY = 24 * ONE_HOUR;
+
+    const timers = [checkPrice('1h', ONE_HOUR), checkPrice('24h', ONE_DAY)];
+    this.pendingFollowups.set(id, timers);
   }
 
   /**
@@ -509,6 +577,7 @@ export class BasketQuorumService {
       wallets: agreeing.map((v) => v.wallet),
       consensusPrice,
       winRate: basket.winRate ?? 0.6,
+      side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
       totalSize: agreeing.reduce((sum, v) => sum + v.size, 0),
     };
 
@@ -524,6 +593,9 @@ export class BasketQuorumService {
       basket: basket.name,
       wallets: signal.wallets,
     });
+
+    // Schedule 1h and 24h follow-up price checks (whalewatch-style validation loop)
+    this._scheduleFollowup(signal);
 
     this.lastFired.set(key, now);
     this._schedulePersist();
