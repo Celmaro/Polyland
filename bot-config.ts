@@ -40,6 +40,7 @@ import {
   type BinanceKLine,
   type BasketQuorumConfig,
 } from './src/index.js';
+import { signalAuditStore } from './src/services/signal-audit-store.js';
 
 // ============================================================================
 // CONFIGURATION
@@ -967,52 +968,40 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
 
 function displayStatus() {
   const runtime = Math.round((Date.now() - state.startTime) / 1000 / 60);
+  const mode = CONFIG.dryRun ? 'DRY RUN' : 'LIVE';
+  const status = state.permanentlyHalted ? 'HALTED' : state.isPaused ? 'PAUSED' : 'ACTIVE';
 
-  console.log('\n' + '═'.repeat(80));
-  console.log('           POLYMARKET TRADING BOT v3.0 - ENHANCED RISK MANAGEMENT');
-  console.log('═'.repeat(80));
-  console.log(`  Runtime:        ${runtime} minutes`);
-  console.log(`  Mode:           ${CONFIG.dryRun ? '🧪 DRY RUN' : '🔴 LIVE TRADING'}`);
-  console.log(`  Status:         ${state.permanentlyHalted ? '🛑 HALTED (TOTAL LOSS)' : state.isPaused ? '⏸️ PAUSED' : '✅ ACTIVE'}`);
-  console.log('─'.repeat(80));
-  console.log('  BALANCES:');
-  console.log(`    MATIC:        ${state.maticBalance.toFixed(4)}`);
-  console.log(`    USDC:         $${state.usdcBalance.toFixed(2)}`);
-  console.log(`    USDC.e:       $${state.usdcEBalance.toFixed(2)}`);
-  console.log('─'.repeat(80));
-  console.log('  PnL & CAPITAL:');
-  console.log(`    Daily:        $${state.dailyPnL >= 0 ? '+' : ''}${state.dailyPnL.toFixed(2)} / $${(CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct).toFixed(2)} limit (${(CONFIG.risk.dailyMaxLossPct * 100).toFixed(0)}%)`);
-  console.log(`    Monthly:      $${state.monthlyPnL >= 0 ? '+' : ''}${state.monthlyPnL.toFixed(2)} / $${(CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct).toFixed(2)} limit (${(CONFIG.risk.monthlyMaxLossPct * 100).toFixed(0)}%)`);
-  console.log(`    Total:        $${state.totalPnL >= 0 ? '+' : ''}${state.totalPnL.toFixed(2)}`);
-  console.log(`    Current:      $${state.currentCapital.toFixed(2)} (Peak: $${state.peakCapital.toFixed(2)})`);
-  console.log(`    Drawdown:     ${(state.currentDrawdown * 100).toFixed(1)}% / ${(CONFIG.risk.maxDrawdownFromPeak * 100).toFixed(0)}% max`);
-  console.log(`    Arb Profit:   $${state.arbProfit >= 0 ? '+' : ''}${state.arbProfit.toFixed(2)}`);
-  console.log('─'.repeat(80));
-  console.log('  RISK STATUS:');
+  // Pull live quorum funnel + edge audit stats.
+  const f = basketQuorum ? basketQuorum.getStats() : null;
+  const e = signalAuditStore.getStats();
+
+  const lines: string[] = [];
+  lines.push(`[status] t=${runtime}m mode=${mode} ${status}`);
+  if (f) {
+    const conversion = f.votesObserved === 0 ? 0 : (f.executed / f.votesObserved * 100).toFixed(1);
+    lines.push(
+      `[quorum] observed=${f.votesObserved} filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket}` +
+      `(thin=${f.quorumSkippedThinEdge},stale=${f.quorumSkippedStaleMarket}) fired=${f.quorumFired}` +
+      ` risk=${f.quorumSkippedRiskHalt} bankroll=${f.quorumSkippedBankroll} drift=${f.quorumSkippedDrift}` +
+      ` executed=${f.executed} failed=${f.failed} conv=${conversion}%`
+    );
+  }
+  if (e.signalsSettled > 0) {
+    lines.push(
+      `[edge] exp=${e.meanExpectedEdge.toFixed(4)} real=${e.meanRealizedEdge.toFixed(4)}` +
+      ` alpha=${e.edgeAlpha.toFixed(4)} sig=${e.isSignificant}` +
+      ` (n=${e.signalsSettled} settled/${e.signalsFired} fired)`
+    );
+  } else {
+    lines.push(`[edge] no settled signals yet (fired=${e.signalsFired})`);
+  }
   const dailyPct = (Math.abs(state.dailyPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
   const monthlyPct = (Math.abs(state.monthlyPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
-  const totalPct = (Math.abs(state.totalPnL) / CONFIG.capital.totalUsd * 100).toFixed(1);
-  const dailyStatus = state.dailyPnL <= -(CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct) ? '🔴 BREACHED' : '✅ OK';
-  const monthlyStatus = state.monthlyPnL <= -(CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct) ? '🔴 BREACHED' : '✅ OK';
-  const drawdownStatus = state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak ? '🔴 BREACHED' : '✅ OK';
-  console.log(`    Daily Limit:  ${dailyStatus} (${dailyPct}% used)`);
-  console.log(`    Monthly Limit:${monthlyStatus} (${monthlyPct}% used)`);
-  console.log(`    Drawdown:     ${drawdownStatus} (${(state.currentDrawdown * 100).toFixed(1)}%)`);
-  console.log(`    Consecutive:  ${state.consecutiveLosses} losses | ${state.consecutiveWins} wins`);
-  console.log('─'.repeat(80));
-  console.log('  STRATEGIES:');
-  console.log(`    Smart Money:  ${state.smartMoneyTrades} trades | ${state.followedWallets.length} wallets`);
-  console.log(`    Arbitrage:    ${state.arbTrades} trades | ${state.activeArbMarket || 'scanning'}`);
-  console.log(`    DipArb:       ${state.dipArbTrades} trades | ${state.activeDipArbMarket || 'waiting'}`);
-  console.log(`    Direct:       ${state.directTrades} trades`);
-  console.log('─'.repeat(80));
-  console.log('  ON-CHAIN:');
-  console.log(`    Splits:       ${state.splits} | Merges: ${state.merges} | Redeems: ${state.redeems}`);
-  console.log(`    Swaps:        ${state.swaps}`);
-  console.log('─'.repeat(80));
-  console.log('  TRENDS:');
-  console.log(`    BTC: ${state.btcTrend.toUpperCase().padEnd(8)} ETH: ${state.ethTrend.toUpperCase().padEnd(8)} SOL: ${state.solTrend.toUpperCase()}`);
-  console.log('═'.repeat(80) + '\n');
+  lines.push(
+    `[risk] daily=${dailyPct}% monthly=${monthlyPct}% drawdown=${(state.currentDrawdown * 100).toFixed(1)}%` +
+    ` streak=${state.consecutiveLosses}L/${state.consecutiveWins}W`
+  );
+  console.log(lines.join('\n'));
 }
 
 // ============================================================================
@@ -1021,10 +1010,8 @@ function displayStatus() {
 
 async function main() {
   console.clear();
-  console.log('╔════════════════════════════════════════════════════════════════════╗');
-  console.log('║          POLYMARKET COMPLETE TRADING BOT v3.0                      ║');
-  console.log('║  All Features: Smart Money | Arb | DipArb | OnChain | Binance      ║');
-  console.log('╚════════════════════════════════════════════════════════════════════╝\n');
+  console.log('POLYMARKET BASKET-QUORUM COPY TRADER v1.0');
+  console.log('mode: ' + (CONFIG.dryRun ? 'DRY RUN (paper)' : 'LIVE') + '\n');
 
   // Paper mode: DRY_RUN defaults to true (process.env.DRY_RUN !== 'false').
   // A missing key boots with an ephemeral read-only wallet — the bot runs
