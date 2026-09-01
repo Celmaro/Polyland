@@ -34,6 +34,7 @@
 import type { WalletService, WalletProfile } from './wallet-service.js';
 import type { RawCandidate } from './wallet-ingestion-service.js';
 import { categorizeMarket, type MarketCategory } from './smart-money-service.js';
+import type { ActivityCache } from './activity-cache.js';
 
 // ============================================================================
 // Config
@@ -109,10 +110,20 @@ export interface ScreenedWallet {
 export class WalletScreeningService {
   private walletService: WalletService;
   private config: WalletScreeningConfig;
+  /** Optional activity cache — avoids re-fetching recent activity every cycle. */
+  private activityCache: ActivityCache | null = null;
 
   constructor(walletService: WalletService, config: Partial<WalletScreeningConfig> = {}) {
     this.walletService = walletService;
     this.config = { ...DEFAULT_SCREENING_CONFIG, ...config };
+  }
+
+  /**
+   * Wire an activity cache so the inference path doesn't re-fetch every cycle.
+   * Pass `null` to disable caching.
+   */
+  setActivityCache(cache: ActivityCache): void {
+    this.activityCache = cache;
   }
 
   /**
@@ -134,21 +145,23 @@ export class WalletScreeningService {
     // resolution. We need to know which basket a manual wallet belongs in.
     const toScore = candidates;
 
-    // Step 2: fetch profiles with bounded concurrency.
+    // Step 2 + 3 in parallel: fetch profiles AND resolve categories
+    // simultaneously. Each worker pool is bounded, but they don't
+    // block each other — total wall-clock is max(profile, activity)
+    // instead of profile + activity.
     const profiles = new Map<string, WalletProfile | null>();
-    const queue = [...toScore];
-    const workers: Promise<void>[] = [];
+    const profileQueue = [...toScore];
+    const profileWorkers: Promise<void>[] = [];
     for (let i = 0; i < this.config.profileFetchConcurrency; i++) {
-      workers.push(
+      profileWorkers.push(
         (async () => {
-          while (queue.length > 0) {
-            const c = queue.shift();
+          while (profileQueue.length > 0) {
+            const c = profileQueue.shift();
             if (!c) return;
             try {
               const profile = await this.walletService.getWalletProfile(c.address);
               profiles.set(c.address, profile);
             } catch (err) {
-              // Treat a fetch failure as "no data" — the screen will mark WATCHLIST.
               console.warn(
                 `[WalletScreening] profile fetch failed for ${c.address}:`,
                 err instanceof Error ? err.message : err
@@ -159,15 +172,15 @@ export class WalletScreeningService {
         })()
       );
     }
-    await Promise.all(workers);
 
-    // Step 3: resolve the category for every candidate.
-    //   - If manual hint exists and is locked → manual.
-    //   - Else if manual hint exists → use it as primary (manual > auto > inferred).
-    //   - Else if auto leaderboard category exists → auto.
-    //   - Else → infer from activity (uses the already-fetched profile's
-    //     activeMarkets plus an extra activity fetch).
-    const resolvedCategories = await this.resolveCategories(toScore);
+    // Categories can resolve from manual/auto hints immediately, only the
+    // inference path needs activity fetches. We start category work in
+    // parallel with the profile pool above.
+    const resolvedCategoriesPromise = this.resolveCategories(toScore);
+
+    // Wait for both pools to drain.
+    await Promise.all([...profileWorkers, resolvedCategoriesPromise]);
+    const resolvedCategories = await resolvedCategoriesPromise;
 
     // Step 4: score each candidate with its resolved category.
     // Bypass wallets short-circuit the quality screen but still get category
@@ -264,11 +277,20 @@ export class WalletScreeningService {
             const c = queue.shift();
             if (!c) return;
             try {
-              const activity = await this.walletService.getWalletActivity(
-                c.address,
-                50, // last 50 trades is enough to bucket
-              );
-              const inferred = this.inferCategoryFromActivity(activity.activities);
+              // Cache check — avoid re-fetching recent activity every cycle.
+              let activities: ReadonlyArray<{ title?: string; slug?: string; marketSlug?: string }>;
+              const cached = this.activityCache?.get<{ activities: typeof activities }>(c.address);
+              if (cached) {
+                activities = cached.activities;
+              } else {
+                const activity = await this.walletService.getWalletActivity(
+                  c.address,
+                  50, // last 50 trades is enough to bucket
+                );
+                activities = activity.activities as typeof activities;
+                this.activityCache?.set(c.address, { activities: [...activities] });
+              }
+              const inferred = this.inferCategoryFromActivity(activities);
               out.set(c.address, inferred);
             } catch (err) {
               console.warn(

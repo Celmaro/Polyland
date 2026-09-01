@@ -47,6 +47,8 @@ import type { TradingService, OrderResult } from './trading-service.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
 import { categorizeMarket, type MarketCategory } from './smart-money-service.js';
 import type { ScreenedWallet } from './wallet-screening-service.js';
+import type { RiskManager } from './risk-manager.js';
+import type { VoteStateStore } from './vote-state-store.js';
 
 // ============================================================================
 // Config
@@ -84,6 +86,13 @@ export interface BasketQuorumConfig {
   minTradeSize: number;
   dryRun: boolean;
   baskets: BasketConfig[];
+  /**
+   * Per-basket bankroll slice as a fraction of total capital (0-1).
+   * The total must sum to <= 1.0. When sum < 1.0 the remainder is kept
+   * unallocated as a reserve. Mirrors Polyland's `strategyAllocation` in
+   * bot-config.ts and PredictEngine's per-strategy capital isolation.
+   */
+  bankrollAllocation?: Partial<Record<MarketCategory, number>>;
 }
 
 // ============================================================================
@@ -124,6 +133,10 @@ export interface QuorumStats {
   quorumSkippedThinEdge: number;
   /** Dropped by stale-market filter (market already expired) */
   quorumSkippedStaleMarket: number;
+  /** Dropped because the RiskManager halted trading */
+  quorumSkippedRiskHalt: number;
+  /** Dropped because the basket's bankroll slice is exhausted */
+  quorumSkippedBankroll: number;
   executed: number;
   failed: number;
 }
@@ -153,9 +166,78 @@ export class BasketQuorumService {
     quorumSkippedCooldown: 0,
     quorumSkippedThinEdge: 0,
     quorumSkippedStaleMarket: 0,
+    quorumSkippedRiskHalt: 0,
+    quorumSkippedBankroll: 0,
     executed: 0,
     failed: 0,
   };
+
+  /** Optional RiskManager — gates every execution. */
+  private riskManager: RiskManager | null = null;
+  /** Optional VoteStateStore — persists votes + lastFired across restarts. */
+  private stateStore: VoteStateStore | null = null;
+  /** Per-basket spend tracker (USDC spent on this basket) */
+  private basketSpend: Map<MarketCategory, number> = new Map();
+  /** Debounce timer for state persistence */
+  private _persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Wire a RiskManager so the quorum gate respects trading halts and
+   * dynamic sizing. Optional — without it, no risk enforcement.
+   */
+  setRiskManager(risk: RiskManager): void {
+    this.riskManager = risk;
+  }
+
+  /**
+   * Wire a VoteStateStore so vote state survives process restarts.
+   * Pruning is applied on load (drops votes older than the longest
+   * configured basket window).
+   */
+  setStateStore(store: VoteStateStore): void {
+    this.stateStore = store;
+    this.votes = store.votes;
+    this.lastFired = store.lastFired;
+    // Prune anything already past the window
+    let maxWindow = 0;
+    for (const [, basket] of this.baskets) {
+      if (basket.windowMs > maxWindow) maxWindow = basket.windowMs;
+    }
+    const pruned = store.pruneStale(maxWindow);
+    if (pruned > 0) {
+      console.log(`[BasketQuorum] pruned ${pruned} stale votes on load`);
+    }
+  }
+
+  /**
+   * Schedule a debounced state save. Called whenever votes or lastFired
+   * change so we don't write the file on every single trade.
+   */
+  private _schedulePersist(): void {
+    if (!this.stateStore) return;
+    if (this._persistTimer !== null) {
+      clearTimeout(this._persistTimer);
+    }
+    this._persistTimer = setTimeout(() => {
+      this.stateStore?.save().catch((err) => {
+        console.warn(
+          `[BasketQuorum] state persist failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      });
+      this._persistTimer = null;
+    }, 1000); // 1s debounce
+  }
+
+  /**
+   * Compute the maximum USDC a given basket may spend in this session
+   * based on its bankrollAllocation. Default: 100% of RiskManager capital.
+   */
+  private bankrollFor(category: MarketCategory): number {
+    const slice = this.config.bankrollAllocation?.[category] ?? 1.0;
+    const capital = this.riskManager ? this.riskManager.currentCapital() : 1000;
+    return capital * slice;
+  }
 
   constructor(tradingService: TradingService, config: BasketQuorumConfig) {
     this.tradingService = tradingService;
@@ -226,6 +308,8 @@ export class BasketQuorumService {
     // Drop any prior vote state — baskets changed.
     this.votes.clear();
     this.lastFired.clear();
+    this.basketSpend.clear();
+    this._schedulePersist();
     const summary = [...byCategory.entries()]
       .map(([c, ws]) => c + '=' + ws.length)
       .join(', ');
@@ -308,6 +392,7 @@ export class BasketQuorumService {
 
     this.stats.voters = this.votes.size;
     this.stats.votesObserved++;
+    this._schedulePersist();
 
     // 7. Evaluate quorum.
     this.tryFire({ ...trade, conditionId, marketSlug, outcome }, basket, outcomeVotes);
@@ -417,15 +502,31 @@ export class BasketQuorumService {
     };
 
     this.lastFired.set(key, now);
+    this._schedulePersist();
 
-    // 7. Price-band / drift filter — the CRITICAL edge decoy. If the market
-    //    has already moved past maxDrift from consensus entry, skip.
-    this.executeIfInBand(trade, signal);
+    // 7a. Risk halt — if RiskManager says no, don't even check drift.
+    if (this.riskManager && !this.riskManager.canTrade()) {
+      this.stats.quorumSkippedRiskHalt++;
+      return;
+    }
+
+    // 7b. Bankroll slice check — the basket's spend must not exceed its slice.
+    const basketBankroll = this.bankrollFor(basket.category);
+    const spent = this.basketSpend.get(basket.category) ?? 0;
+    if (spent >= basketBankroll) {
+      this.stats.quorumSkippedBankroll++;
+      return;
+    }
+
+    // 7c. Price-band / drift filter — the CRITICAL edge decoy. If the market
+    //     has already moved past maxDrift from consensus entry, skip.
+    this.executeIfInBand(trade, signal, basket);
   }
 
   private async executeIfInBand(
     trade: SmartMoneyTrade,
-    signal: QuorumSignal
+    signal: QuorumSignal,
+    basket: BasketConfig,
   ): Promise<void> {
     // In production, fetch the current market price here via
     //   this.tradingService.getMarketPrice?.(signal.conditionId)
@@ -455,6 +556,18 @@ export class BasketQuorumService {
       if (copyValue > this.config.maxSizePerTrade) {
         copySize = this.config.maxSizePerTrade / signal.consensusPrice;
         copyValue = this.config.maxSizePerTrade;
+      }
+
+      // RiskManager dynamic sizing — shrink/grow based on consecutive outcomes.
+      if (this.riskManager) {
+        copyValue = this.riskManager.sizeOrder(copyValue);
+      }
+
+      // Re-check bankroll after dynamic sizing.
+      const bankroll = this.bankrollFor(basket.category);
+      const spent = this.basketSpend.get(basket.category) ?? 0;
+      if (spent + copyValue > bankroll) {
+        copyValue = Math.max(0, bankroll - spent);
       }
 
       const usdcAmount = copyValue;
@@ -488,6 +601,10 @@ export class BasketQuorumService {
 
       if (result.success) {
         this.stats.executed++;
+        this.basketSpend.set(
+          basket.category,
+          (this.basketSpend.get(basket.category) ?? 0) + usdcAmount,
+        );
       } else {
         this.stats.failed++;
       }
@@ -505,6 +622,11 @@ export class BasketQuorumService {
   reset(): void {
     this.votes.clear();
     this.lastFired.clear();
+    this.basketSpend.clear();
+    if (this._persistTimer !== null) {
+      clearTimeout(this._persistTimer);
+      this._persistTimer = null;
+    }
     this.stats = {
       votesObserved: 0,
       voters: 0,
@@ -513,8 +635,22 @@ export class BasketQuorumService {
       quorumSkippedCooldown: 0,
       quorumSkippedThinEdge: 0,
       quorumSkippedStaleMarket: 0,
+      quorumSkippedRiskHalt: 0,
+      quorumSkippedBankroll: 0,
       executed: 0,
       failed: 0,
     };
+  }
+
+  /**
+   * Record the settled P&L of a trade so the RiskManager can update
+   * its halts, dynamic sizing, and bankroll slice accounting.
+   * Call this from your executor (or the TradingService wrapper) AFTER
+   * the order has been filled/resolved.
+   */
+  recordSettledTrade(pnlUsd: number, ts: number = Date.now(), side: 'BUY' | 'SELL' = 'BUY'): void {
+    if (this.riskManager) {
+      this.riskManager.recordTrade({ pnlUsd, ts, side });
+    }
   }
 }
