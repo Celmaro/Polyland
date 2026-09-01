@@ -49,7 +49,16 @@ import type { WalletService, TimePeriod, LeaderboardSortBy, LeaderboardCategory 
 export interface ManualWalletSpec {
   address: string;
   label?: string;
-  category?: string; // 'politics' | 'crypto' | etc; optional
+  /**
+   * Operator's category hint for this wallet. Goes to the matching basket
+   * (e.g. 'politics', 'crypto', 'sports'). The screening service may
+   * OVERRIDE this if the wallet's actual trade history disagrees (e.g. a
+   * trader you filed under politics turns out to only trade crypto) — set
+   * `lockCategory: true` to force the operator's choice.
+   */
+  category?: string;
+  /** When true, screening won't override the operator-supplied category */
+  lockCategory?: boolean;
   /** Skip screening (operator asserts this wallet). Default false. */
   bypassScreening?: boolean;
 }
@@ -102,6 +111,16 @@ export interface RawCandidate {
   source: WalletSource;
   /** Operator label, if manual */
   label?: string;
+  /**
+   * Category hint. Resolution order (later overrides earlier unless
+   * `lockCategory` is true):
+   *   1. operator-supplied `manual.category`
+   *   2. auto-source `leaderboardCategory`
+   *   3. inferred from activity by WalletScreeningService
+   */
+  hintCategory?: string;
+  /** When true, screening won't override the operator-supplied category */
+  lockCategory?: boolean;
   /** Category hint from leaderboard category (auto) or operator (manual) */
   leaderboardCategory?: LeaderboardCategory;
   /** Auto-source rank (1-based) — undefined for manual */
@@ -226,7 +245,16 @@ export class WalletIngestionService {
       address: m.address.toLowerCase(),
       source: 'manual',
       label: m.label,
-      leaderboardCategory: (m.category?.toUpperCase() as LeaderboardCategory | undefined),
+      // The operator's explicit category hint (lowercased to MarketCategory shape).
+      // Stored as `hintCategory` so screening knows the priority order
+      // (manual → auto → inferred).
+      hintCategory: m.category?.toLowerCase(),
+      lockCategory: m.lockCategory,
+      // Keep `leaderboardCategory` populated too — it's the field the dedup
+      // logic and the screening service treat as "auto-source signal".
+      leaderboardCategory: m.category
+        ? (m.category.toUpperCase() as LeaderboardCategory)
+        : undefined,
       bypassScreening: m.bypassScreening,
     }));
 

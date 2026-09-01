@@ -33,6 +33,7 @@
 
 import type { WalletService, WalletProfile } from './wallet-service.js';
 import type { RawCandidate } from './wallet-ingestion-service.js';
+import { categorizeMarket, type MarketCategory } from './smart-money-service.js';
 
 // ============================================================================
 // Config
@@ -74,6 +75,14 @@ export interface ScreenedWallet {
   source: 'manual' | 'auto' | 'both';
   label?: string;
 
+  // Resolved category — used by BasketQuorumService.seed() to route wallets.
+  // Resolution: manual.hintCategory → auto.leaderboardCategory → activity inference.
+  category: MarketCategory;
+  /** Where the resolved category came from. */
+  categorySource: 'manual' | 'auto' | 'inferred' | 'unset';
+  /** Confidence (0-1) for inferred categories — 1 for manual/auto hints */
+  categoryConfidence: number;
+
   // Computed quality metrics
   consistency: number; // 0-100 composite
   winRate: number;     // 0-1
@@ -109,18 +118,21 @@ export class WalletScreeningService {
   /**
    * Run screening on every candidate. Returns a list of ScreenedWallet.
    * Manual bypasses are honored. Auto + manual converge on the same screen.
+   *
+   * Each wallet gets a resolved `category`:
+   *   1. manual.hintCategory  (operator)
+   *   2. auto.leaderboardCategory  (from leaderboard)
+   *   3. inferred from activity  (most-common categorizeMarket() over recent fills)
+   *   4. 'other'  (last-resort fallback)
+   *
+   * Set `candidate.lockCategory === true` to force the operator's hint
+   * to win even if step 3 would override.
    */
   async score(candidates: RawCandidate[]): Promise<ScreenedWallet[]> {
-    // Step 1: separate manual-bypass from everyone else.
-    const bypassed: ScreenedWallet[] = [];
-    const toScore: RawCandidate[] = [];
-    for (const c of candidates) {
-      if (c.bypassScreening) {
-        bypassed.push(this.makeBypassed(c));
-      } else {
-        toScore.push(c);
-      }
-    }
+    // Every candidate goes through the same pipeline — manual bypass just
+    // means "skip the quality screen" but it does NOT skip category
+    // resolution. We need to know which basket a manual wallet belongs in.
+    const toScore = candidates;
 
     // Step 2: fetch profiles with bounded concurrency.
     const profiles = new Map<string, WalletProfile | null>();
@@ -149,13 +161,180 @@ export class WalletScreeningService {
     }
     await Promise.all(workers);
 
-    // Step 3: score each candidate.
-    const screened: ScreenedWallet[] = [...bypassed];
+    // Step 3: resolve the category for every candidate.
+    //   - If manual hint exists and is locked → manual.
+    //   - Else if manual hint exists → use it as primary (manual > auto > inferred).
+    //   - Else if auto leaderboard category exists → auto.
+    //   - Else → infer from activity (uses the already-fetched profile's
+    //     activeMarkets plus an extra activity fetch).
+    const resolvedCategories = await this.resolveCategories(toScore);
+
+    // Step 4: score each candidate with its resolved category.
+    // Bypass wallets short-circuit the quality screen but still get category
+    // resolution so they land in the right basket.
+    const screened: ScreenedWallet[] = [];
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
-      screened.push(this.evaluate(c, profile));
+      const resolved = resolvedCategories.get(c.address);
+      if (c.bypassScreening) {
+        screened.push(this.makeBypassed(c, resolved));
+      } else {
+        screened.push(this.evaluate(c, profile, resolved));
+      }
     }
     return screened;
+  }
+
+  /**
+   * Resolve the category for each candidate. Returns a map
+   * address -> { category, source, confidence }.
+   */
+  private async resolveCategories(
+    candidates: RawCandidate[],
+  ): Promise<
+    Map<
+      string,
+      {
+        category: MarketCategory;
+        source: 'manual' | 'auto' | 'inferred';
+        confidence: number;
+      }
+    >
+  > {
+    const out = new Map<
+      string,
+      { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number }
+    >();
+
+    // Map leaderboard categories to MarketCategory.
+    const ledgerToCategory: Record<string, MarketCategory> = {
+      POLITICS: 'politics',
+      SPORTS: 'sports',
+      CRYPTO: 'crypto',
+      ECONOMICS: 'economics',
+      FINANCE: 'economics',
+      TECH: 'science',
+      SCIENCE: 'science',
+      CULTURE: 'entertainment',
+      WEATHER: 'other',
+      MENTIONS: 'other',
+      OVERALL: 'other',
+    };
+
+    // First pass: manual hints + auto leaderboard (no network).
+    const needsInference: RawCandidate[] = [];
+    for (const c of candidates) {
+      // 1. Manual hint (always wins if lockCategory or no override possible)
+      if (c.hintCategory && c.lockCategory) {
+        out.set(c.address, {
+          category: this.coerceMarketCategory(c.hintCategory),
+          source: 'manual',
+          confidence: 1.0,
+        });
+        continue;
+      }
+      // 2. Auto leaderboard category
+      if (c.leaderboardCategory) {
+        const cat = ledgerToCategory[c.leaderboardCategory] ?? 'other';
+        out.set(c.address, { category: cat, source: 'auto', confidence: 0.9 });
+        // Still allow inference if manual hint disagrees — but only if not locked.
+        if (!c.hintCategory) continue;
+      }
+      // 3. Manual hint (non-locked)
+      if (c.hintCategory) {
+        out.set(c.address, {
+          category: this.coerceMarketCategory(c.hintCategory),
+          source: 'manual',
+          confidence: 0.95,
+        });
+        continue;
+      }
+      // 4. Need to infer from activity
+      needsInference.push(c);
+    }
+
+    // Second pass: fetch recent activity and classify by market slugs.
+    // Bounded concurrency, same worker-pool pattern as profile fetches.
+    const queue = [...needsInference];
+    const workers: Promise<void>[] = [];
+    for (let i = 0; i < this.config.profileFetchConcurrency; i++) {
+      workers.push(
+        (async () => {
+          while (queue.length > 0) {
+            const c = queue.shift();
+            if (!c) return;
+            try {
+              const activity = await this.walletService.getWalletActivity(
+                c.address,
+                50, // last 50 trades is enough to bucket
+              );
+              const inferred = this.inferCategoryFromActivity(activity.activities);
+              out.set(c.address, inferred);
+            } catch (err) {
+              console.warn(
+                `[WalletScreening] activity fetch failed for ${c.address}:`,
+                err instanceof Error ? err.message : err,
+              );
+              out.set(c.address, {
+                category: 'other',
+                source: 'inferred',
+                confidence: 0,
+              });
+            }
+          }
+        })()
+      );
+    }
+    await Promise.all(workers);
+    return out;
+  }
+
+  /**
+   * Look at the market slugs in a wallet's recent trades and pick the
+   * most-common MarketCategory. Confidence scales with how concentrated
+   * the trades are in a single bucket (a 100%-crypto wallet gets 1.0;
+   * a 50/50 politics/crypto split gets 0.5).
+   */
+  private inferCategoryFromActivity(
+    activities: ReadonlyArray<{ title?: string; slug?: string; marketSlug?: string }>,
+  ): { category: MarketCategory; source: 'inferred'; confidence: number } {
+    const counts = new Map<MarketCategory, number>();
+    let total = 0;
+    for (const a of activities) {
+      const haystack = [a.title ?? '', a.slug ?? '', a.marketSlug ?? '']
+        .filter(Boolean)
+        .join(' ');
+      if (!haystack.trim()) continue;
+      const cat = categorizeMarket(haystack);
+      counts.set(cat, (counts.get(cat) ?? 0) + 1);
+      total++;
+    }
+    if (total === 0) {
+      return { category: 'other', source: 'inferred', confidence: 0 };
+    }
+    let top: MarketCategory = 'other';
+    let topCount = 0;
+    for (const [cat, count] of counts) {
+      if (count > topCount) {
+        top = cat;
+        topCount = count;
+      }
+    }
+    return { category: top, source: 'inferred', confidence: topCount / total };
+  }
+
+  private coerceMarketCategory(hint: string): MarketCategory {
+    const h = hint.toLowerCase();
+    const allowed: MarketCategory[] = [
+      'crypto',
+      'politics',
+      'sports',
+      'economics',
+      'science',
+      'entertainment',
+      'other',
+    ];
+    return (allowed.includes(h as MarketCategory) ? (h as MarketCategory) : 'other');
   }
 
   /**
@@ -176,12 +355,18 @@ export class WalletScreeningService {
 
   // ---- internals --------------------------------------------------------
 
-  private makeBypassed(c: RawCandidate): ScreenedWallet {
+  private makeBypassed(
+    c: RawCandidate,
+    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
+  ): ScreenedWallet {
     return {
       address: c.address,
       tier: 'PRIMARY',
       source: c.source,
       label: c.label,
+      category: resolved?.category ?? 'other',
+      categorySource: resolved?.source ?? 'unset',
+      categoryConfidence: resolved?.confidence ?? 0,
       consistency: 100,
       winRate: 1,
       profitFactor: 999,
@@ -194,10 +379,14 @@ export class WalletScreeningService {
     };
   }
 
-  private evaluate(c: RawCandidate, profile: WalletProfile | null): ScreenedWallet {
+  private evaluate(
+    c: RawCandidate,
+    profile: WalletProfile | null,
+    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
+  ): ScreenedWallet {
     // No profile → too little history to trust → WATCHLIST.
     if (!profile) {
-      return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false);
+      return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false, resolved);
     }
     if (profile.tradeCount < this.config.minTradeCount) {
       return this.buildResult(
@@ -205,7 +394,8 @@ export class WalletScreeningService {
         profile,
         'WATCHLIST',
         `insufficient history (${profile.tradeCount} < ${this.config.minTradeCount})`,
-        false
+        false,
+        resolved,
       );
     }
 
@@ -229,7 +419,7 @@ export class WalletScreeningService {
     const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
 
     if (isBotSuspect) {
-      return this.buildResult(c, profile, 'REJECTED', 'bot signature detected', true);
+      return this.buildResult(c, profile, 'REJECTED', 'bot signature detected', true, resolved);
     }
     if (maxDrawdownPct > this.config.maxDrawdownPct) {
       return this.buildResult(
@@ -237,21 +427,23 @@ export class WalletScreeningService {
         profile,
         'REJECTED',
         `drawdown ${maxDrawdownPct.toFixed(1)}% > ${this.config.maxDrawdownPct}%`,
-        false
+        false,
+        resolved,
       );
     }
     if (consistency >= 85 && profile.winRate >= this.config.minWinRate) {
-      return this.buildResult(c, profile, 'PRIMARY', `consistency ${consistency.toFixed(1)}`, false);
+      return this.buildResult(c, profile, 'PRIMARY', `consistency ${consistency.toFixed(1)}`, false, resolved);
     }
     if (consistency >= this.config.minConsistency) {
-      return this.buildResult(c, profile, 'SATELLITE', `consistency ${consistency.toFixed(1)}`, false);
+      return this.buildResult(c, profile, 'SATELLITE', `consistency ${consistency.toFixed(1)}`, false, resolved);
     }
     return this.buildResult(
       c,
       profile,
       'WATCHLIST',
       `consistency ${consistency.toFixed(1)} below ${this.config.minConsistency}`,
-      false
+      false,
+      resolved,
     );
   }
 
@@ -278,12 +470,16 @@ export class WalletScreeningService {
     tier: WalletTier,
     reason: string,
     isBotSuspect: boolean,
+    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
   ): ScreenedWallet {
     return {
       address: c.address,
       tier,
       source: c.source,
       label: c.label,
+      category: resolved?.category ?? 'other',
+      categorySource: resolved?.source ?? 'unset',
+      categoryConfidence: resolved?.confidence ?? 0,
       consistency: profile
         ? Math.min(
             99.5,

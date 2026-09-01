@@ -190,34 +190,16 @@ export class BasketQuorumService {
       return;
     }
 
-    // Bucket eligible wallets by category. The mapping rule:
-    //   - label-based hint (manual wallets)
-    //   - leaderboardCategory (auto wallets) mapped to MarketCategory
-    //   - fallback to 'other'
+    // The screening service has already resolved each wallet's category
+    // (manual hint → auto leaderboard → inferred from activity).
+    // We just bucket by the resolved category.
     const byCategory = new Map<MarketCategory, string[]>();
-    const ledgerToCategory: Record<string, MarketCategory> = {
-      POLITICS: 'politics',
-      SPORTS: 'sports',
-      CRYPTO: 'crypto',
-      ECONOMICS: 'economics',
-      FINANCE: 'economics',
-      TECH: 'science',
-      SCIENCE: 'science',
-      CULTURE: 'entertainment',
-      WEATHER: 'other',  // Polymeteo's specialty; treat as a separate domain
-      MENTIONS: 'other',
-      OVERALL: 'other',
-    };
-
+    let inferredCount = 0;
+    let otherCount = 0;
     for (const w of eligible) {
-      // Prefer the leaderboardCategory (auto source is more reliable for category).
-      let cat: MarketCategory = 'other';
-      if (w.label) {
-        const fromLabel = w.label.toLowerCase();
-        if (fromLabel in ledgerToCategory) cat = ledgerToCategory[fromLabel];
-      }
-      // (Auto-source category isn't on ScreenedWallet by design — it's stripped
-      //  at screening time. Manual labels are the operator's authoritative hint.)
+      const cat: MarketCategory = w.category;
+      if (w.categorySource === 'inferred') inferredCount++;
+      if (cat === 'other') otherCount++;
       if (!byCategory.has(cat)) byCategory.set(cat, []);
       byCategory.get(cat)!.push(w.address.toLowerCase());
     }
@@ -243,7 +225,8 @@ export class BasketQuorumService {
       .join(', ');
     console.log(
       `[BasketQuorum] seeded ${eligible.length} wallets across ` +
-        `${byCategory.size} baskets: ${summary}`
+        `${byCategory.size} baskets: ${summary} ` +
+        `(inferred: ${inferredCount}, fallback-to-other: ${otherCount})`
     );
   }
 
