@@ -464,6 +464,12 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   });
   const screening = new WalletScreeningService(sdk.wallets, {
     profileFetchConcurrency: 10,
+    minTradeCount: 80,       // need a real track record, not 30-trade noise
+    minConsistency: 82,      // tighter floor for SATELLITE
+    primaryConsistency: 90,  // PRIMARY stays elite
+    minWinRate: 0.60,
+    minCategoryWinRate: 0.55,
+    minCategoryTrades: 8,    // must prove edge IN the resolved category
   });
   const stateStore = new VoteStateStore('./data/quorum-state.json');
   const risk = new RiskManager(

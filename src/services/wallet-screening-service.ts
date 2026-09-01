@@ -47,21 +47,39 @@ export interface WalletScreeningConfig {
   minWinRate: number;
   /** Minimum composite consistency score for SATELLITE tier (PRIMARY = +15) */
   minConsistency: number;
+  /** Minimum composite consistency for PRIMARY tier (higher = stronger conviction) */
+  primaryConsistency: number;
   /** Max drawdown % allowed (Polymeteo screens at 10% for the +5 bonus; this is a hard cap) */
   maxDrawdownPct: number;
   /** Wallets with median inter-fill interval below this are flagged as bots (ms) */
   botMedianIntervalMs: number;
   /** Concurrency for profile fetches — keep modest to avoid 429s */
   profileFetchConcurrency: number;
+  /**
+   * A wallet only joins a basket for categories where its CATEGORY-SPECIFIC
+   * win rate beats this baseline. Stops a strong-crypto wallet from polluting
+   * the politics basket. 0.55 = must beat coin-flip-with-vig.
+   */
+  minCategoryWinRate: number;
+  /**
+   * Minimum number of category-specific trades before we trust a per-category
+   * win rate. Below this, the wallet has no demonstrated edge in that category
+   * and is held to WATCHLIST rather than seeded into the basket.
+   */
+  minCategoryTrades: number;
 }
 
 export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
-  minTradeCount: 30,
-  minWinRate: 0.55,
-  minConsistency: 70,
+  minTradeCount: 80,
+  minWinRate: 0.60,
+  minConsistency: 82,
+  primaryConsistency: 90,
   maxDrawdownPct: 35,
   botMedianIntervalMs: 5_000,
   profileFetchConcurrency: 4,
+  minCategoryWinRate: 0.55,
+  /** Min category-specific trades before we trust a per-category win rate. */
+  minCategoryTrades: 8,
 };
 
 // ============================================================================
@@ -118,6 +136,12 @@ export interface ScreenedWallet {
   isBotSuspect: boolean;
   botReason?: string;
 
+  // Category specialization: per-category win rate from the wallet's own trades.
+  // A wallet is only trusted in baskets where its category-specific win rate
+  // beats minCategoryWinRate. Keyed by MarketCategory.
+  categoryWinRates: Record<string, { winRate: number; tradeCount: number }>;
+  /** True if the wallet's resolved category beats the specialization baseline. */
+  specializesInResolvedCategory: boolean;
   // Operator override
   bypassed: boolean;
 
@@ -195,13 +219,38 @@ export class WalletScreeningService {
       );
     }
 
+    // Step 2b: fetch positions for per-category win-rate specialization.
+    // Each position has conditionId + cashPnl; we bucket by category and
+    // measure the wallet's win rate INSIDE each category. A crypto whale
+    // with 70% crypto win rate but 45% politics win rate must not pollute
+    // the politics basket.
+    const categoryWinRates = new Map<string, Record<string, { winRate: number; tradeCount: number }>>();
+    const posQueue = [...toScore];
+    const posWorkers: Promise<void>[] = [];
+    for (let i = 0; i < this.config.profileFetchConcurrency; i++) {
+      posWorkers.push(
+        (async () => {
+          while (posQueue.length > 0) {
+            const c = posQueue.shift();
+            if (!c) return;
+            try {
+              const positions = await this.walletService.getWalletPositions(c.address);
+              categoryWinRates.set(c.address, this.winRatesByCategory(positions));
+            } catch {
+              categoryWinRates.set(c.address, {});
+            }
+          }
+        })()
+      );
+    }
+
     // Categories can resolve from manual/auto hints immediately, only the
     // inference path needs activity fetches. We start category work in
     // parallel with the profile pool above.
     const resolvedCategoriesPromise = this.resolveCategories(toScore);
 
-    // Wait for both pools to drain.
-    await Promise.all([...profileWorkers, resolvedCategoriesPromise]);
+    // Wait for all pools to drain.
+    await Promise.all([...profileWorkers, ...posWorkers, resolvedCategoriesPromise]);
     const resolvedCategories = await resolvedCategoriesPromise;
 
     // Step 4: score each candidate with its resolved category.
@@ -211,10 +260,11 @@ export class WalletScreeningService {
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
+      const catWinRates = categoryWinRates.get(c.address) ?? {};
       if (c.bypassScreening) {
         screened.push(this.makeBypassed(c, resolved));
       } else {
-        screened.push(this.evaluate(c, profile, resolved));
+        screened.push(this.evaluate(c, profile, resolved, catWinRates));
       }
     }
     return screened;
@@ -427,19 +477,47 @@ export class WalletScreeningService {
       smartScore: 100,
       tradeCount: 0,
       isBotSuspect: false,
+      categoryWinRates: {},
+      specializesInResolvedCategory: true, // operator trusts this wallet
       bypassed: true,
       reason: 'manual bypass',
     };
+  }
+
+  /**
+   * Compute per-category win rates from a wallet's positions.
+   * Buckets by category (via market title/slug) and measures win rate
+   * (cashPnl > 0) within each. Returns a map keyed by MarketCategory.
+   */
+  private winRatesByCategory(
+    positions: ReadonlyArray<{ title?: string; slug?: string; cashPnl?: number; percentPnl?: number }>,
+  ): Record<string, { winRate: number; tradeCount: number }> {
+    const buckets = new Map<string, { wins: number; total: number }>();
+    for (const p of positions) {
+      const haystack = [p.title ?? '', p.slug ?? ''].filter(Boolean).join(' ');
+      if (!haystack.trim()) continue;
+      const cat = categorizeMarket(haystack);
+      const bucket = buckets.get(cat) ?? { wins: 0, total: 0 };
+      bucket.total++;
+      if ((p.cashPnl ?? p.percentPnl ?? 0) > 0) bucket.wins++;
+      buckets.set(cat, bucket);
+    }
+    const out: Record<string, { winRate: number; tradeCount: number }> = {};
+    for (const [cat, b] of buckets) {
+      out[cat] = { winRate: b.total > 0 ? b.wins / b.total : 0, tradeCount: b.total };
+    }
+    return out;
   }
 
   private evaluate(
     c: RawCandidate,
     profile: WalletProfile | null,
     resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
+    catWinRates: Record<string, { winRate: number; tradeCount: number }> = {},
   ): ScreenedWallet {
     // No profile → too little history to trust → WATCHLIST.
     if (!profile) {
-      return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false, resolved);
+      return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false, resolved, catWinRates);
     }
     if (profile.tradeCount < this.config.minTradeCount) {
       return this.buildResult(
@@ -449,6 +527,7 @@ export class WalletScreeningService {
         `insufficient history (${profile.tradeCount} < ${this.config.minTradeCount})`,
         false,
         resolved,
+        catWinRates,
       );
     }
 
@@ -471,8 +550,21 @@ export class WalletScreeningService {
 
     const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
 
+    // Category specialization gate: a wallet is only trusted for the basket
+    // matching its resolved category if its CATEGORY-SPECIFIC win rate there
+    // beats the baseline. If it has >= minCategoryTrades in that category, it
+    // MUST clear the bar; otherwise (no demonstrated category edge) it is held
+    // to WATCHLIST — we do NOT fall back to the global win rate, because a
+    // global edge tells us nothing about the category the quorum would route it to.
+    const resolvedCat = resolved?.category ?? 'other';
+    const catStat = catWinRates[resolvedCat];
+    const specializes =
+      catStat && catStat.tradeCount >= this.config.minCategoryTrades
+        ? catStat.winRate >= this.config.minCategoryWinRate
+        : false; // insufficient category-specific history → not specialized
+
     if (isBotSuspect) {
-      return this.buildResult(c, profile, 'REJECTED', 'bot signature detected', true, resolved);
+      return this.buildResult(c, profile, 'REJECTED', 'bot signature detected', true, resolved, catWinRates);
     }
     if (maxDrawdownPct > this.config.maxDrawdownPct) {
       return this.buildResult(
@@ -482,13 +574,26 @@ export class WalletScreeningService {
         `drawdown ${maxDrawdownPct.toFixed(1)}% > ${this.config.maxDrawdownPct}%`,
         false,
         resolved,
+        catWinRates,
       );
     }
-    if (consistency >= 85 && profile.winRate >= this.config.minWinRate) {
-      return this.buildResult(c, profile, 'PRIMARY', `consistency ${consistency.toFixed(1)}`, false, resolved);
+    // Require specialization in the resolved category before joining any basket.
+    if (!specializes) {
+      return this.buildResult(
+        c,
+        profile,
+        'WATCHLIST',
+        `not specialized in ${resolvedCat} (catWin=${(catStat?.winRate ?? profile.winRate * 100).toFixed(0)}% < ${this.config.minCategoryWinRate * 100}%)`,
+        false,
+        resolved,
+        catWinRates,
+      );
+    }
+    if (consistency >= this.config.primaryConsistency && profile.winRate >= this.config.minWinRate) {
+      return this.buildResult(c, profile, 'PRIMARY', `consistency ${consistency.toFixed(1)}`, false, resolved, catWinRates);
     }
     if (consistency >= this.config.minConsistency) {
-      return this.buildResult(c, profile, 'SATELLITE', `consistency ${consistency.toFixed(1)}`, false, resolved);
+      return this.buildResult(c, profile, 'SATELLITE', `consistency ${consistency.toFixed(1)}`, false, resolved, catWinRates);
     }
     return this.buildResult(
       c,
@@ -497,6 +602,7 @@ export class WalletScreeningService {
       `consistency ${consistency.toFixed(1)} below ${this.config.minConsistency}`,
       false,
       resolved,
+      catWinRates,
     );
   }
 
@@ -578,13 +684,20 @@ export class WalletScreeningService {
     reason: string,
     isBotSuspect: boolean,
     resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
+    catWinRates: Record<string, { winRate: number; tradeCount: number }> = {},
   ): ScreenedWallet {
+    const resolvedCat = resolved?.category ?? 'other';
+    const catStat = catWinRates[resolvedCat];
+    const specializes =
+      catStat && catStat.tradeCount >= 10
+        ? catStat.winRate >= this.config.minCategoryWinRate
+        : (profile?.winRate ?? 0) >= this.config.minCategoryWinRate;
     return {
       address: c.address,
       tier,
       source: c.source,
       label: c.label,
-      category: resolved?.category ?? 'other',
+      category: resolvedCat,
       categorySource: resolved?.source ?? 'unset',
       categoryConfidence: resolved?.confidence ?? 0,
       dimensions: this.computeDimensions(profile),
@@ -602,6 +715,8 @@ export class WalletScreeningService {
       smartScore: profile?.smartScore ?? 0,
       tradeCount: profile?.tradeCount ?? 0,
       isBotSuspect,
+      categoryWinRates: catWinRates,
+      specializesInResolvedCategory: specializes,
       bypassed: false,
       reason,
     };
