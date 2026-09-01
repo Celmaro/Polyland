@@ -34,6 +34,7 @@ import {
   WalletIngestionService,
   WalletScreeningService,
   VoteStateStore,
+  RiskManager,
   type SmartMoneyTrade,
   type SmartMoneyLeaderboardEntry,
   type BinanceKLine,
@@ -399,58 +400,58 @@ function calculatePositionSize(baseSize: number): number {
 // ============================================================================
 
 let basketQuorum: BasketQuorumService | null = null;
-let quorumSubscription: { stop: () => void } | null = null;
+let quorumSubscription: { id: string; unsubscribe: () => void } | null = null;
 
 const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
-  defaultQuorum: CONFIG.smartMoney.minTraders ?? 3,
+  defaultQuorum: 3,
   defaultWindowMs: 30 * 60 * 1000,       // 30-minute rolling window
-  defaultMinPrice: 0.01,
-  defaultMaxPrice: 0.95,
-  bankrollUSDC: CONFIG.capital.totalUsd,
-  maxMarketRiskPct: CONFIG.capital.maxPerMarketPct,
-  perStrategyBankroll: Object.fromEntries(
-    Object.entries(CONFIG.capital.strategyAllocation).map(([k, v]) => [k.toUpperCase(), v]),
-  ) as Record<string, number>,
+  maxPriceDrift: 0.05,
+  fireCooldownMs: 10 * 60 * 1000,
+  sizeScale: CONFIG.smartMoney.sizeScale,
+  maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
+  maxSlippage: CONFIG.smartMoney.maxSlippage,
+  orderType: 'FOK',
+  minTradeSize: CONFIG.smartMoney.minTradeSize,
+  dryRun: CONFIG.dryRun,
+  bankrollAllocation: {
+    crypto: 0.60,
+    sports: 0.10,
+    politics: 0.10,
+    esports: 0.05,
+    // remainder (0.15) = reserve, unallocated
+  },
   baskets: [
-    // Crypto basket — top wallets from leaderboard
     {
       name: 'Crypto Quorum',
-      category: 'CRYPTO',
+      category: 'crypto',
       enabled: true,
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      bankrollSlice: CONFIG.capital.strategyAllocation.smartMoney,
     },
-    // Sports basket
     {
       name: 'Sports Quorum',
-      category: 'SPORTS',
+      category: 'sports',
       enabled: true,
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      bankrollSlice: 0.10,
     },
-    // Politics basket
     {
       name: 'Politics Quorum',
-      category: 'POLITICS',
+      category: 'politics',
       enabled: true,
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      bankrollSlice: 0.10,
     },
-    // Esports basket
     {
       name: 'Esports Quorum',
-      category: 'ESPORTS',
+      category: 'esports',
       enabled: true,
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      bankrollSlice: 0.05,
     },
   ],
 };
@@ -461,23 +462,40 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   log('QUORUM', 'Setting up basket quorum copy trading...');
 
   // Boot the three-service stack: ingest → screen → quorum
-  const ingestion = new WalletIngestionService(sdk.walletService);
-  const screening = new WalletScreeningService(sdk.walletService, {
-    maxConcurrent: 10,
+  const ingestion = new WalletIngestionService(sdk.wallets, {
+    manual: CONFIG.smartMoney.customWallets.map((addr) => ({
+      address: addr,
+      label: 'manual',
+      source: 'manual' as const,
+      lockCategory: false,
+    })),
+    auto: {
+      enabled: true,
+      period: 'week',
+      topN: CONFIG.smartMoney.topN,
+      categories: ['OVERALL', 'CRYPTO', 'SPORTS', 'POLITICS'],
+      refreshIntervalMs: 6 * 60 * 60 * 1000,
+      sortBy: 'pnl',
+    },
+  });
+  const screening = new WalletScreeningService(sdk.wallets, {
+    profileFetchConcurrency: 10,
   });
   const stateStore = new VoteStateStore('./data/quorum-state.json');
-  const risk = new RiskManager({
-    dailyMaxLossPct: 0.05,
-    monthlyMaxLossPct: 0.15,
-    maxDrawdownPct: 0.25,
-    totalMaxLossPct: 0.40,
-    lossSizingReduction: 0.20,
-    winSizingIncrease: 0.10,
-    minSizeMultiplier: 0.10,
-    maxSizeMultiplier: 2.0,
-  });
+  const risk = new RiskManager(
+    {
+      dailyMaxLossPct: 0.05,
+      monthlyMaxLossPct: 0.15,
+      maxDrawdownFromPeak: 0.25,
+      totalMaxLossPct: 0.40,
+      lossSizingReduction: 0.20,
+      winSizingIncrease: 0.10,
+      enableDynamicSizing: true,
+    },
+    CONFIG.capital.totalUsd,
+  );
 
-  basketQuorum = new BasketQuorumService(BASKET_QUORUM_CONFIG);
+  basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);
   basketQuorum.setStateStore(stateStore);
 
@@ -504,14 +522,11 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
 
   // Seed baskets with screened wallets
   basketQuorum.seed(primaries);
-  log('QUORUM', `Seeded ${basketQuorum.getBasketCount()} baskets`);
 
   // Wire trades into quorum
-  quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades(
-    async (trade: SmartMoneyTrade) => {
-      basketQuorum!.onTrade(trade);
-    },
-  );
+  quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades((trade: SmartMoneyTrade) => {
+    basketQuorum?.onTrade(trade);
+  });
 
   // Periodic funnel logging every 5 minutes
   setInterval(() => {
@@ -522,12 +537,9 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     }
   }, 5 * 60 * 1000);
 
-  log('QUORUM', `Basket quorum running — monitoring ${primaries.length} wallets across ${basketQuorum.getBasketCount()} baskets`);
+  const basketCount = BASKET_QUORUM_CONFIG.baskets.filter((b) => b.enabled).length;
+  log('QUORUM', `Basket quorum running — monitoring ${primaries.length} wallets across ${basketCount} baskets`);
 }
-
-// ============================================================================
-// 1. SMART MONEY COPY TRADING (legacy single-wallet mirror)
-// ============================================================================
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
   if (!CONFIG.smartMoney.enabled) return;
@@ -1056,7 +1068,7 @@ async function main() {
     console.log('\n\nShutting down...');
     if (arbService) await arbService.stop();
     await sdk.dipArb.stop();
-    if (quorumSubscription) quorumSubscription.stop();
+    if (quorumSubscription) quorumSubscription.unsubscribe();
     displayStatus();
     sdk.stop();
     process.exit(0);

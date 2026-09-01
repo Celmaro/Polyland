@@ -32,7 +32,8 @@
     "example:ctf": "tsx examples/10-ctf-operations.ts",
     "example:live-arb": "tsx examples/11-live-arbitrage-scan.ts",
     "example:trending-arb": "tsx examples/12-trending-arb-monitor.ts",
-    "example:arb-service": "tsx examples/13-arbitrage-service.ts"
+    "example:arb-service": "tsx examples/13-arbitrage-service.ts",
+    "start": "node dist/bot-config.js"
   },
   "keywords": [
     "polymarket",
