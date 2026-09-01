@@ -428,6 +428,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
     },
     {
       name: 'Sports Quorum',
@@ -436,6 +437,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
     },
     {
       name: 'Politics Quorum',
@@ -444,6 +446,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
     },
     {
       name: 'Esports Quorum',
@@ -452,6 +455,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
     },
   ],
 };

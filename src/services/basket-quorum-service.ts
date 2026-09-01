@@ -49,6 +49,7 @@ import { categorizeMarket, type MarketCategory } from './smart-money-service.js'
 import type { ScreenedWallet } from './wallet-screening-service.js';
 import type { RiskManager } from './risk-manager.js';
 import type { VoteStateStore } from './vote-state-store.js';
+import { signalAuditStore, type SignalSide } from './signal-audit-store.js';
 
 // ============================================================================
 // Config
@@ -67,6 +68,8 @@ export interface BasketConfig {
   windowMs: number;
   /** Whether this basket is active */
   enabled: boolean;
+  /** Rolling win rate (0-1), updated on each settlement. Starts at 0.6 (prior). */
+  winRate: number;
 }
 
 export interface BasketQuorumConfig {
@@ -109,6 +112,8 @@ interface Vote {
 }
 
 interface QuorumSignal {
+  /** Unique id linking this signal to SignalAuditStore */
+  signalId: string;
   conditionId: string;
   marketSlug: string;
   outcome: string;
@@ -119,6 +124,8 @@ interface QuorumSignal {
   wallets: string[];
   /** Median consensus entry price */
   consensusPrice: number;
+  /** Basket rolling win rate at fire time (for edge calculation) */
+  winRate: number;
   /** Filled sizes at quorum */
   totalSize: number;
 }
@@ -249,6 +256,7 @@ export class BasketQuorumService {
         quorum: basket.quorum ?? config.defaultQuorum,
         windowMs: basket.windowMs ?? config.defaultWindowMs,
         wallets: basket.wallets.map((w) => w.toLowerCase()),
+        winRate: basket.winRate ?? 0.6,
       });
     }
   }
@@ -302,6 +310,7 @@ export class BasketQuorumService {
         quorum: this.config.defaultQuorum,
         windowMs: this.config.defaultWindowMs,
         enabled: true,
+        winRate: 0.6,  // prior: 60% win rate as Bayesian starting point
       });
     }
 
@@ -490,6 +499,7 @@ export class BasketQuorumService {
         : prices[mid];
 
     const signal: QuorumSignal = {
+      signalId: `${conditionId}-${outcome}-${now}`,
       conditionId,
       marketSlug,
       outcome,
@@ -498,8 +508,22 @@ export class BasketQuorumService {
       walletCount: agreeing.length,
       wallets: agreeing.map((v) => v.wallet),
       consensusPrice,
+      winRate: basket.winRate ?? 0.6,
       totalSize: agreeing.reduce((sum, v) => sum + v.size, 0),
     };
+
+    // Record the fire in SignalAuditStore (price calibration + fee math done inside)
+    signalAuditStore.recordFire({
+      conditionId,
+      marketSlug,
+      outcome,
+      side: 'BUY',
+      pricePaid: consensusPrice,
+      size: signal.totalSize,
+      winRate: basket.winRate ?? 0.6,
+      basket: basket.name,
+      wallets: signal.wallets,
+    });
 
     this.lastFired.set(key, now);
     this._schedulePersist();
@@ -657,6 +681,7 @@ export class BasketQuorumService {
       failed: s.failed,
       conversion_pct: Math.round(conversion * 100) / 100,
     };
+    const edgeStats = signalAuditStore.getStats();
     console.log(
       `[BasketQuorum${label ? ':' + label : ''}] funnel: ` +
         `observed=${funnel.observed} ` +
@@ -665,7 +690,14 @@ export class BasketQuorumService {
         `risk=${funnel.skipped_risk} bankroll=${funnel.skipped_bankroll} ` +
         `drift=${funnel.skipped_drift} cooldown=${funnel.skipped_cooldown} ` +
         `executed=${funnel.executed} failed=${funnel.failed} ` +
-        `conversion=${funnel.conversion_pct}%`,
+        `conversion=${funnel.conversion_pct}%` +
+        (edgeStats.signalsSettled > 0
+          ? ` | edge: exp=${edgeStats.meanExpectedEdge.toFixed(4)} ` +
+            `real=${edgeStats.meanRealizedEdge.toFixed(4)} ` +
+            `alpha=${edgeStats.edgeAlpha.toFixed(4)} ` +
+            `sig=${edgeStats.isSignificant} ` +
+            `(n=${edgeStats.signalsSettled} settled/${edgeStats.signalsFired} fired)`
+          : ''),
     );
     return funnel;
   }
@@ -695,6 +727,29 @@ export class BasketQuorumService {
   }
 
   /**
+   * Record market resolution for edge auditing.
+   * Call this when a market settles — it updates the SignalAuditStore
+   * AND each basket's rolling win rate so the next quorum fire has an
+   * up-to-date expected edge.
+   *
+   * @param conditionId  Polymarket condition id
+   * @param resolved     0 or 1 (binary outcome)
+   */
+  recordResolution(conditionId: string, resolved: 0 | 1): void {
+    // 1. Update the audit store so we can compute realized edge
+    signalAuditStore.recordSettlement(conditionId, resolved);
+
+    // 2. Update each basket's rolling win rate.
+    //    W_new = W_old * (1 - α) + outcome * α   (EMA with α=0.1)
+    const ALPHA = 0.1;
+    for (const [, basket] of this.baskets) {
+      if (!basket.enabled) continue;
+      const won = resolved === 1 ? 1 : 0;
+      basket.winRate = basket.winRate * (1 - ALPHA) + won * ALPHA;
+    }
+  }
+
+  /**
    * Record the settled P&L of a trade so the RiskManager can update
    * its halts, dynamic sizing, and bankroll slice accounting.
    * Call this from your executor (or the TradingService wrapper) AFTER
@@ -706,3 +761,4 @@ export class BasketQuorumService {
     }
   }
 }
+
