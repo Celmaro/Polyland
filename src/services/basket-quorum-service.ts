@@ -405,6 +405,11 @@ export class BasketQuorumService {
     return this.baskets.get(category)?.quorum ?? this.config.defaultQuorum;
   }
 
+  /** Number of baskets currently seeded with wallets (after seed()). */
+  getBasketCount(): number {
+    return this.baskets.size;
+  }
+
   /**
    * Entry point: feed every smart-money trade here.
    * Routes by category -> basket -> votes -> quorum -> execute.
