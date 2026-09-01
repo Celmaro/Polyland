@@ -162,6 +162,8 @@ export interface WalletProfile {
   smartScore: number; // 0-100
   winRate: number;    // 0-1
   lastActiveAt: Date;
+  /** Condition IDs of currently open positions (for signal quality scoring). */
+  openConditionIds: string[];
 }
 
 export interface WalletActivityOptions {
@@ -257,6 +259,11 @@ export class WalletService {
 
     const lastActivity = activities[0];
 
+    // Extract currently open position condition IDs.
+    // Used in screening to detect wallets that are already deep in a market —
+    // skin-in-the-game + local knowledge signal, independent of leaderboard stats.
+    const openConditionIds = positions.map((p) => p.conditionId);
+
     return {
       address,
       totalPnL,
@@ -270,6 +277,7 @@ export class WalletService {
         ? positions.filter((p) => (p.cashPnl || 0) > 0).length / positions.length
         : 0,
       lastActiveAt: lastActivity ? new Date(lastActivity.timestamp) : new Date(0),
+      openConditionIds,
     };
   }
 
