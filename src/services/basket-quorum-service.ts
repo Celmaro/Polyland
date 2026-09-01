@@ -194,6 +194,13 @@ export class BasketQuorumService {
   private gammaApi: GammaApiClient | null = null;
   /** Pending follow-up timers keyed by signalId */
   private pendingFollowups: Map<string, NodeJS.Timeout[]> = new Map();
+  /**
+   * Per-category specialization thresholds used by seed() to decide which
+   * basket(s) a wallet joins. Mirrors WalletScreeningConfig so both gates
+   * enforce the same bar.
+   */
+  private specMinCategoryTrades = 12;
+  private specMinCategoryWinRate = 0.58;
 
   /**
    * Wire a RiskManager so the quorum gate respects trading halts and
@@ -201,6 +208,16 @@ export class BasketQuorumService {
    */
   setRiskManager(risk: RiskManager): void {
     this.riskManager = risk;
+  }
+
+  /**
+   * Set the per-category specialization thresholds used by seed() to route
+   * wallets into baskets. Should match WalletScreeningConfig so the screen
+   * and the seed agree on what "proven edge in a category" means.
+   */
+  setSpecializationThresholds(minCategoryTrades: number, minCategoryWinRate: number): void {
+    this.specMinCategoryTrades = minCategoryTrades;
+    this.specMinCategoryWinRate = minCategoryWinRate;
   }
 
   /**
@@ -354,18 +371,50 @@ export class BasketQuorumService {
       return;
     }
 
-    // The screening service has already resolved each wallet's category
-    // (manual hint → auto leaderboard → inferred from activity).
-    // We just bucket by the resolved category.
+    // Route each wallet into the basket(s) where IT has demonstrated edge.
+    // A wallet is seeded into a category basket only if its own per-category
+    // win rate beats the baseline AND it has enough category-specific trades
+    // to trust that number. This stops a strong-crypto wallet from polluting
+    // the politics basket, and lets a genuinely multi-category expert join
+    // several baskets at once.
+    //
+    // Fallback: bypassed / manual wallets with no per-category data are seeded
+    // purely by their resolved category (operator trusts them).
     const byCategory = new Map<MarketCategory, string[]>();
     let inferredCount = 0;
     let otherCount = 0;
+    let multiBasket = 0;
+
+    const qualifiesFor = (w: ScreenedWallet, cat: MarketCategory): boolean => {
+      const stat = w.categoryWinRates[cat];
+      if (!stat) return false;
+      return (
+        stat.tradeCount >= this.specMinCategoryTrades &&
+        stat.winRate >= this.specMinCategoryWinRate
+      );
+    };
+
     for (const w of eligible) {
-      const cat: MarketCategory = w.category;
       if (w.categorySource === 'inferred') inferredCount++;
-      if (cat === 'other') otherCount++;
-      if (!byCategory.has(cat)) byCategory.set(cat, []);
-      byCategory.get(cat)!.push(w.address.toLowerCase());
+      if (w.category === 'other') otherCount++;
+
+      // Collect every category this wallet is specialized in.
+      const cats = new Set<MarketCategory>();
+      for (const cat of Object.keys(w.categoryWinRates) as MarketCategory[]) {
+        if (qualifiesFor(w, cat)) cats.add(cat);
+      }
+
+      // No per-category proof (bypassed / manual / thin data) → trust resolved cat.
+      if (cats.size === 0) {
+        cats.add(w.category);
+      } else if (cats.size > 1) {
+        multiBasket++;
+      }
+
+      for (const cat of cats) {
+        if (!byCategory.has(cat)) byCategory.set(cat, []);
+        byCategory.get(cat)!.push(w.address.toLowerCase());
+      }
     }
 
     // Rebuild baskets Map using existing config defaults.
@@ -393,7 +442,7 @@ export class BasketQuorumService {
     console.log(
       `[BasketQuorum] seeded ${eligible.length} wallets across ` +
         `${byCategory.size} baskets: ${summary} ` +
-        `(inferred: ${inferredCount}, fallback-to-other: ${otherCount})`
+        `(inferred: ${inferredCount}, fallback-to-other: ${otherCount}, multi-basket: ${multiBasket})`
     );
   }
 

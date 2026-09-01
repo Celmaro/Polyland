@@ -462,15 +462,16 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
       sortBy: 'pnl',
     },
   });
-  const screening = new WalletScreeningService(sdk.wallets, {
+  const screeningConfig = {
     profileFetchConcurrency: 10,
-    minTradeCount: 80,       // need a real track record, not 30-trade noise
-    minConsistency: 82,      // tighter floor for SATELLITE
-    primaryConsistency: 90,  // PRIMARY stays elite
+    minTradeCount: 150,      // real track record: 150+ closed trades separates skill from luck
+    minConsistency: 85,      // tighter floor for SATELLITE
+    primaryConsistency: 92,  // PRIMARY stays elite
     minWinRate: 0.60,
-    minCategoryWinRate: 0.55,
-    minCategoryTrades: 8,    // must prove edge IN the resolved category
-  });
+    minCategoryWinRate: 0.58, // must beat coin-flip-with-vig IN the category it's seeded into
+    minCategoryTrades: 12,    // proven edge needs >=12 category-specific trades to trust
+  };
+  const screening = new WalletScreeningService(sdk.wallets, screeningConfig);
   const stateStore = new VoteStateStore('./data/quorum-state.json');
   const risk = new RiskManager(
     {
@@ -489,6 +490,10 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   basketQuorum.setRiskManager(risk);
   basketQuorum.setStateStore(stateStore);
   basketQuorum.setGammaApi(sdk.gammaApi);
+  basketQuorum.setSpecializationThresholds(
+    screeningConfig.minCategoryTrades,
+    screeningConfig.minCategoryWinRate,
+  );
 
   // Collect wallets from all sources (manual + auto)
   log('QUORUM', 'Collecting wallets...');
