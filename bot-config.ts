@@ -107,7 +107,7 @@ const CONFIG = {
   },
 
   arbitrage: {
-    enabled: true,
+    enabled: false,
     // 🔴 FIXED: Higher profit threshold to account for gas fees
     profitThreshold: 0.01,  // Up from 0.5% to 1%
     minTradeSize: 20,  // Up from 5 to reduce gas impact
@@ -122,7 +122,7 @@ const CONFIG = {
   },
 
   dipArb: {
-    enabled: true,
+    enabled: false,
     coins: ['BTC', 'ETH', 'SOL'] as const,
     shares: 10,
     sumTarget: 0.92,
@@ -132,20 +132,20 @@ const CONFIG = {
   },
 
   onchain: {
-    enabled: true,
+    enabled: false,
     autoApprove: true,
     minMatic: 0.5,
   },
 
   binance: {
-    enabled: true,
+    enabled: false,
     symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
     interval: '15m' as const,
     trendThreshold: 2,
   },
 
   directTrading: {
-    enabled: true,
+    enabled: false,
     trendFollowing: true,
     minTrendStrength: 0.02,
     // 🔴 NEW: Stop-loss and take-profit
