@@ -493,18 +493,27 @@ export class WalletScreeningService {
     positions: ReadonlyArray<{ title?: string; slug?: string; cashPnl?: number; percentPnl?: number }>,
   ): Record<string, { winRate: number; tradeCount: number }> {
     const buckets = new Map<string, { wins: number; total: number }>();
+    let grandTotal = 0;
     for (const p of positions) {
       const haystack = [p.title ?? '', p.slug ?? ''].filter(Boolean).join(' ');
       if (!haystack.trim()) continue;
       const cat = categorizeMarket(haystack);
       const bucket = buckets.get(cat) ?? { wins: 0, total: 0 };
       bucket.total++;
+      grandTotal++;
       if ((p.cashPnl ?? p.percentPnl ?? 0) > 0) bucket.wins++;
       buckets.set(cat, bucket);
     }
     const out: Record<string, { winRate: number; tradeCount: number }> = {};
     for (const [cat, b] of buckets) {
-      out[cat] = { winRate: b.total > 0 ? b.wins / b.total : 0, tradeCount: b.total };
+      // Concentration: share of ALL categorized trades that landed in this category.
+      const concentration = grandTotal > 0 ? b.total / grandTotal : 0;
+      out[cat] = {
+        winRate: b.total > 0 ? b.wins / b.total : 0,
+        tradeCount: b.total,
+        // stash concentration on the object for the evaluation gate (not strictly typed)
+        ...(concentration > 0 ? { concentration } : {}),
+      } as { winRate: number; tradeCount: number };
     }
     return out;
   }
@@ -551,17 +560,23 @@ export class WalletScreeningService {
     const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
 
     // Category specialization gate: a wallet is only trusted for the basket
-    // matching its resolved category if its CATEGORY-SPECIFIC win rate there
-    // beats the baseline. If it has >= minCategoryTrades in that category, it
-    // MUST clear the bar; otherwise (no demonstrated category edge) it is held
-    // to WATCHLIST — we do NOT fall back to the global win rate, because a
-    // global edge tells us nothing about the category the quorum would route it to.
+    // matching its resolved category if it actually has edge THERE.
+    //   - Hard pass: >= minCategoryTrades in that category AND its category
+    //     win rate beats minCategoryWinRate.
+    //   - Soft pass: the wallet is CONCENTRATED in that category
+    //     (>=60% of its trades there) AND its GLOBAL win rate beats minWinRate.
+    //     (Few category-specific trades, but clearly a focused specialist.)
+    //   - Otherwise: WATCHLIST — no demonstrated edge in the category the
+    //     quorum would route it to. We do NOT seed on global edge alone.
     const resolvedCat = resolved?.category ?? 'other';
-    const catStat = catWinRates[resolvedCat];
+    const catStat = catWinRates[resolvedCat] as
+      | { winRate: number; tradeCount: number; concentration?: number }
+      | undefined;
+    const concentration = catStat?.concentration ?? 0;
     const specializes =
       catStat && catStat.tradeCount >= this.config.minCategoryTrades
         ? catStat.winRate >= this.config.minCategoryWinRate
-        : false; // insufficient category-specific history → not specialized
+        : catStat && concentration >= 0.6 && profile.winRate >= this.config.minWinRate;
 
     if (isBotSuspect) {
       return this.buildResult(c, profile, 'REJECTED', 'bot signature detected', true, resolved, catWinRates);
