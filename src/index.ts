@@ -628,3 +628,30 @@ export class PolymarketSDK {
     this.cache.invalidate(conditionId);
   }
 }
+
+// ============================================================================
+// Basket-quorum copy trading
+// ============================================================================
+export { BasketQuorumService } from './services/basket-quorum-service.js';
+export type {
+  BasketConfig,
+  BasketQuorumConfig,
+  QuorumStats,
+} from './services/basket-quorum-service.js';
+
+export { WalletIngestionService } from './services/wallet-ingestion-service.js';
+export type {
+  ManualWalletSpec,
+  ManualWalletsFile,
+  AutoSourceConfig,
+  WalletIngestionConfig,
+  RawCandidate,
+  WalletSource,
+} from './services/wallet-ingestion-service.js';
+
+export { WalletScreeningService, DEFAULT_SCREENING_CONFIG } from './services/wallet-screening-service.js';
+export type {
+  WalletScreeningConfig,
+  ScreenedWallet,
+  WalletTier,
+} from './services/wallet-screening-service.js';
