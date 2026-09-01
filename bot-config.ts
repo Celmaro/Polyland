@@ -1056,15 +1056,9 @@ async function main() {
   log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
 
   // Setup all services
-  await setupSwap(sdk);
-  await setupOnchain();
-  await setupBridge(sdk);
-  await setupBinanceAnalysis(sdk);
-  await analyzeTopWallets(sdk);
-  await queryOnchainData(sdk);
-  // Basket quorum runs alongside legacy smart money (both share the same
-  // subscribeSmartMoneyTrades feed; BasketQuorumService filters onTrade for
-  // wallets it owns and routes through its own consensus logic).
+  // Only basket-quorum copy trading runs.
+  // Non-quorum services disabled: setupSwap, setupOnchain, setupBridge,
+  // setupBinanceAnalysis, analyzeTopWallets, queryOnchainData.
   await setupBasketQuorum(sdk);
   // setupSmartMoney(sdk); // disabled — only basket quorum copy trading runs
   // setupArbitrage(sdk);  // disabled — arbitrage not used
