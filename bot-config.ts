@@ -30,9 +30,14 @@ import {
   ArbitrageService,
   OnchainService,
   BridgeClient,
+  BasketQuorumService,
+  WalletIngestionService,
+  WalletScreeningService,
+  VoteStateStore,
   type SmartMoneyTrade,
   type SmartMoneyLeaderboardEntry,
   type BinanceKLine,
+  type BasketQuorumConfig,
 } from './src/index.js';
 
 // ============================================================================
@@ -390,7 +395,138 @@ function calculatePositionSize(baseSize: number): number {
 }
 
 // ============================================================================
-// 1. SMART MONEY STRATEGY
+// 1b. BASKET QUORUM COPY TRADING
+// ============================================================================
+
+let basketQuorum: BasketQuorumService | null = null;
+let quorumSubscription: { stop: () => void } | null = null;
+
+const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
+  defaultQuorum: CONFIG.smartMoney.minTraders ?? 3,
+  defaultWindowMs: 30 * 60 * 1000,       // 30-minute rolling window
+  defaultMinPrice: 0.01,
+  defaultMaxPrice: 0.95,
+  bankrollUSDC: CONFIG.capital.totalUsd,
+  maxMarketRiskPct: CONFIG.capital.maxPerMarketPct,
+  perStrategyBankroll: Object.fromEntries(
+    Object.entries(CONFIG.capital.strategyAllocation).map(([k, v]) => [k.toUpperCase(), v]),
+  ) as Record<string, number>,
+  baskets: [
+    // Crypto basket — top wallets from leaderboard
+    {
+      name: 'Crypto Quorum',
+      category: 'CRYPTO',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      bankrollSlice: CONFIG.capital.strategyAllocation.smartMoney,
+    },
+    // Sports basket
+    {
+      name: 'Sports Quorum',
+      category: 'SPORTS',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      bankrollSlice: 0.10,
+    },
+    // Politics basket
+    {
+      name: 'Politics Quorum',
+      category: 'POLITICS',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      bankrollSlice: 0.10,
+    },
+    // Esports basket
+    {
+      name: 'Esports Quorum',
+      category: 'ESPORTS',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      bankrollSlice: 0.05,
+    },
+  ],
+};
+
+async function setupBasketQuorum(sdk: PolymarketSDK) {
+  if (!CONFIG.smartMoney.enabled) return;
+
+  log('QUORUM', 'Setting up basket quorum copy trading...');
+
+  // Boot the three-service stack: ingest → screen → quorum
+  const ingestion = new WalletIngestionService(sdk.walletService);
+  const screening = new WalletScreeningService(sdk.walletService, {
+    maxConcurrent: 10,
+  });
+  const stateStore = new VoteStateStore('./data/quorum-state.json');
+  const risk = new RiskManager({
+    dailyMaxLossPct: 0.05,
+    monthlyMaxLossPct: 0.15,
+    maxDrawdownPct: 0.25,
+    totalMaxLossPct: 0.40,
+    lossSizingReduction: 0.20,
+    winSizingIncrease: 0.10,
+    minSizeMultiplier: 0.10,
+    maxSizeMultiplier: 2.0,
+  });
+
+  basketQuorum = new BasketQuorumService(BASKET_QUORUM_CONFIG);
+  basketQuorum.setRiskManager(risk);
+  basketQuorum.setStateStore(stateStore);
+
+  // Collect wallets from all sources (manual + auto)
+  log('QUORUM', 'Collecting wallets...');
+  const candidates = await ingestion.collect();
+  log('QUORUM', `Ingested ${candidates.length} candidates`);
+
+  if (candidates.length === 0) {
+    log('WARN', 'No wallet candidates — check WALLET_SOURCES or leaderboard access');
+    return;
+  }
+
+  // Screen and score wallets
+  log('QUORUM', 'Screening wallets...');
+  const screened = await screening.score(candidates);
+  const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
+  log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE`);
+
+  if (primaries.length === 0) {
+    log('WARN', 'No PRIMARY/SATELLITE wallets passed screening');
+    return;
+  }
+
+  // Seed baskets with screened wallets
+  basketQuorum.seed(primaries);
+  log('QUORUM', `Seeded ${basketQuorum.getBasketCount()} baskets`);
+
+  // Wire trades into quorum
+  quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades(
+    async (trade: SmartMoneyTrade) => {
+      basketQuorum!.onTrade(trade);
+    },
+  );
+
+  // Periodic funnel logging every 5 minutes
+  setInterval(() => {
+    if (basketQuorum) {
+      basketQuorum.logFunnel();
+      const stats = basketQuorum.getStats();
+      log('INFO', `Quorum stats: fired=${stats.quorumFired} executed=${stats.executed} failed=${stats.failed}`);
+    }
+  }, 5 * 60 * 1000);
+
+  log('QUORUM', `Basket quorum running — monitoring ${primaries.length} wallets across ${basketQuorum.getBasketCount()} baskets`);
+}
+
+// ============================================================================
+// 1. SMART MONEY COPY TRADING (legacy single-wallet mirror)
 // ============================================================================
 
 async function setupSmartMoney(sdk: PolymarketSDK) {
@@ -904,6 +1040,10 @@ async function main() {
   await setupBinanceAnalysis(sdk);
   await analyzeTopWallets(sdk);
   await queryOnchainData(sdk);
+  // Basket quorum runs alongside legacy smart money (both share the same
+  // subscribeSmartMoneyTrades feed; BasketQuorumService filters onTrade for
+  // wallets it owns and routes through its own consensus logic).
+  await setupBasketQuorum(sdk);
   await setupSmartMoney(sdk);
   await setupArbitrage(sdk);
   await setupDipArb(sdk);
@@ -916,6 +1056,7 @@ async function main() {
     console.log('\n\nShutting down...');
     if (arbService) await arbService.stop();
     await sdk.dipArb.stop();
+    if (quorumSubscription) quorumSubscription.stop();
     displayStatus();
     sdk.stop();
     process.exit(0);

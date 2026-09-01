@@ -381,7 +381,14 @@ export class GammaApiClient {
         );
       const data = (await response.json()) as unknown[];
       if (!Array.isArray(data)) return [];
-      return data.map((item) => this.normalizeMarket(item as Record<string, unknown>));
+      const markets = data.map((item) => this.normalizeMarket(item as Record<string, unknown>));
+      // Drop markets whose endDate has already passed — `closed: false` in
+      // the Gamma API doesn't always mean "still open for trading"; some
+      // markets stay flagged active for hours after resolution while
+      // redemption settles. The Zeabur runlogs showed resolved markets
+      // (Seoul, Wellington, etc) contaminating the signal feed.
+      const now = Date.now();
+      return markets.filter((m) => m.endDate.getTime() > now);
     });
   }
 

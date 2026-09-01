@@ -70,6 +70,25 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
 
 export type WalletTier = 'PRIMARY' | 'SATELLITE' | 'WATCHLIST' | 'REJECTED';
 
+/**
+ * Six-dimension wallet quality score (PredictEngine pattern).
+ * Each dimension is normalized 0-100.
+ */
+export interface WalletDimensions {
+  /** Realized P&L strength relative to trade count */
+  profitability: number;
+  /** Entry-price skill proxy (avg % PnL per position) */
+  timing: number;
+  /** Execution-quality proxy (fills that don't chase; from smartScore) */
+  slippage: number;
+  /** Win-rate stability across history */
+  consistency: number;
+  /** Market-category focus vs. spray-and-pray */
+  marketSelection: number;
+  /** How recently the wallet has been active (edge decays) */
+  recency: number;
+}
+
 export interface ScreenedWallet {
   address: string;
   tier: WalletTier;
@@ -83,6 +102,9 @@ export interface ScreenedWallet {
   categorySource: 'manual' | 'auto' | 'inferred' | 'unset';
   /** Confidence (0-1) for inferred categories — 1 for manual/auto hints */
   categoryConfidence: number;
+
+  // Six-dimension scores (0-100 each)
+  dimensions: WalletDimensions;
 
   // Computed quality metrics
   consistency: number; // 0-100 composite
@@ -390,6 +412,14 @@ export class WalletScreeningService {
       category: resolved?.category ?? 'other',
       categorySource: resolved?.source ?? 'unset',
       categoryConfidence: resolved?.confidence ?? 0,
+      dimensions: {
+        profitability: 100,
+        timing: 100,
+        slippage: 100,
+        consistency: 100,
+        marketSelection: 100,
+        recency: 100,
+      },
       consistency: 100,
       winRate: 1,
       profitFactor: 999,
@@ -471,6 +501,60 @@ export class WalletScreeningService {
   }
 
   /**
+   * Six-dimension scoring (PredictEngine pattern). All inputs come from
+   * WalletProfile; dimensions we can't measure yet are neutral (50).
+   *
+   *  - profitability: realized PnL per trade, log-scaled
+   *  - timing:        avgPercentPnL (entry/exit skill proxy)
+   *  - slippage:      smartScore already encodes execution quality; invert
+   *  - consistency:   win rate mapped to 0-100
+   *  - marketSelection: position-count vs. trade-count ratio (a focused
+   *                     trader holds fewer concurrent positions)
+   *  - recency:       days since last activity, decayed
+   */
+  private computeDimensions(
+    profile: WalletProfile | null,
+  ): WalletDimensions {
+    if (!profile) {
+      return {
+        profitability: 0,
+        timing: 0,
+        slippage: 50,
+        consistency: 0,
+        marketSelection: 50,
+        recency: 0,
+      };
+    }
+    // Profitability: log-scale realizedPnL per trade, clamp 0-100.
+    const perTrade = profile.realizedPnL / Math.max(profile.tradeCount, 1);
+    const profitability = Math.max(
+      0,
+      Math.min(100, 50 + 50 * Math.tanh(perTrade / 50)),
+    );
+
+    // Timing: avgPercentPnL (0-1 expected) mapped to 0-100.
+    const timing = Math.max(0, Math.min(100, profile.avgPercentPnL * 100));
+
+    // Slippage/execution: smartScore is a 0-100 composite that already
+    // weights execution quality.
+    const slippage = Math.max(0, Math.min(100, profile.smartScore));
+
+    // Consistency: win rate to 0-100.
+    const consistency = Math.max(0, Math.min(100, profile.winRate * 100));
+
+    // Market selection: focus ratio. A wallet with 500 trades but only
+    // 3 positions is focused; 500 trades across 400 positions is spraying.
+    const focus = profile.positionCount / Math.max(profile.tradeCount, 1);
+    const marketSelection = Math.max(0, Math.min(100, 100 * (1 - focus)));
+
+    // Recency: days since last activity, decay factor 14 days half-life.
+    const daysStale = (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
+    const recency = Math.max(0, Math.min(100, 100 * Math.pow(0.5, daysStale / 14)));
+
+    return { profitability, timing, slippage, consistency, marketSelection, recency };
+  }
+
+  /**
    * Bot signature heuristic.
    * Real signal: high smartScore is GOOD; very high smartScore (95+) AND
    * very high tradeCount (1000+) AND high winRate (75%+) is suspicious —
@@ -503,6 +587,7 @@ export class WalletScreeningService {
       category: resolved?.category ?? 'other',
       categorySource: resolved?.source ?? 'unset',
       categoryConfidence: resolved?.confidence ?? 0,
+      dimensions: this.computeDimensions(profile),
       consistency: profile
         ? Math.min(
             99.5,

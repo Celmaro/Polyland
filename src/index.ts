@@ -655,3 +655,13 @@ export type {
   ScreenedWallet,
   WalletTier,
 } from './services/wallet-screening-service.js';
+
+export { RiskManager } from './services/risk-manager.js';
+export type { RiskConfig, RiskSnapshot } from './services/risk-manager.js';
+
+export { VoteStateStore } from './services/vote-state-store.js';
+
+export { ActivityCache } from './services/activity-cache.js';
+
+export { BacktestRunner } from './services/backtest-runner.js';
+export type { BacktestConfig, BacktestResult } from './services/backtest-runner.js';

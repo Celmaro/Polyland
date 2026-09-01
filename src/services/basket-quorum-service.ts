@@ -618,6 +618,58 @@ export class BasketQuorumService {
     return { ...this.stats };
   }
 
+  /**
+   * Pretty-print the funnel: how many signals came in, how many were
+   * filtered at each gate, how many actually traded. Matches the
+   * Polymeteo "signals detected -> filters -> quorum -> copied" funnel.
+   *
+   * Returns the funnel object so callers can also send it to a
+   * dashboard / log aggregator.
+   */
+  logFunnel(label: string = ''): {
+    observed: number;
+    filtered: number;
+    filtered_thin: number;
+    filtered_stale: number;
+    quorum_fired: number;
+    skipped_risk: number;
+    skipped_bankroll: number;
+    skipped_drift: number;
+    skipped_cooldown: number;
+    executed: number;
+    failed: number;
+    conversion_pct: number;
+  } {
+    const s = this.stats;
+    const filtered = s.quorumSkippedThinEdge + s.quorumSkippedStaleMarket;
+    const conversion = s.votesObserved === 0 ? 0 : (s.executed / s.votesObserved) * 100;
+    const funnel = {
+      observed: s.votesObserved,
+      filtered,
+      filtered_thin: s.quorumSkippedThinEdge,
+      filtered_stale: s.quorumSkippedStaleMarket,
+      quorum_fired: s.quorumFired,
+      skipped_risk: s.quorumSkippedRiskHalt,
+      skipped_bankroll: s.quorumSkippedBankroll,
+      skipped_drift: s.quorumSkippedDrift,
+      skipped_cooldown: s.quorumSkippedCooldown,
+      executed: s.executed,
+      failed: s.failed,
+      conversion_pct: Math.round(conversion * 100) / 100,
+    };
+    console.log(
+      `[BasketQuorum${label ? ':' + label : ''}] funnel: ` +
+        `observed=${funnel.observed} ` +
+        `filtered=${funnel.filtered}(thin=${funnel.filtered_thin},stale=${funnel.filtered_stale}) ` +
+        `fired=${funnel.quorum_fired} ` +
+        `risk=${funnel.skipped_risk} bankroll=${funnel.skipped_bankroll} ` +
+        `drift=${funnel.skipped_drift} cooldown=${funnel.skipped_cooldown} ` +
+        `executed=${funnel.executed} failed=${funnel.failed} ` +
+        `conversion=${funnel.conversion_pct}%`,
+    );
+    return funnel;
+  }
+
   /** Drop all state (used on basket re-config). */
   reset(): void {
     this.votes.clear();
