@@ -292,13 +292,19 @@ export class WalletScreeningService {
     );
 
     const screened: ScreenedWallet[] = [];
+    const gateCounts: Record<string, number> = {};
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
       const walletsCatWinRates = catWinRates.get(c.address) ?? {};
       screened.push(c.bypassScreening
         ? this.makeBypassed(c, resolved)
-        : this.evaluate(c, profile, resolved, walletsCatWinRates));
+        : this.evaluate(c, profile, resolved, walletsCatWinRates, gateCounts));
+    }
+    // Log gate tally for this cycle (diagnostic).
+    const entries = Object.entries(gateCounts).sort((a, b) => b[1] - a[1]);
+    if (entries.length > 0) {
+      console.log('[WalletScreening] gate tally: ' + entries.map(([k, v]) => `${k}=${v}`).join(' '));
     }
     return screened;
   }
@@ -565,17 +571,20 @@ export class WalletScreeningService {
     profile: WalletProfile | null,
     resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
     catWinRates: Record<string, { winRate: number; tradeCount: number }>,
+    gateCounts?: Record<string, number>,
   ): ScreenedWallet {
     // No profile — cannot score
     if (!profile) {
+      if (gateCounts) gateCounts['no profile'] = (gateCounts['no profile'] ?? 0) + 1;
       return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false, undefined, catWinRates);
     }
 
     // Insufficient history
     if (profile.tradeCount < this.config.minTradeCount) {
+      if (gateCounts) gateCounts['insufficient history'] = (gateCounts['insufficient history'] ?? 0) + 1;
       return this.buildResult(
         c, profile, 'WATCHLIST',
-        `insufficient history (${profile.tradeCount} < ${this.config.minTradeCount})`,
+        `insufficient history: ${profile.tradeCount} trades (min ${this.config.minTradeCount})`,
         false, resolved, catWinRates,
       );
     }
@@ -583,12 +592,14 @@ export class WalletScreeningService {
     // Bot detection
     const botCheck = this.detectBot(profile);
     if (botCheck.isBot) {
+      if (gateCounts) gateCounts['HFT signature'] = (gateCounts['HFT signature'] ?? 0) + 1;
       return this.buildResult(c, profile, 'REJECTED', botCheck.reason!, true, resolved, catWinRates);
     }
 
     // Recency gate — edge decays
     const daysStale = (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
     if (daysStale > this.config.maxInactiveDays) {
+      if (gateCounts) gateCounts['inactive >60d'] = (gateCounts['inactive >60d'] ?? 0) + 1;
       return this.buildResult(
         c, profile, 'WATCHLIST',
         `inactive ${daysStale.toFixed(0)}d (> ${this.config.maxInactiveDays}d)`,
@@ -601,6 +612,7 @@ export class WalletScreeningService {
     // A wallet can win 60%+ of trades but still lose money if losers outweigh winners.
     // We use totalPnL > 0 as the gate; this is the actual bottom line.
     if (profile.totalPnL <= 0) {
+      if (gateCounts) gateCounts['unprofitable'] = (gateCounts['unprofitable'] ?? 0) + 1;
       return this.buildResult(
         c, profile, 'WATCHLIST',
         `unprofitable (totalPnL=${profile.totalPnL.toFixed(2)} <= 0)`,
@@ -624,6 +636,7 @@ export class WalletScreeningService {
         : concentration >= 0.6 && profile.winRate >= this.config.minWinRate;
 
     if (!specializes) {
+      if (gateCounts) gateCounts['not specialized'] = (gateCounts['not specialized'] ?? 0) + 1;
       return this.buildResult(
         c, profile, 'WATCHLIST',
         `not specialized in ${resolvedCat} (catWin=${((catStat?.winRate ?? profile.winRate) * 100).toFixed(0)}% < ${this.config.minCategoryWinRate * 100}%)`,
@@ -666,7 +679,6 @@ export class WalletScreeningService {
     );
   }
 
-  // --------------------------------------------------------------------------
   // Result builder
   // --------------------------------------------------------------------------
 
