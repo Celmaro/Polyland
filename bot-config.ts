@@ -561,22 +561,11 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     }
   }, 5 * 60 * 1000);
 
-  // DIAGNOSTIC: raw trade-firehose counter — counts ALL trades arriving over the
-  // websocket (before any address filtering). If rawTrades stays 0, the websocket
-  // feed itself is dead. If rawTrades grows but observed stays 0, the seeded
-  // wallets simply haven't traded yet (human-pace activity).
-  let rawTrades = 0;
-  let seededMatches = 0;
-  const seededSet = new Set(primaries.map((w) => w.address.toLowerCase()));
-  sdk.realtime.subscribeAllActivity({
-    onTrade: (t) => {
-      rawTrades++;
-      if (t.trader?.address && seededSet.has(t.trader.address.toLowerCase())) seededMatches++;
-    },
-  });
-  setInterval(() => {
-    log('DIAG', `firehose: rawTrades=${rawTrades} seededMatches=${seededMatches} (0 raw = dead websocket)`);
-  }, 5 * 60 * 1000);
+  // NOTE: no separate firehose subscription. subscribeSmartMoneyTrades already
+  // subscribes to all activity; a SECOND subscribeAllActivity sends a duplicate
+  // subscription that the Polymarket server rejects (connection_id_fk error),
+  // disconnecting the websocket and killing the quorum trade feed. observed =
+  // trades from seeded wallets is logged by the funnel every 5 min.
 
   const basketCount = basketQuorum.getBasketCount();
   log('QUORUM', `Basket quorum running — monitoring ${primaries.length} wallets across ${basketCount} baskets`);
