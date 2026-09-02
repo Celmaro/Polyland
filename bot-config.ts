@@ -20,6 +20,8 @@ import {
   type BasketQuorumConfig,
 } from './src/index.js';
 import { signalAuditStore } from './src/services/signal-audit-store.js';
+import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from './src/utils/anti-sniper.js';
+import { ChainlinkTwapOracle } from './src/services/chainlink-twap-oracle.js';
 
 // ============================================================================
 // CONFIGURATION
@@ -507,6 +509,38 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     screeningConfig.minCategoryWinRate,
   );
 
+  // Wire anti-sniper guard (lihanyu81/polymarket_lp_tool pattern). Protects
+  // against copy-sniping and thin-book fills. Configurable via env.
+  const antiSniperConfig = {
+    midJumpThreshold: parseFloat(process.env.ANTI_SNIPER_MID_JUMP ?? '0.03'),
+    midStableConfirmMs: parseInt(process.env.ANTI_SNIPER_STABLE_MS ?? '1000', 10),
+    fillCooldownMs: parseInt(process.env.ANTI_SNIPER_FILL_COOLDOWN_MS ?? '5000', 10),
+    maxRepriceTicks: parseInt(process.env.ANTI_SNIPER_MAX_REPRICE_TICKS ?? '2', 10),
+    midJumpLookbackMs: parseInt(process.env.ANTI_SNIPER_LOOKBACK_MS ?? '2000', 10),
+  };
+  const antiSniper = new AntiSniperGuard(null, antiSniperConfig);
+  basketQuorum.setAntiSniper(antiSniper);
+  log('QUORUM', `Anti-sniper guard: ${JSON.stringify(antiSniperConfig)}`);
+
+  // Wire Chainlink TWAP oracle (KingSparta69/MattheusFeittosa pattern) for
+  // crypto Up/Down markets. Connects to wss://ws-live-data.polymarket.com
+  // and subscribes to crypto_prices_twap_thirty/sixty topics.
+  const twapOracle = new ChainlinkTwapOracle({
+    autoReconnect: true,
+    reconnectDelayMs: 3_000,
+    pingIntervalMs: 5_000,
+    maxStalenessMs: parseInt(process.env.TWAP_MAX_STALENESS_MS ?? '30000', 10),
+  });
+  if (process.env.TWAP_ENABLED !== 'false') {
+    basketQuorum.setTwapOracle(twapOracle);
+    twapOracle.connect().catch((err) => {
+      log('WARN', `TWAP oracle connect failed: ${err instanceof Error ? err.message : err}`);
+    });
+    log('QUORUM', 'Chainlink TWAP oracle wired (crypto baskets enabled)');
+  } else {
+    log('QUORUM', 'Chainlink TWAP oracle disabled via TWAP_ENABLED=false');
+  }
+
   // Collect wallets from all sources (manual + auto)
   log('QUORUM', 'Collecting wallets...');
   const candidates = await ingestion.collect();
@@ -532,6 +566,12 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
         if (!basketQuorum || basketQuorum.getBasketCount() === 0) {
           if (tradeBuffer.length < SEED_BUFFER_LIMIT) tradeBuffer.push(trade);
           return;
+        }
+        // Feed the price as a mid observation to the anti-sniper guard
+        // (if a tokenId is available). This builds the rolling mid buffer
+        // used by the mid-jump and mid-stable checks.
+        if (trade.tokenId && trade.price) {
+          basketQuorum.observeMid(trade.tokenId, trade.price);
         }
         basketQuorum.onTrade(trade);
       },
@@ -573,7 +613,14 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     if (basketQuorum) {
       basketQuorum.logFunnel();
       const stats = basketQuorum.getStats();
-      log('INFO', `Quorum stats: fired=${stats.quorumFired} executed=${stats.executed} failed=${stats.failed}`);
+      log('INFO',
+        `Quorum stats: fired=${stats.quorumFired} executed=${stats.executed} failed=${stats.failed}` +
+        ` antiSniper=${stats.quorumSkippedAntiSniper ?? 0}` +
+        ` twapStale=${stats.quorumSkippedTwapStale ?? 0}` +
+        ` twapMisaligned=${stats.quorumSkippedTwapMisaligned ?? 0}` +
+        ` thinLiq=${stats.quorumSkippedThinLiquidity ?? 0}` +
+        ` negEdge=${stats.quorumSkippedNegativeEdge ?? 0}`,
+      );
     }
   }, 5 * 60 * 1000);
 
@@ -605,10 +652,16 @@ function displayStatus() {
   lines.push(`[status] t=${runtime}m mode=${mode} ${status}`);
   if (f) {
     const conversion = f.votesObserved === 0 ? 0 : (f.executed / f.votesObserved * 100).toFixed(1);
+    const antiSniper = f.quorumSkippedAntiSniper ?? 0;
+    const twapStale = f.quorumSkippedTwapStale ?? 0;
+    const twapMisaligned = f.quorumSkippedTwapMisaligned ?? 0;
+    const thinLiq = f.quorumSkippedThinLiquidity ?? 0;
+    const negEdge = f.quorumSkippedNegativeEdge ?? 0;
     lines.push(
       `[quorum] observed=${f.votesObserved} filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket}` +
       `(thin=${f.quorumSkippedThinEdge},stale=${f.quorumSkippedStaleMarket}) fired=${f.quorumFired}` +
       ` risk=${f.quorumSkippedRiskHalt} bankroll=${f.quorumSkippedBankroll} drift=${f.quorumSkippedDrift}` +
+      ` antiSniper=${antiSniper} twap=${twapStale}/${twapMisaligned} liq=${thinLiq} negEdge=${negEdge}` +
       ` executed=${f.executed} failed=${f.failed} conv=${conversion}%`
     );
   }

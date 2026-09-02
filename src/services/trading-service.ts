@@ -522,6 +522,54 @@ export class TradingService {
     });
   }
 
+  /**
+   * Fetch the order book for a token.
+   * Used by the 2× liquidity check (early-bird.ts pattern) and the
+   * anti-sniper guard's mid observation loop.
+   */
+  async getOrderBook(tokenId: string): Promise<{
+    bids: { price: string; size: string }[];
+    asks: { price: string; size: string }[];
+  } | null> {
+    const client = await this.ensureInitialized();
+    return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
+      try {
+        // @ts-ignore — clob-client exposes getOrderBook at runtime even
+        // when the public type omits it.
+        const raw = await (client as any).getOrderBook(tokenId);
+        return {
+          bids: (raw?.bids ?? []) as { price: string; size: string }[],
+          asks: (raw?.asks ?? []) as { price: string; size: string }[],
+        };
+      } catch {
+        return null;
+      }
+    });
+  }
+
+  /**
+   * Fetch the per-market taker fee rate in basis points.
+   * The clob-client exposes this via `getMarket(conditionId)`.
+   */
+  async getMarketFeeRateBps(conditionId: string): Promise<number> {
+    const client = await this.ensureInitialized();
+    return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
+      try {
+        // @ts-ignore — clob-client versions vary; the market metadata
+        // field name is `fee_rate_bps` or `feeRateBps`.
+        const market = await (client as any).getMarket(conditionId);
+        const bps =
+          market?.fee_rate_bps ??
+          market?.feeRateBps ??
+          market?.fee_rate ??
+          200;
+        return typeof bps === 'string' ? Number(bps) : bps;
+      } catch {
+        return 200; // default 2% taker
+      }
+    });
+  }
+
   async getEarningsForDay(date: string): Promise<UserEarning[]> {
     const client = await this.ensureInitialized();
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {

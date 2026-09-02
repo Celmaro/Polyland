@@ -51,6 +51,25 @@ import type { RiskManager } from './risk-manager.js';
 import type { VoteStateStore } from './vote-state-store.js';
 import { signalAuditStore, type SignalSide } from './signal-audit-store.js';
 import { GammaApiClient } from '../clients/gamma-api.js';
+import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
+import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from '../utils/anti-sniper.js';
+import { buildOrderBookSummary } from '../utils/liquidity-check.js';
+import { ChainlinkTwapOracle, type CryptoSymbol, type TwapSignalEvaluation } from './chainlink-twap-oracle.js';
+
+/** Symbol → question-key heuristic mapping (lowercased). For markets
+ *  where the title contains 'btc', 'eth', 'sol', 'xrp', 'doge', 'hype' we
+ *  treat it as a crypto-resolution market and consult the oracle. */
+function detectCryptoSymbol(slug: string | undefined): CryptoSymbol | null {
+  if (!slug) return null;
+  const s = slug.toLowerCase();
+  if (s.includes('btc') || s.includes('bitcoin')) return 'btc';
+  if (s.includes('eth') || s.includes('ethereum')) return 'eth';
+  if (s.includes('sol') && !s.includes('solana-air')) return 'sol';
+  if (s.includes('xrp') || s.includes('ripple')) return 'xrp';
+  if (s.includes('doge')) return 'doge';
+  if (s.includes('hype')) return 'hype';
+  return null;
+}
 
 // ============================================================================
 // Config
@@ -149,6 +168,16 @@ export interface QuorumStats {
   quorumSkippedRiskHalt: number;
   /** Dropped because the basket's bankroll slice is exhausted */
   quorumSkippedBankroll: number;
+  /** Dropped by the anti-sniper guard (mid jump, unstable mid, fill cooldown) */
+  quorumSkippedAntiSniper?: number;
+  /** Dropped by the Chainlink TWAP oracle due to stale data */
+  quorumSkippedTwapStale?: number;
+  /** Dropped by the Chainlink TWAP oracle due to momentum misalignment */
+  quorumSkippedTwapMisaligned?: number;
+  /** Dropped by the 2× liquidity check (book too thin) */
+  quorumSkippedThinLiquidity?: number;
+  /** Dropped by the fee-adjusted edge filter (no profitable edge after fees) */
+  quorumSkippedNegativeEdge?: number;
   executed: number;
   failed: number;
 }
@@ -199,6 +228,16 @@ export class BasketQuorumService {
   private gammaApi: GammaApiClient | null = null;
   /** Pending follow-up timers keyed by signalId */
   private pendingFollowups: Map<string, NodeJS.Timeout[]> = new Map();
+  /** Anti-sniper guard (mid-jump, fill-cooldown, reprice clamping). */
+  private antiSniper: AntiSniperGuard | null = null;
+  /** Chainlink TWAP oracle (crypto markets only). */
+  private twapOracle: ChainlinkTwapOracle | null = null;
+  /** Per-conditionId fee rate cache (basis points), so we don't refetch. */
+  private feeRateCache: Map<string, number> = new Map();
+  /** Per-conditionId tick size cache. */
+  private tickSizeCache: Map<string, number> = new Map();
+  /** Per-conditionId last TWAP evaluation result (debug + audit). */
+  private lastTwapEval: Map<string, TwapSignalEvaluation> = new Map();
   /**
    * Per-category specialization thresholds used by seed() to decide which
    * basket(s) a wallet joins. Mirrors WalletScreeningConfig so both gates
@@ -252,6 +291,33 @@ export class BasketQuorumService {
    */
   setGammaApi(api: GammaApiClient): void {
     this.gammaApi = api;
+  }
+
+  /**
+   * Wire an anti-sniper guard. Without one, the fire path is unprotected
+   * against thin-book fills and copy-sniping. The default is the proven
+   * config (3% mid-jump, 1s stable confirm, 5s fill cooldown, 2 ticks
+   * reprice cap).
+   */
+  setAntiSniper(guard: AntiSniperGuard): void {
+    this.antiSniper = guard;
+  }
+
+  /**
+   * Wire the Chainlink TWAP oracle for crypto Up/Down markets. Without
+   * one, crypto baskets fire on the bare consensus without an oracle
+   * sanity check.
+   */
+  setTwapOracle(oracle: ChainlinkTwapOracle): void {
+    this.twapOracle = oracle;
+  }
+
+  /**
+   * Feed a mid-price observation to the anti-sniper guard. The order book
+   * subscriber should call this for every mid update.
+   */
+  observeMid(tokenId: string, mid: number): void {
+    this.antiSniper?.observe(tokenId, mid);
   }
 
   /**
@@ -693,6 +759,51 @@ export class BasketQuorumService {
       return;
     }
 
+    // 7c-pre. Anti-sniper guard (lihanyu81 polymarket_lp_tool pattern):
+    //     rejects the fire if the CLOB mid has jumped, the mid hasn't
+    //     been stable long enough, or we just filled on this market.
+    if (this.antiSniper && trade.tokenId) {
+      const decision = this.antiSniper.allowFire(trade.tokenId, now);
+      if (!decision.allow) {
+        this.stats.quorumSkippedAntiSniper =
+          (this.stats.quorumSkippedAntiSniper ?? 0) + 1;
+        if (process.env['DEBUG_QUORUM']) {
+          console.log(
+            `[BasketQuorum] SKIP anti-sniper: ${signal.marketSlug} ` +
+              `reason=${decision.reason}`,
+          );
+        }
+        return;
+      }
+    }
+
+    // 7c-pre2. Chainlink TWAP oracle (KingSparta69 pattern). For crypto
+    //     markets, sanity-check the consensus against the running 30s/60s
+    //     TWAP. If TWAP momentum disagrees with our side, demote the
+    //     signal quality (skip if completely anti-aligned).
+    if (this.twapOracle && basket.category === 'crypto') {
+      const symbol = detectCryptoSymbol(signal.marketSlug);
+      if (symbol) {
+        const evalResult = this.twapOracle.evaluate(
+          symbol,
+          signal.consensusPrice,
+          signal.side,
+          now,
+        );
+        this.lastTwapEval.set(conditionId, evalResult);
+        if (evalResult.quality === 'stale') {
+          this.stats.quorumSkippedTwapStale =
+            (this.stats.quorumSkippedTwapStale ?? 0) + 1;
+          return;
+        }
+        if (evalResult.quality === 'fresh' && !evalResult.aligned) {
+          this.stats.quorumSkippedTwapMisaligned =
+            (this.stats.quorumSkippedTwapMisaligned ?? 0) + 1;
+          return;
+        }
+      }
+    }
+
     // 7c. Price-band / drift filter — the CRITICAL edge decoy. If the market
     //     has already moved past maxDrift from consensus entry, skip.
     this.executeIfInBand(trade, signal, basket);
@@ -750,8 +861,63 @@ export class BasketQuorumService {
         return;
       }
 
+      // 8a. Fee-adjusted edge check (Polymarket docs fee formula).
+      //     If expected edge after taker fees is non-positive, skip the trade.
+      //     Cached feeRateBps per condition; defaults to ~2% if unknown.
+      const feeRateBps = this.feeRateCache.get(signal.conditionId) ?? DEFAULT_FEE_RATE_BPS;
+      const feePerShareVal = takerFeePerShare(signal.consensusPrice, feeRateBps);
+      const winRate = signal.winRate ?? 0.6;
+      const expectedEdge = winRate - signal.consensusPrice - feePerShareVal;
+      if (expectedEdge <= 0) {
+        this.stats.quorumSkippedNegativeEdge =
+          (this.stats.quorumSkippedNegativeEdge ?? 0) + 1;
+        console.log(
+          `[BasketQuorum] SKIP negative-edge: ${signal.marketSlug} ` +
+            `winRate=${winRate.toFixed(3)} price=${signal.consensusPrice.toFixed(3)} ` +
+            `fee=${(feePerShareVal * 100).toFixed(2)}% edge=${(expectedEdge * 100).toFixed(2)}%`,
+        );
+        return;
+      }
+
+      // 8b. 2× liquidity check (early-bird.ts pattern from polymarket-trade-engine).
+      //     Only run when not in dry-run and we have a real CLOB connection.
+      if (trade.tokenId && !this.config.dryRun) {
+        try {
+          const raw = await this.tradingService.getOrderBook(trade.tokenId);
+          if (raw) {
+            const book = buildOrderBookSummary(raw);
+            const liqCheck = book.hasSufficientLiquidity({
+              side: 'BUY',
+              shares: copySize,
+              price: signal.consensusPrice,
+              multiplier: 2,
+            });
+            if (!liqCheck.ok) {
+              this.stats.quorumSkippedThinLiquidity =
+                (this.stats.quorumSkippedThinLiquidity ?? 0) + 1;
+              console.log(
+                `[BasketQuorum] SKIP thin-liquidity: ${signal.marketSlug} ` +
+                  `${liqCheck.reason ?? 'unknown'}`,
+              );
+              return;
+            }
+          }
+        } catch {
+          // Book fetch failed — non-fatal; continue without the check.
+        }
+      }
+
       const slippagePrice =
         signal.consensusPrice * (1 + this.config.maxSlippage);
+
+      // Clamp reprice via anti-sniper (maxRepriceTicks cap).
+      const finalPrice = this.antiSniper && trade.tokenId
+        ? this.antiSniper.clampReprice(
+            trade.tokenId,
+            slippagePrice,
+            this.tickSizeCache.get(signal.conditionId) ?? 0.01,
+          )
+        : slippagePrice;
 
       let result: OrderResult;
       if (this.config.dryRun) {
@@ -763,13 +929,15 @@ export class BasketQuorumService {
           quorum: signal.walletCount,
           wallets: signal.wallets.map((w) => w.slice(0, 8)),
           usdc: usdcAmount.toFixed(2),
+          edge_pct: (expectedEdge * 100).toFixed(2),
+          fee_bps: feeRateBps,
         });
       } else {
         result = await this.tradingService.createMarketOrder({
           tokenId: trade.tokenId!,
           side: 'BUY',
           amount: usdcAmount,
-          price: slippagePrice,
+          price: finalPrice,
           orderType: this.config.orderType,
         });
       }
@@ -780,6 +948,10 @@ export class BasketQuorumService {
           basket.category,
           (this.basketSpend.get(basket.category) ?? 0) + usdcAmount,
         );
+        // Record fire in the anti-sniper guard so cooldown takes effect.
+        if (this.antiSniper && trade.tokenId) {
+          this.antiSniper.recordFire(trade.tokenId);
+        }
       } else {
         this.stats.failed++;
       }
@@ -811,6 +983,11 @@ export class BasketQuorumService {
     skipped_bankroll: number;
     skipped_drift: number;
     skipped_cooldown: number;
+    skipped_anti_sniper: number;
+    skipped_twap_stale: number;
+    skipped_twap_misaligned: number;
+    skipped_thin_liquidity: number;
+    skipped_negative_edge: number;
     executed: number;
     failed: number;
     conversion_pct: number;
@@ -828,6 +1005,11 @@ export class BasketQuorumService {
       skipped_bankroll: s.quorumSkippedBankroll,
       skipped_drift: s.quorumSkippedDrift,
       skipped_cooldown: s.quorumSkippedCooldown,
+      skipped_anti_sniper: s.quorumSkippedAntiSniper ?? 0,
+      skipped_twap_stale: s.quorumSkippedTwapStale ?? 0,
+      skipped_twap_misaligned: s.quorumSkippedTwapMisaligned ?? 0,
+      skipped_thin_liquidity: s.quorumSkippedThinLiquidity ?? 0,
+      skipped_negative_edge: s.quorumSkippedNegativeEdge ?? 0,
       executed: s.executed,
       failed: s.failed,
       conversion_pct: Math.round(conversion * 100) / 100,
@@ -840,6 +1022,9 @@ export class BasketQuorumService {
         `fired=${funnel.quorum_fired} ` +
         `risk=${funnel.skipped_risk} bankroll=${funnel.skipped_bankroll} ` +
         `drift=${funnel.skipped_drift} cooldown=${funnel.skipped_cooldown} ` +
+        `antiSniper=${funnel.skipped_anti_sniper} ` +
+        `twap=${funnel.skipped_twap_stale}/${funnel.skipped_twap_misaligned} ` +
+        `liq=${funnel.skipped_thin_liquidity} negEdge=${funnel.skipped_negative_edge} ` +
         `executed=${funnel.executed} failed=${funnel.failed} ` +
         `conversion=${funnel.conversion_pct}%` +
         (edgeStats.signalsSettled > 0

@@ -667,3 +667,65 @@ export { BacktestRunner } from './services/backtest-runner.js';
 export type { BacktestConfig, BacktestResult } from './services/backtest-runner.js';
 export { SignalAuditStore, signalAuditStore } from './services/signal-audit-store.js';
 export type { EdgeStats, FiredSignal, SignalSide, SignalOutcome } from './services/signal-audit-store.js';
+
+// ============================================================================
+// Repo survey improvements (2026-09):
+//   - Polymarket fee math utilities
+//   - Anti-sniper / mid-stability guards (lihanyu81 pattern)
+//   - Order book liquidity check (early-bird.ts pattern)
+//   - Maker/taker detection from closed positions
+//   - Chainlink TWAP oracle via RTDS (KingSparta69 + MattheusFeittosa pattern)
+// ============================================================================
+
+export {
+  takerFeePerShare,
+  feePerShare,
+  expectedEdgeBuy,
+  expectedEdgeSell,
+  roundTripTakerCost,
+  breakEvenWinRate,
+  DEFAULT_FEE_RATE_BPS,
+  MAKER_FEE_BPS,
+  type FeeRateBps,
+} from './utils/fee-math.js';
+
+export {
+  AntiSniperGuard,
+  DEFAULT_ANTI_SNIPER_CONFIG,
+  type AntiSniperConfig,
+  type GuardDecision,
+} from './utils/anti-sniper.js';
+
+export {
+  buildOrderBookSummary,
+  fetchBook,
+  type OrderBookSummary,
+  type OrderBookLevel,
+  type LiquidityCheckParams,
+  type LiquidityCheckResult,
+  type BookFetcher,
+} from './utils/liquidity-check.js';
+
+export {
+  inferMakerTaker,
+  aggregateMakerTaker,
+  makerRateScoreBonus,
+  type ClosedPositionLike,
+  type MakerTakerStats,
+} from './utils/maker-taker.js';
+
+export {
+  ChainlinkTwapOracle,
+  RTDS_WS_URL,
+  RTDS_TWAP_TOPICS,
+  RTDS_TWAP_FEED_IDS,
+  CHAINLINK_E18,
+  type CryptoSymbol,
+  type TwapTick,
+  type TwapSnapshot,
+  type TwapWindowSeconds,
+  type TwapSignalEvaluation,
+  type TwapSignalQuality,
+  type RtdsClientOptions,
+} from './services/chainlink-twap-oracle.js';
+
