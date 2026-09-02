@@ -530,10 +530,19 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   // Seed baskets with screened wallets
   basketQuorum.seed(primaries);
 
-  // Wire trades into quorum
-  quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades((trade: SmartMoneyTrade) => {
-    basketQuorum?.onTrade(trade);
-  });
+  // Wire trades into quorum — pass wallet addresses as filter so the service
+  // only forwards trades from those specific wallets. smartMoneyOnly=false
+  // because these are screened wallets, not necessarily in the SDK's internal
+  // smartMoneySet (setupSmartMoney is disabled to keep only basket-quorum active).
+  quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades(
+    (trade: SmartMoneyTrade) => {
+      basketQuorum?.onTrade(trade);
+    },
+    {
+      filterAddresses: primaries.map((w) => w.address),
+      smartMoneyOnly: false,
+    },
+  );
 
   // Periodic funnel logging every 5 minutes
   setInterval(() => {
