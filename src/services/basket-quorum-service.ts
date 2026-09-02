@@ -622,6 +622,11 @@ export class BasketQuorumService {
       primaryCount >= 2 ||
       (primaryCount >= 1 && satelliteCount >= 2);
     if (!tieredFires) {
+      // Diagnostic: log NEAR-MISSES so we can see if consensus is *almost* there.
+      if (primaryCount + satelliteCount >= 2) {
+        const voters = [...outcomeVotes.values()].map(v => `${v.tier}@${v.price}`).join(',');
+        console.log(`[Quorum near-miss] ${marketSlug} ${outcome} primary=${primaryCount} sat=${satelliteCount} votes=[${voters}]`);
+      }
       // Not enough tier-weighted consensus — wait for more basket members.
       return;
     }
