@@ -618,11 +618,14 @@ export class WalletScreeningService {
     const components = this.computeScoringComponents(profile);
     const copyScore = this.computeCopyScore(components);
 
-    // DEBUG: log top 5 candidates' copyScore vs specializes evaluation
+    const resolvedCat = resolved?.category ?? 'other';
+    const catStat = catWinRates[resolvedCat];
+
+    // DEBUG: log top 2 candidates' copyScore vs specializes evaluation
     // (only fires once per cycle via static callCount guard)
     if ((this as any).__dbg === undefined) { (this as any).__dbg = 0; }
     if ((this as any).__dbg++ < 2) {
-      console.log(`[Score] ${c.address.slice(0,8)} copyScore=${copyScore} consistency=${Math.min(99.5, profile.winRate*100*0.55+Math.min(profile.smartScore/25,3)*8+profile.smartScore/4).toFixed(1)} specializes-check=${copyScore>=75||(catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0.3*profile.winRate>=0.60)}`);
+      console.log(`[Score] ${c.address.slice(0,8)} copyScore=${copyScore} winRate=${profile.winRate} smartScore=${profile.smartScore} cat=${resolvedCat} catStat=${JSON.stringify(catStat)} specializes=${copyScore>=75||(!!catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0)}`);
     }
 
     // Category specialization gate.
@@ -632,8 +635,6 @@ export class WalletScreeningService {
     // generalist-expert wallets (CopyScore 75+) are legitimately skilled across
     // categories — their CopyScore proves edge without needing category concentration.
     // CopyScore >= 75 bypasses specializes entirely (top-tier generalists).
-    const resolvedCat = resolved?.category ?? 'other';
-    const catStat = catWinRates[resolvedCat];
     const concentration = catStat?.tradeCount
       ? catStat.tradeCount / profile.tradeCount
       : 0;
