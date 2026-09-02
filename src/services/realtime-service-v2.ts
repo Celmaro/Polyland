@@ -586,7 +586,15 @@ export class RealtimeServiceV2 extends EventEmitter {
           { topic: 'activity', type: 'orders_matched' },
         ];
 
-    this.sendSubscription({ subscriptions });
+    const subMsg = { subscriptions };
+    this.sendSubscription(subMsg);
+    // Store for re-subscribe on reconnect. Without this, on WS reconnect the
+    // activity feed is silently lost — handleConnect only re-sends entries from
+    // subscriptionMessages, and subscribeActivity was previously a fire-and-forget
+    // (only subscribeMarkets/subscribeCryptoChainlinkPrices stored). That left
+    // handleConnect resending the OTHER (stale) entries while activity remained
+    // dead — and the duplicate error was a server-side duplicate-connection race.
+    this.subscriptionMessages.set(subId, subMsg);
 
     const handler = (trade: ActivityTrade) => handlers.onTrade?.(trade);
     this.on('activityTrade', handler);
@@ -598,6 +606,7 @@ export class RealtimeServiceV2 extends EventEmitter {
       unsubscribe: () => {
         this.off('activityTrade', handler);
         this.sendUnsubscription({ subscriptions });
+        this.subscriptionMessages.delete(subId);
         this.subscriptions.delete(subId);
       },
     };
