@@ -245,7 +245,10 @@ export class WalletService {
   async getWalletProfile(address: string): Promise<WalletProfile> {
     const [positions, activities] = await Promise.all([
       this.dataApi.getPositions(address),
-      this.dataApi.getActivity(address, { limit: 100 }),
+      // getAllActivity paginates up to maxItems so tradeCount reflects real
+      // history (not just the last 100). 500 is enough to separate skill from
+      // luck without hammering the API per wallet.
+      this.dataApi.getAllActivity(address, undefined, 500),
     ]);
 
     const totalPnL = positions.reduce((sum, p) => sum + (p.cashPnl || 0), 0);
