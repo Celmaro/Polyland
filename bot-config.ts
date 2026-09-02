@@ -523,6 +523,13 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
   log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE`);
 
+  // Debug: log top 10 candidates by CopyScore (even if not seeded) to diagnose thresholds
+  const sorted = [...screened].sort((a, b) => b.copyScore - a.copyScore);
+  const top10 = sorted.slice(0, 10).map((w) =>
+  `${w.tier}[${w.copyScore}]${w.category}`
+  ).join(' | ');
+  log('QUORUM', `Top10 copyScore: ${top10}`);
+
   if (primaries.length === 0) {
     log('WARN', 'No PRIMARY/SATELLITE wallets passed screening');
     return;
