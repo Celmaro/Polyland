@@ -520,12 +520,19 @@ export class WalletScreeningService {
       return { isBot: true, reason: 'AMM/spread-capture bot signature (winRate≥75%, vol≥500, smartScore≥95)' };
     }
 
-    // Pattern 2: HFT — orders/day > 90
+    // Pattern 2: HFT — orders/day > threshold
+    // We don't have per-fill timestamps, so we approximate orders/day as:
+    //   tradeCount / max(tradingWindowDays, 30)
+    // where tradingWindowDays = days since last active, floored at 30 days.
+    // Without first-activity data, a 30-day floor prevents freshly-active wallets
+    // with moderate trade counts from being misclassified as HFT.
+    // A wallet with 200 trades over 30 days = ~7 orders/day (human pace).
+    // A wallet with 200 trades over 2 days (but last active 30d ago) = ~7/day.
     const daysSinceActive = Math.max(1,
       (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000,
     );
-    // Approximate orders per day from trade frequency
-    const ordersPerDay = profile.tradeCount / Math.max(1, daysSinceActive);
+    const tradingWindowDays = Math.max(30, daysSinceActive);
+    const ordersPerDay = profile.tradeCount / tradingWindowDays;
     if (ordersPerDay > this.config.maxOrdersPerDay) {
       return { isBot: true, reason: `HFT signature (${ordersPerDay.toFixed(0)} orders/day > ${this.config.maxOrdersPerDay})` };
     }
