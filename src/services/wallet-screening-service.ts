@@ -45,8 +45,35 @@
 
 import type { WalletService, WalletProfile } from './wallet-service.js';
 import type { RawCandidate } from './wallet-ingestion-service.js';
-import { categorizeMarket, type MarketCategory } from './smart-money-service.js';
 import type { ActivityCache } from './activity-cache.js';
+import { categorizeMarket, type MarketCategory } from './smart-money-service.js';
+
+/**
+ * Normalize an arbitrary leaderboard/hint category string to a valid
+ * lowercase MarketCategory. Leaderboard emits OVERALL, CULTURE, MENTIONS,
+ * WEATHER, TECH, FINANCE — none of which are valid MarketCategory values,
+ * so wallets labeled that way would be seeded into a ghost basket that
+ * never receives a matching trade (categorizeMarket never returns them).
+ */
+function normalizeCategory(raw: string): MarketCategory {
+  const cat = (raw ?? '').toLowerCase();
+  switch (cat) {
+    case 'politics': return 'politics';
+    case 'sports': return 'sports';
+    case 'crypto': return 'crypto';
+    case 'esports': return 'esports';
+    case 'entertainment': return 'entertainment';
+    case 'culture': return 'entertainment';
+    case 'economics': return 'economics';
+    case 'finance': return 'economics';
+    case 'science': return 'science';
+    case 'tech': return 'science';
+    case 'mentions': return 'other';
+    case 'weather': return 'other';
+    case 'other': return 'other';
+    default: return 'other';  // OVERALL etc.
+  }
+}
 
 // ============================================================================
 // Config
@@ -346,12 +373,18 @@ export class WalletScreeningService {
     await Promise.all(
       candidates.map(async (c) => {
         // Priority: manual hint > auto/leaderboard category > activity inference > 'other'
+        // All normalized to LOWERCASE MarketCategory — categorizeMarket() and
+        // basket keys are lowercase, and a 'POLITICS' vs 'politics' mismatch
+        // silently breaks categoryWinRates lookups AND basket routing at trade time.
+        // Leaderboard emits categories (OVERALL, CULTURE, MENTIONS, WEATHER, TECH,
+        // FINANCE) that are NOT valid MarketCategory — map them here so those wallets
+        // don't land in a ghost basket that never receives a matching trade.
         if (c.hintCategory) {
-          results.set(c.address, { category: c.hintCategory as MarketCategory, source: 'manual', confidence: 1 });
+          results.set(c.address, { category: normalizeCategory(c.hintCategory), source: 'manual', confidence: 1 });
           return;
         }
         if (c.leaderboardCategory) {
-          results.set(c.address, { category: c.leaderboardCategory as MarketCategory, source: 'auto', confidence: 0.9 });
+          results.set(c.address, { category: normalizeCategory(c.leaderboardCategory), source: 'auto', confidence: 0.9 });
           return;
         }
         // Inference from recent activity — check cache first
