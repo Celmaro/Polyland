@@ -517,40 +517,56 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     return;
   }
 
-  // Screen and score wallets
-  log('QUORUM', 'Screening wallets...');
-  const screened = await screening.score(candidates);
-  const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
-  log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE`);
+  // Wire trade feed IMMEDIATELY — before screening — so we don't miss trades
+    // during the 5-15min it takes to screen 250+ candidates. filterAddresses is
+    // empty here: onTrade() filters by basket membership, so we capture all trades
+    // and discard the ones from wallets that don't end up seeded.
+    // Once seeding completes, basketQuorum.seed(primaries) sets the wallet list.
+    const tradeBuffer: SmartMoneyTrade[] = [];
+    const SEED_BUFFER_LIMIT = 1000;
+    quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades(
+      (trade: SmartMoneyTrade) => {
+        // Buffer trades until seed() completes (otherwise they'd be dropped
+        // because no baskets exist yet). The buffer is bounded; if screening
+        // takes longer than the trade volume we drop oldest.
+        if (!basketQuorum || basketQuorum.getBasketCount() === 0) {
+          if (tradeBuffer.length < SEED_BUFFER_LIMIT) tradeBuffer.push(trade);
+          return;
+        }
+        basketQuorum.onTrade(trade);
+      },
+      { filterAddresses: [], smartMoneyOnly: false },
+    );
 
-  // Debug: log top 10 candidates by CopyScore (even if not seeded) to diagnose thresholds
-  const sorted = [...screened].sort((a, b) => b.copyScore - a.copyScore);
-  const top10 = sorted.slice(0, 10).map((w) =>
-    `${w.tier}[${w.copyScore}]${w.category}(${w.reason.slice(0, 40)})`
-  ).join(' | ');
-  log('QUORUM', `Top10: ${top10}`);
+    // Screen and score wallets
+    log('QUORUM', 'Screening wallets...');
+    const screened = await screening.score(candidates);
+    const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
+    log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE`);
 
-  if (primaries.length === 0) {
-    log('WARN', 'No PRIMARY/SATELLITE wallets passed screening');
-    return;
-  }
+    // Debug: log top 10 candidates by CopyScore (even if not seeded) to diagnose thresholds
+    const sorted = [...screened].sort((a, b) => b.copyScore - a.copyScore);
+    const top10 = sorted.slice(0, 10).map((w) =>
+      `${w.tier}[${w.copyScore}]${w.category}(${w.reason.slice(0, 40)})`
+    ).join(' | ');
+    log('QUORUM', `Top10: ${top10}`);
 
-  // Seed baskets with screened wallets
-  basketQuorum.seed(primaries);
+    if (primaries.length === 0) {
+      log('WARN', 'No PRIMARY/SATELLITE wallets passed screening');
+      return;
+    }
 
-  // Wire trades into quorum — pass wallet addresses as filter so the service
-  // only forwards trades from those specific wallets. smartMoneyOnly=false
-  // because these are screened wallets, not necessarily in the SDK's internal
-  // smartMoneySet (setupSmartMoney is disabled to keep only basket-quorum active).
-  quorumSubscription = sdk.smartMoney.subscribeSmartMoneyTrades(
-    (trade: SmartMoneyTrade) => {
-      basketQuorum?.onTrade(trade);
-    },
-    {
-      filterAddresses: primaries.map((w) => w.address),
-      smartMoneyOnly: false,
-    },
-  );
+    // Seed baskets with screened wallets
+    basketQuorum.seed(primaries);
+
+    // Drain the buffered trades captured during screening. These are trades from
+    // wallets that may already be PRIMARY/SATELLITE; replaying them lets the
+    // basket-quorum count votes that arrived in the gap.
+    if (tradeBuffer.length > 0) {
+      log('INFO', `Replaying ${tradeBuffer.length} buffered trades post-seed`);
+      for (const trade of tradeBuffer) basketQuorum.onTrade(trade);
+      tradeBuffer.length = 0;
+    }
 
   // Periodic funnel logging every 5 minutes
   setInterval(() => {
