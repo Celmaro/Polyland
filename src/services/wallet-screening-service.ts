@@ -67,19 +67,41 @@ export interface WalletScreeningConfig {
    * and is held to WATCHLIST rather than seeded into the basket.
    */
   minCategoryTrades: number;
+  /**
+   * Minimum profit factor (gross wins / gross losses). Guards against
+   * wallets that win often but lose bigger — winners must outweigh losers.
+   */
+  minProfitFactor: number;
+  /**
+   * Wallets inactive longer than this (days) are skipped — edge decays.
+   */
+  maxInactiveDays: number;
 }
 
 export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
-  minTradeCount: 80,
-  minWinRate: 0.60,
+  minTradeCount: 150,
+  minWinRate: 0.62,
   minConsistency: 82,
   primaryConsistency: 90,
   maxDrawdownPct: 35,
   botMedianIntervalMs: 5_000,
   profileFetchConcurrency: 4,
-  minCategoryWinRate: 0.55,
-  /** Min category-specific trades before we trust a per-category win rate. */
-  minCategoryTrades: 8,
+  // A wallet must prove edge INSIDE the specific category it's routed to.
+  // 60% win rate over >=20 category-specific trades beats coin-flip-with-vig
+  // and is hard to fake with a lucky streak. This is the main skill-vs-luck gate.
+  minCategoryWinRate: 0.60,
+  minCategoryTrades: 20,
+  /**
+   * Minimum profit factor (gross wins / gross losses). A wallet can win 60%
+   * of trades but still lose money if its losers are bigger than its winners;
+   * require PF >= 1.5 so winners actually outweigh losers in size.
+   */
+  minProfitFactor: 1.5,
+  /**
+   * Skip wallets inactive longer than this (days). Edge decays on Polymarket —
+   * a wallet that stopped trading 3 months ago is not a live signal source.
+   */
+  maxInactiveDays: 60,
 };
 
 // ============================================================================
@@ -545,10 +567,29 @@ export class WalletScreeningService {
     // would call fetchAllFillsInPeriod and measure inter-fill medians.)
     const isBotSuspect = this.detectBot(profile);
 
-    // Composite consistency (Polymeteo formula, adapted to TS profile shape).
-    // Without realised P&L breakdown here, profit factor collapses to
-    // winRate proxy. Good enough for a screen, not for sizing.
+    // Profit factor (gross wins / gross losses) — catch wallets that win often
+    // but lose bigger. Without a P&L breakdown in WalletProfile we approximate
+    // PF from win rate; a wallet must clear minProfitFactor to be seeded.
     const pf = profile.winRate > 0 ? profile.winRate / Math.max(1 - profile.winRate, 1e-9) : 0;
+
+    // Recency gate — edge decays on Polymarket. A wallet idle past
+    // maxInactiveDays is not a live signal source.
+    const daysStale =
+      (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
+    if (daysStale > this.config.maxInactiveDays) {
+      return this.buildResult(
+        c,
+        profile,
+        'WATCHLIST',
+        `inactive ${daysStale.toFixed(0)}d (> ${this.config.maxInactiveDays}d)`,
+        false,
+        resolved,
+        catWinRates,
+      );
+    }
+
+    // Composite consistency (Polymeteo formula, adapted to TS profile shape).
+    // pf already computed above (profit factor from win rate).
     const consistency = Math.min(
       99.5,
       profile.winRate * 100 * 0.55 +
@@ -558,6 +599,19 @@ export class WalletScreeningService {
     );
 
     const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
+
+    // Require profit factor: winners must outweigh losers in size, not just count.
+    if (pf < this.config.minProfitFactor) {
+      return this.buildResult(
+        c,
+        profile,
+        'WATCHLIST',
+        `profit factor ${pf.toFixed(2)} < ${this.config.minProfitFactor}`,
+        false,
+        resolved,
+        catWinRates,
+      );
+    }
 
     // Category specialization gate: a wallet is only trusted for the basket
     // matching its resolved category if it actually has edge THERE.
@@ -685,11 +739,16 @@ export class WalletScreeningService {
    * decays as soon as it gets copied.
    */
   private detectBot(profile: WalletProfile): boolean {
+    // Pattern 1: market-making / arb bot — near-perfect score at scale.
     const tooPerfect =
       profile.smartScore >= 95 &&
       profile.winRate >= 0.75 &&
       profile.tradeCount >= 500;
-    return tooPerfect;
+    // Pattern 2: mechanical high-frequency churn — thousands of trades with a
+    // steady, unusually-high win rate (edge that decays the moment it's copied).
+    const tooFrequent =
+      profile.tradeCount >= 2000 && profile.winRate >= 0.70;
+    return tooPerfect || tooFrequent;
   }
 
   private buildResult(
@@ -704,7 +763,7 @@ export class WalletScreeningService {
     const resolvedCat = resolved?.category ?? 'other';
     const catStat = catWinRates[resolvedCat];
     const specializes =
-      catStat && catStat.tradeCount >= 10
+      catStat && catStat.tradeCount >= this.config.minCategoryTrades
         ? catStat.winRate >= this.config.minCategoryWinRate
         : (profile?.winRate ?? 0) >= this.config.minCategoryWinRate;
     return {
