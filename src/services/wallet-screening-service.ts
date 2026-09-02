@@ -625,7 +625,7 @@ export class WalletScreeningService {
 
     // DEBUG: log high-copyScore candidates' copyScore vs specializes evaluation
     if (copyScore >= 55) {  // lowered from 75 to catch SPORTS=90
-      console.log(`[Score] ${c.address.slice(0,8)} copyScore=${copyScore} winRate=${profile.winRate} smartScore=${profile.smartScore} cat=${resolvedCat} catStat=${JSON.stringify(catStat)} specializes=${copyScore>=75||(!!catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0)}`);
+      console.log(`[Score] ${c.address} copyScore=${copyScore} winRate=${profile.winRate} smartScore=${profile.smartScore} cat=${resolvedCat} catStat=${JSON.stringify(catStat)} specializes=${copyScore>=75||(!!catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0)}`);
     }
 
     // Category specialization gate.
