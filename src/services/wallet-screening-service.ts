@@ -618,6 +618,13 @@ export class WalletScreeningService {
     const components = this.computeScoringComponents(profile);
     const copyScore = this.computeCopyScore(components);
 
+    // DEBUG: log top 5 candidates' copyScore vs specializes evaluation
+    // (only fires once per cycle via static callCount guard)
+    if ((this as any).__dbg === undefined) { (this as any).__dbg = 0; }
+    if ((this as any).__dbg++ < 2) {
+      console.log(`[Score] ${c.address.slice(0,8)} copyScore=${copyScore} consistency=${Math.min(99.5, profile.winRate*100*0.55+Math.min(profile.smartScore/25,3)*8+profile.smartScore/4).toFixed(1)} specializes-check=${copyScore>=75||(catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0.3*profile.winRate>=0.60)}`);
+    }
+
     // Category specialization gate.
     // A wallet routing to a specific basket must prove it actually wins there.
     // APPROXIMATION: category trades / total trades must exceed concentration
