@@ -573,6 +573,8 @@ export class WalletScreeningService {
     catWinRates: Record<string, { winRate: number; tradeCount: number }>,
     gateCounts?: Record<string, number>,
   ): ScreenedWallet {
+    // DEBUG: log address when entering evaluate()
+    console.log(`[Eval] ${c.address.slice(0,8)} hintCat=${c.hintCategory ?? 'none'} resolved=${resolved?.category} copyScore-pending`);
     // No profile — cannot score
     if (!profile) {
       if (gateCounts) gateCounts['no profile'] = (gateCounts['no profile'] ?? 0) + 1;
