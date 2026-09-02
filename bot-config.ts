@@ -383,7 +383,11 @@ let basketQuorum: BasketQuorumService | null = null;
 let quorumSubscription: { id: string; unsubscribe: () => void } | null = null;
 
 const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
-  defaultQuorum: 3,
+  // Quorum of 2 distinct, vetted wallets per basket. With ~67 leaderboard
+  // candidates yielding only 2-7 quality wallets, 2 is the minimum viable
+  // consensus (still "two independent experts agreed", not one wallet's luck).
+  // Raise to 3+ if the candidate pool grows.
+  defaultQuorum: 2,
   defaultWindowMs: 30 * 60 * 1000,       // 30-minute rolling window
   maxPriceDrift: 0.05,
   fireCooldownMs: 10 * 60 * 1000,
