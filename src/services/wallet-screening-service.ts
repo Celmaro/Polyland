@@ -81,8 +81,6 @@ export interface WalletScreeningConfig {
    * win rate. Below this the wallet has no demonstrated edge in that category.
    */
   minCategoryTrades: number;
-  /** Minimum profit factor (gross wins / gross losses) */
-  minProfitFactor: number;
   /** Wallets inactive longer than this (days) are skipped — edge decays */
   maxInactiveDays: number;
   /**
@@ -98,7 +96,9 @@ export interface WalletScreeningConfig {
 }
 
 export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
-  minTradeCount: 150,
+  // 100+ trades = full data marker in the industry rubric; CopyScore's
+  // shrinkage adjustment already penalizes thin samples below this.
+  minTradeCount: 100,
   minWinRate: 0.60,
   minConsistency: 82,
   primaryConsistency: 92,
@@ -106,11 +106,10 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   maxOrdersPerDay: 90,    // Polycopy: 90+ orders/day = bot signature
   profileFetchConcurrency: 4,
   // Category specialization: must prove edge inside the specific basket routed to.
-  // 58% win rate over >= 12 category-specific trades beats coin-flip-with-vig.
+  // 58% win rate over >= 3 SETTLED category positions beats coin-flip-with-vig.
+  // (Settled positions aggregate fills — 3 settled markets is a real sample.)
   minCategoryWinRate: 0.58,
-  minCategoryTrades: 12,
-  // Winners must outweigh losers in size.
-  minProfitFactor: 1.5,
+  minCategoryTrades: 3,
   // Edge decays — a wallet idle 60+ days is not a live signal source.
   maxInactiveDays: 60,
   // CopyScore thresholds (0–100 composite — Poly Syncer/Polycopy methodology).
@@ -642,11 +641,15 @@ export class WalletScreeningService {
       ? catStat.tradeCount / profile.tradeCount
       : 0;
     const minConcentration = copyScore >= 75 ? 0 : 0.30;
-    const hasCatStats = catStat !== undefined && catStat.tradeCount >= 12;
-    const catEdge = hasCatStats && catStat.winRate >= this.config.minCategoryWinRate;
+    // Category edge: >=3 SETTLED positions in the category with >=58% win rate.
+    // Settled positions aggregate fills — 150+ trades may collapse to 10-30
+    // distinct markets, so trade-count thresholds must be position-based.
+    const hasCatEdge = !!catStat
+      && catStat.tradeCount >= this.config.minCategoryTrades
+      && catStat.winRate >= this.config.minCategoryWinRate;
     const specializes =
-      copyScore >= 75 ||  // elite generalist — CopyScore is the proof (bypasses catStat check)
-      hasCatStats ||      // proven category specialist with enough data
+      copyScore >= 75 ||   // elite generalist — CopyScore is the proof (bypasses catStat check)
+      hasCatEdge ||        // proven category winner on settled markets
       concentration >= minConcentration && profile.winRate >= this.config.minWinRate;
 
     if (!specializes) {

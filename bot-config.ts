@@ -472,15 +472,15 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     // PRIMARY: >= 65 (elite, top ~15%). SATELLITE: >= 45 (above-median).
     primaryCopyScoreThreshold: 65,
     satelliteCopyScoreThreshold: 45,
-    // Proven-good baseline: 150 trades (now accurate thanks to getAllActivity),
-    // consistency floor 85, category win 0.58 over >=12 category trades.
-    // Profitability gate: totalPnL > 0 (actual net profit, not win-rate proxy).
-    minTradeCount: 150,
+    // Proven-good baseline: 100 trades (industry full-sample marker),
+    // category edge = 58% win over >=3 SETTLED positions.
+    // Profitability is handled by CopyScore components, not a binary gate.
+    minTradeCount: 100,
     minConsistency: 85,
     primaryConsistency: 92,
     minWinRate: 0.60,
     minCategoryWinRate: 0.58,
-    minCategoryTrades: 12,
+    minCategoryTrades: 3,
     maxInactiveDays: 60,   // edge decays — 60d matches Poly Syncer window
   };
   const screening = new WalletScreeningService(sdk.wallets, screeningConfig);
