@@ -468,16 +468,16 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   });
   const screeningConfig = {
     profileFetchConcurrency: 10,
-    // CopyScore thresholds (Poly Syncer/Polycopy composite 0–100):
-    // PRIMARY: >= 65 (elite, top ~15%). SATELLITE: >= 45 (above-median).
-    primaryCopyScoreThreshold: 65,
-    satelliteCopyScoreThreshold: 45,
-    // Proven-good baseline: 100 trades (industry full-sample marker),
+    // CopyScore thresholds (Poly Syncer composite 0–100, single score).
+    // Consistency is now ROLLED INTO CopyScore (rankStability/steadiness),
+    // not a separate gate. Thin wallets are shrunk toward 50 by computeCopyScore
+    // so thresholds are set below that pull. PRIMARY >= 60, SATELLITE >= 40.
+    primaryCopyScoreThreshold: 60,
+    satelliteCopyScoreThreshold: 40,
+    // Baseline: 100 trades (industry full-sample marker for shrinkage fade),
     // category edge = 58% win over >=3 SETTLED positions.
     // Profitability is handled by CopyScore components, not a binary gate.
     minTradeCount: 100,
-    minConsistency: 85,
-    primaryConsistency: 92,
     minWinRate: 0.60,
     minCategoryWinRate: 0.58,
     minCategoryTrades: 3,

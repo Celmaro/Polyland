@@ -46,6 +46,7 @@
 import type { WalletService, WalletProfile } from './wallet-service.js';
 import type { RawCandidate } from './wallet-ingestion-service.js';
 import type { ActivityCache } from './activity-cache.js';
+import type { ClosedPosition } from '../clients/data-api.js';
 import { categorizeMarket, type MarketCategory } from './smart-money-service.js';
 
 /**
@@ -84,10 +85,13 @@ export interface WalletScreeningConfig {
   minTradeCount: number;
   /** Minimum win rate (0–1) for PRIMARY tier */
   minWinRate: number;
-  /** Minimum composite consistency score for SATELLITE tier */
-  minConsistency: number;
-  /** Minimum composite consistency for PRIMARY tier (higher = stronger conviction) */
-  primaryConsistency: number;
+  /**
+   * Deprecated — consistency is now a component of CopyScore (steadiness),
+   * not a separate tier gate. Kept optional for config back-compat.
+   */
+  minConsistency?: number;
+  /** @deprecated See minConsistency. */
+  primaryConsistency?: number;
   /** Max drawdown % allowed before REJECTED */
   maxDrawdownPct: number;
   /**
@@ -182,11 +186,17 @@ export interface WalletScoringComponents {
    */
   drawdownResilience: number;
   /**
-   * Rank stability (0–1): Spearman correlation between daily rank and
-   * 7-day moving rank. Approximated from consistency score (lower
-   * consistency volatility = higher stability).
+   * Rank stability / steadiness (0–1): inverse dispersion of per-trade returns.
+   * A wallet whose returns are tightly clustered around its edge is a stable
+   * trader (steadier rank). This is the consistency signal, folded INTO the
+   * composite rather than gating it separately.
    */
   rankStability: number;
+  /**
+   * Number of settled positions used to compute the components. Drives
+   * small-sample shrinkage toward the cohort median in computeCopyScore().
+   */
+  sampleSize: number;
 }
 
 // ============================================================================
@@ -312,8 +322,8 @@ export class WalletScreeningService {
       this.resolveCategories(toScore),
     ]);
 
-    // Fetch per-category win rates in parallel
-    const catWinRates = await this.fetchCategoryWinRates(
+    // Fetch per-category win rates + full closed-position series in parallel.
+    const closedStats = await this.fetchClosedPositionStats(
       toScore.filter((c) => profiles.has(c.address)),
     );
 
@@ -322,10 +332,10 @@ export class WalletScreeningService {
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
-      const walletsCatWinRates = catWinRates.get(c.address) ?? {};
+      const { winRates, positions } = closedStats.get(c.address) ?? { winRates: {}, positions: [] };
       screened.push(c.bypassScreening
         ? this.makeBypassed(c, resolved)
-        : this.evaluate(c, profile, resolved, walletsCatWinRates, gateCounts));
+        : this.evaluate(c, profile, resolved, winRates, positions, gateCounts));
     }
     // Log gate tally for this cycle (diagnostic).
     const entries = Object.entries(gateCounts).sort((a, b) => b[1] - a[1]);
@@ -405,10 +415,10 @@ export class WalletScreeningService {
   // Per-category win rates
   // --------------------------------------------------------------------------
 
-  private async fetchCategoryWinRates(
+  private async fetchClosedPositionStats(
     candidates: RawCandidate[],
-  ): Promise<Map<string, Record<string, { winRate: number; tradeCount: number }>>> {
-    const results = new Map<string, Record<string, { winRate: number; tradeCount: number }>>();
+  ): Promise<Map<string, { winRates: Record<string, { winRate: number; tradeCount: number }>; positions: ClosedPosition[] }>> {
+    const results = new Map<string, { winRates: Record<string, { winRate: number; tradeCount: number }>; positions: ClosedPosition[] }>();
 
     await Promise.all(
       candidates.map(async (c) => {
@@ -432,12 +442,12 @@ export class WalletScreeningService {
               tradeCount: stats.total,
             };
           }
-          results.set(c.address, winRates);
+          results.set(c.address, { winRates, positions: closed });
         } catch (err) {
           // LOG the failure — a silent {} here starves the specialization gate
           // and makes catStat undefined for the wallet downstream.
-          console.warn(`[WalletScreening] category win rates failed for ${c.address.slice(0, 10)}: ${err instanceof Error ? err.message : String(err)}`);
-          results.set(c.address, {});
+          console.warn(`[WalletScreening] closed positions failed for ${c.address.slice(0, 10)}: ${err instanceof Error ? err.message : String(err)}`);
+          results.set(c.address, { winRates: {}, positions: [] });
         }
       }),
     );
@@ -450,50 +460,97 @@ export class WalletScreeningService {
   // --------------------------------------------------------------------------
 
   /**
-   * Compute the five sub-components of the composite CopyScore.
-   * Each is bounded 0–1.  Weights mirror Poly Syncer:
+   * Compute the five sub-components of the composite CopyScore from the
+   * CLOSED (settled) position series. Each is bounded 0–1.
+   *
+   * Weights mirror Poly Syncer:
    *   Sharpe 0.45 | Edge-adj win-rate 0.20 | Log-ROI 0.15 | Drawdown 0.10 | Rank stability 0.10
+   *
+   * Consistency is NOT a separate gate — steadiness is baked in as
+   * rankStability (inverse dispersion of per-trade returns).
    */
-  private computeScoringComponents(profile: WalletProfile): WalletScoringComponents {
-    const { winRate, smartScore, avgPercentPnL, tradeCount } = profile;
+  private computeScoringComponents(
+    profile: WalletProfile,
+    positions: ClosedPosition[] = [],
+  ): WalletScoringComponents {
+    const n = positions.length;
 
-    // 1. Sharpe-normalized (0.45 weight)
-    // Numerator: risk-adjusted return proxy = smartScore / 100 (already risk-adjusted).
-    // Denominator: cohort 95th-percentile ≈ smartScore 95/100.
-    // Capped at 1.0 so wallets exceeding cohort ceiling don't inflate the score.
-    const sharpeNormalized = Math.min(1, smartScore / 95);
+    // Per-position stats: cost basis (capital deployed), realized PnL, return.
+    // For a settled binary, entry price avgPrice IS the break-even probability
+    // (buying YES at $0.40 implies the market priced it 40% likely).
+    let wins = 0;
+    let costBasis = 0;
+    let notional = 0;          // sum(totalBought) — for trade-weighted fill price
+    let pnl = 0;
+    const returns: number[] = [];
 
-    // 2. Edge-adjusted win-rate (0.20 weight)
-    // Break-even probability at even odds = 0.50.  Edge = realized winRate − breakEven.
-    // At 60% win rate: edge = 0.60 − 0.50 = 0.10 (10 percentage points of edge).
-    // Normalized: edge / 0.50 (so 10pp edge → 0.20, 20pp edge → 0.40, etc.).
-    // Clamp to [0, 1] — a wallet below 50% has negative edge and scores 0.
-    const breakEven = 0.5;
-    const rawEdge = winRate - breakEven;
-    const edgeAdjustedWinRate = Math.max(0, Math.min(1, rawEdge / breakEven));
+    // Cumulative realized PnL over time (sorted by timestamp) for drawdown.
+    let cumPnl = 0;
+    let peak = 0;
+    let maxDrawdown = 0;
 
-    // 3. Log-ROI normalized (0.15 weight)
-    // Log-ROI compresses the fat tail of arithmetic ROI.  We use avgPercentPnL
-    // (0–1) as proxy and apply log1p to compress extreme values.
-    // Then min-max normalize assuming avgPercentPnL ∈ [−0.1, 0.5] maps to [0, 1].
-    const rawRoi = Math.log1p(Math.max(-0.95, avgPercentPnL)); // log1p handles near-zero/negative
-    const roiNormalized = Math.max(0, Math.min(1, (rawRoi + 2) / 2.5)); // rough min-max
+    const byTime = [...positions].sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
 
-    // 4. Drawdown resilience (0.10 weight)
-    // Resilience = 1 − (maxDrawdown / cohortP95Drawdown).
-    // We approximate cohortP95Drawdown ≈ maxDrawdownPct config threshold.
-    // A wallet at or above the threshold → 0. A wallet with 0 drawdown → 1.
-    const maxDd = this.config.maxDrawdownPct;
-    const drawdownResilience = Math.max(0, Math.min(1, 1 - (maxDd / maxDd)));
+    for (const pos of byTime) {
+      const cost = (pos.avgPrice ?? 0) * (pos.totalBought ?? 0);
+      const p = pos.realizedPnl ?? 0;
+      costBasis += cost;
+      notional += pos.totalBought ?? 0;
+      pnl += p;
+      if (p > 0) wins++;
+      if (cost > 0) returns.push(p / cost);
 
-    // 5. Rank stability (0.10 weight)
-    // Spearman correlation proxy: derive from winRate stability.
-    // A wallet whose winRate hovers near its mean is stable (high consistency →
-    // low variance → high rank stability).  Approximate as consistency / 100.
-    // Small-sample shrinkage: wallets < 100 trades get scores pulled 50% toward 0.5.
-    const baseStability = smartScore / 100;
-    const shrinkageFactor = tradeCount < 100 ? 0.5 : 1.0;
-    const rankStability = shrinkageFactor * baseStability + (1 - shrinkageFactor) * 0.5;
+      cumPnl += p;
+      if (cumPnl > peak) peak = cumPnl;
+      const dd = peak > 0 ? (cumPnl - peak) / peak : 0;
+      if (dd < maxDrawdown) maxDrawdown = dd; // negative
+    }
+
+    const realizedWinRate = n > 0 ? wins / n : 0;
+
+    // 1. Sharpe-normalized (0.45) — mean/std of per-trade returns.
+    // Denominator is cohort 95th-percentile; approximated as a benchmark Sharpe
+    // of 2.0 (a wallet at or above it scores 1.0, matching the reference cap).
+    let sharpe = 0;
+    if (returns.length >= 5) {
+      const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+      const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
+      const sd = Math.sqrt(variance);
+      sharpe = sd > 0 ? mean / sd : 0;
+    }
+    const sharpeNormalized = Math.max(0, Math.min(1, sharpe / 2.0));
+
+    // 2. Edge-adjusted win-rate (0.20) — realized winRate minus trade-weighted
+    // mean entry price (break-even). Buying at 40¢ and winning is real edge;
+    // buying at 80¢ and winning is barely beating the market.
+    // avgPrice is a decimal fraction (0-1) equal to the implied probability at
+    // entry — the break-even for a binary. So weighted break-even is simply
+    // the sum(avgPrice*size) / sum(size).
+    const weightedFill = notional > 0 && costBasis > 0 ? costBasis / (notional) : 0;
+    const rawEdge = realizedWinRate - weightedFill;
+    const edgeAdjustedWinRate = Math.max(0, Math.min(1, rawEdge / 0.5));
+
+    // 3. Log-ROI normalized (0.15) — log1p of cumulative ROI, compressed.
+    const roi = costBasis > 0 ? pnl / costBasis : 0;
+    const logRoi = Math.log1p(Math.max(-0.95, roi));
+    const roiNormalized = Math.max(0, Math.min(1, (logRoi + 2) / 2.5));
+
+    // 4. Drawdown resilience (0.10) — 1 − (maxDrawdown / cohortP95Drawdown).
+    // Using the config maxDrawdownPct as the cohort-p95 reference denominator.
+    const ddPct = Math.abs(maxDrawdown) * 100;
+    const drawdownResilience = Math.max(0, Math.min(1, 1 - ddPct / Math.max(this.config.maxDrawdownPct, 1)));
+
+    // 5. Rank stability / steadiness (0.10) — inverse dispersion of returns.
+    // Low coefficient of variation = steady edge = stable rank. This is the
+    // "consistency" signal now folded INTO the composite (not a separate gate).
+    let steadiness = 0;
+    if (returns.length >= 5) {
+      const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
+      const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
+      const sd = Math.sqrt(variance);
+      steadiness = Math.abs(mean) > 0 && sd > 0 ? 1 - Math.min(1, sd / Math.abs(mean)) : 0;
+    }
+    const rankStability = Math.max(0, Math.min(1, steadiness));
 
     return {
       sharpeNormalized,
@@ -501,12 +558,17 @@ export class WalletScreeningService {
       logRoiNormalized: roiNormalized,
       drawdownResilience,
       rankStability,
+      sampleSize: n,
     };
   }
 
   /**
    * Composite CopyScore (0–100) using fixed-weight linear combination.
    * Mirrors Poly Syncer: Sharpe 0.45 | Edge-wr 0.20 | Log-ROI 0.15 | Drawdown 0.10 | Rank 0.10
+   *
+   * Small-sample shrinkage: wallets with < 100 settled trades are pulled toward
+   * the cohort median (score 50), scaling linearly to zero shrinkage at 100.
+   * This is the reference methodology's defense against sample-size collapse.
    */
   computeCopyScore(components: WalletScoringComponents): number {
     const raw =
@@ -515,7 +577,12 @@ export class WalletScreeningService {
       0.15 * components.logRoiNormalized +
       0.10 * components.drawdownResilience +
       0.10 * components.rankStability;
-    return Math.round(Math.max(0, Math.min(100, raw * 100)));
+    const scored = Math.round(Math.max(0, Math.min(1, raw)) * 100);
+
+    // Small-sample shrinkage toward 50 (cohort median). Applied AFTER the
+    // composite so thin wallets score near neutral rather than overconfident.
+    const shrinkage = Math.min(1, components.sampleSize / 100);
+    return Math.round(50 + (scored - 50) * shrinkage);
   }
 
   // --------------------------------------------------------------------------
@@ -606,6 +673,7 @@ export class WalletScreeningService {
     profile: WalletProfile | null,
     resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
     catWinRates: Record<string, { winRate: number; tradeCount: number }>,
+    positions: ClosedPosition[] = [],
     gateCounts?: Record<string, number>,
   ): ScreenedWallet {
     // DEBUG: log address when entering evaluate()
@@ -651,8 +719,9 @@ export class WalletScreeningService {
     // had unlucky variance — the CopyScore captures this holistically.
     // The binary gate was removed after gate-tally showed it rejected 52/70 wallets.
 
-    // Composite scoring components
-    const components = this.computeScoringComponents(profile);
+    // Composite scoring components — computed from the CLOSED position series
+    // (real Sharpe, edge-adjusted win-rate, log-ROI, drawdown, steadiness).
+    const components = this.computeScoringComponents(profile, positions);
     const copyScore = this.computeCopyScore(components);
 
     const resolvedCat = resolved?.category ?? 'other';
@@ -691,34 +760,26 @@ export class WalletScreeningService {
         c, profile, 'WATCHLIST',
         `not specialized in ${resolvedCat} (catWin=${((catStat?.winRate ?? profile.winRate) * 100).toFixed(0)}% < ${this.config.minCategoryWinRate * 100}%)`,
         false, resolved, catWinRates,
+        components,
       );
     }
 
-    // Drawdown check
-    const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
-
-    // Composite consistency (Polymeteo formula — adapted to WalletProfile shape).
-    // Uses smartScore as a risk-adjusted performance proxy for drawdown/resilience.
-    const consistency = Math.min(
-      99.5,
-      profile.winRate * 100 * 0.55 +
-        Math.min(profile.smartScore / 25, 3) * 8 +  // smartScore/25 maps 0-100 to 0-4
-        (profile.smartScore / 4),
-    );
-
-    // Tier assignment — driven by CopyScore AND consistency
-    if (copyScore >= this.config.primaryCopyScoreThreshold && consistency >= this.config.primaryConsistency && profile.winRate >= this.config.minWinRate) {
+    // Tier assignment — driven ONLY by CopyScore (consistency is one of its
+    // components: rankStability/steadiness). No separate consistency XOR gate.
+    if (copyScore >= this.config.primaryCopyScoreThreshold && profile.winRate >= this.config.minWinRate) {
       return this.buildResult(
         c, profile, 'PRIMARY',
-        `copyScore ${copyScore} consistency ${consistency.toFixed(1)}`,
+        `copyScore ${copyScore}`,
         false, resolved, catWinRates,
+        components,
       );
     }
-    if (copyScore >= this.config.satelliteCopyScoreThreshold && consistency >= this.config.minConsistency) {
+    if (copyScore >= this.config.satelliteCopyScoreThreshold) {
       return this.buildResult(
         c, profile, 'SATELLITE',
-        `copyScore ${copyScore} consistency ${consistency.toFixed(1)}`,
+        `copyScore ${copyScore}`,
         false, resolved, catWinRates,
+        components,
       );
     }
 
@@ -726,6 +787,7 @@ export class WalletScreeningService {
       c, profile, 'WATCHLIST',
       `copyScore ${copyScore} below threshold`,
       false, resolved, catWinRates,
+      components,
     );
   }
 
@@ -740,12 +802,16 @@ export class WalletScreeningService {
     isBot: boolean,
     resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
     catWinRates: Record<string, { winRate: number; tradeCount: number }> = {},
+    components: WalletScoringComponents | null = null,
   ): ScreenedWallet {
     const resolvedCat = resolved?.category ?? 'other';
     const catStat = catWinRates[resolvedCat];
-    const components = profile ? this.computeScoringComponents(profile) : null;
-    const copyScore = profile && components
-      ? this.computeCopyScore(components)
+    // Use the pre-computed components/copyScore from evaluate() when available.
+    // Recomputing here (without the closed-position series) would cheapen the
+    // score to an empty-series approximation. Only fall back when not passed.
+    const useComponents = components ?? (profile ? this.computeScoringComponents(profile) : null);
+    const copyScore = profile && useComponents
+      ? this.computeCopyScore(useComponents)
       : 0;
     const consistency = profile
       ? Math.min(99.5, profile.winRate * 100 * 0.55 + Math.min(profile.smartScore / 25, 3) * 8 + profile.smartScore / 4)
@@ -761,7 +827,7 @@ export class WalletScreeningService {
       categoryConfidence: resolved?.confidence ?? 0,
       dimensions: this.computeDimensions(profile),
       copyScore,
-      scoringComponents: components ?? undefined,
+      scoringComponents: useComponents ?? undefined,
       consistency,
       winRate: profile?.winRate ?? 0,
       profitFactor: 0,  // no longer computed (replaced by totalPnL > 0 gate)
@@ -796,6 +862,7 @@ export class WalletScreeningService {
       scoringComponents: {
         sharpeNormalized: 1, edgeAdjustedWinRate: 1,
         logRoiNormalized: 1, drawdownResilience: 1, rankStability: 1,
+        sampleSize: 100,
       },
       consistency: 100,
       winRate: 1,
