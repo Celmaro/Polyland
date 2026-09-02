@@ -464,20 +464,18 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   });
   const screeningConfig = {
     profileFetchConcurrency: 10,
-    // Real track record: 150+ trades in the measured window separates
-    // skill from luck. (Polymarket's profile.tradeCount is period-scoped,
-    // not lifetime — 200 was empirically too high and zeroed the basket.)
+    // Proven-good baseline: 150 trades (now accurate thanks to getAllActivity),
+    // consistency floor 85, category win 0.58 over >=12 category trades.
+    // The root-cause bug (tradeCount capped at 100) is fixed; these values
+    // previously yielded 7 quality wallets. PF/recency checks remain in the
+    // DEFAULT config and apply as soft guards.
     minTradeCount: 150,
-    minConsistency: 88,      // tighter floor for SATELLITE
-    primaryConsistency: 94,  // PRIMARY stays elite
+    minConsistency: 85,
+    primaryConsistency: 92,
     minWinRate: 0.60,
-    // Must clearly beat coin-flip-with-vig IN the category it's seeded into.
-    minCategoryWinRate: 0.60,
-    // Proven edge needs >=20 category-specific trades to trust (skill, not luck).
-    minCategoryTrades: 20,
-    // Winners must outweigh losers in SIZE, not just count.
+    minCategoryWinRate: 0.58,
+    minCategoryTrades: 12,
     minProfitFactor: 1.5,
-    // Edge decays — a wallet idle >45d is not a live signal source.
     maxInactiveDays: 45,
   };
   const screening = new WalletScreeningService(sdk.wallets, screeningConfig);
