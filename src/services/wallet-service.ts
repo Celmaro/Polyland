@@ -12,6 +12,7 @@
 import {
   DataApiClient,
   Position,
+  ClosedPosition,
   Activity,
   LeaderboardEntry,
   LeaderboardResult,
@@ -289,6 +290,22 @@ export class WalletService {
    */
   async getWalletPositions(address: string): Promise<Position[]> {
     return this.dataApi.getPositions(address);
+  }
+
+  /**
+   * Get CLOSED (settled) positions for a wallet — the only place realizedPnl exists.
+   * Used by screening for per-category win-rate computation.
+   */
+  async getWalletClosedPositions(address: string): Promise<ClosedPosition[]> {
+    // Data API caps limit at 50 per page; paginate to capture up to 500 settled positions.
+    const all: ClosedPosition[] = [];
+    const pageSize = 50;
+    for (let offset = 0; offset < 500; offset += pageSize) {
+      const page = await this.dataApi.getClosedPositions(address, { limit: pageSize, offset });
+      all.push(...page);
+      if (page.length < pageSize) break;
+    }
+    return all;
   }
 
   /**

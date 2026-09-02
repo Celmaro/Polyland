@@ -526,9 +526,9 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   // Debug: log top 10 candidates by CopyScore (even if not seeded) to diagnose thresholds
   const sorted = [...screened].sort((a, b) => b.copyScore - a.copyScore);
   const top10 = sorted.slice(0, 10).map((w) =>
-  `${w.tier}[${w.copyScore}]${w.category}`
+    `${w.tier}[${w.copyScore}]${w.category}(${w.reason.slice(0, 40)})`
   ).join(' | ');
-  log('QUORUM', `Top10 copyScore: ${top10}`);
+  log('QUORUM', `Top10: ${top10}`);
 
   if (primaries.length === 0) {
     log('WARN', 'No PRIMARY/SATELLITE wallets passed screening');

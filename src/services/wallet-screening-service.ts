@@ -381,15 +381,15 @@ export class WalletScreeningService {
     await Promise.all(
       candidates.map(async (c) => {
         try {
-          const positions = await this.walletService.getWalletPositions(c.address);
+          // CLOSED positions — settled markets only. This is where realizedPnl
+          // and final outcomes live. Open positions have no realized outcome.
+          const closed = await this.walletService.getWalletClosedPositions(c.address);
           const byCategory: Record<string, { wins: number; total: number }> = {};
 
-          for (const pos of positions) {
-            // `title` is the market question text on Polymarket's Position type.
+          for (const pos of closed) {
             const cat = categorizeMarket(pos.title ?? '') as MarketCategory;
             if (!byCategory[cat]) byCategory[cat] = { wins: 0, total: 0 };
             byCategory[cat].total++;
-            // `realizedPnl` is the closed PnL for a settled position.
             if ((pos.realizedPnl ?? 0) > 0) byCategory[cat].wins++;
           }
 
@@ -401,7 +401,10 @@ export class WalletScreeningService {
             };
           }
           results.set(c.address, winRates);
-        } catch {
+        } catch (err) {
+          // LOG the failure — a silent {} here starves the specialization gate
+          // and makes catStat undefined for the wallet downstream.
+          console.warn(`[WalletScreening] category win rates failed for ${c.address.slice(0, 10)}: ${err instanceof Error ? err.message : String(err)}`);
           results.set(c.address, {});
         }
       }),
