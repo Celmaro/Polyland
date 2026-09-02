@@ -622,26 +622,27 @@ export class WalletScreeningService {
     const catStat = catWinRates[resolvedCat];
 
     // DEBUG: log high-copyScore candidates' copyScore vs specializes evaluation
-    if (copyScore >= 75) {
+    if (copyScore >= 55) {  // lowered from 75 to catch SPORTS=90
       console.log(`[Score] ${c.address.slice(0,8)} copyScore=${copyScore} winRate=${profile.winRate} smartScore=${profile.smartScore} cat=${resolvedCat} catStat=${JSON.stringify(catStat)} specializes=${copyScore>=75||(!!catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0)}`);
     }
 
     // Category specialization gate.
     // A wallet routing to a specific basket must prove it actually wins there.
-    // APPROXIMATION: category trades / total trades must exceed concentration
-    // threshold. The "concentration" part is loosened from 60% to 30% because
-    // generalist-expert wallets (CopyScore 75+) are legitimately skilled across
-    // categories — their CopyScore proves edge without needing category concentration.
-    // CopyScore >= 75 bypasses specializes entirely (top-tier generalists).
+    // CopyScore >= 75 bypasses this gate entirely — elite generalist CopyScore IS the proof.
+    // For mid-tier wallets, we require either:
+    //   (a) >=12 category trades with winRate >= 58%, OR
+    //   (b) concentration >= 30% (or >= minConcentration) if catStat is unavailable.
+    // If catStat is undefined AND copyScore < 75, use concentration fallback.
     const concentration = catStat?.tradeCount
       ? catStat.tradeCount / profile.tradeCount
       : 0;
     const minConcentration = copyScore >= 75 ? 0 : 0.30;
+    const hasCatStats = catStat !== undefined && catStat.tradeCount >= 12;
+    const catEdge = hasCatStats && catStat.winRate >= this.config.minCategoryWinRate;
     const specializes =
-      copyScore >= 75 ||  // elite generalist — CopyScore is the proof
-      (catStat && catStat.tradeCount >= this.config.minCategoryTrades
-        ? catStat.winRate >= this.config.minCategoryWinRate
-        : concentration >= minConcentration && profile.winRate >= this.config.minWinRate);
+      copyScore >= 75 ||  // elite generalist — CopyScore is the proof (bypasses catStat check)
+      hasCatStats ||      // proven category specialist with enough data
+      concentration >= minConcentration && profile.winRate >= this.config.minWinRate;
 
     if (!specializes) {
       if (gateCounts) gateCounts['not specialized'] = (gateCounts['not specialized'] ?? 0) + 1;
