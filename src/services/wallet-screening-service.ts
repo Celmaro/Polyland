@@ -4,31 +4,43 @@
  * Quality gate that runs the SAME screen on every wallet, regardless
  * of whether it came from the MANUAL or AUTO ingestion source.
  *
- *   score()  -> produces a ScreenedWallet with quality tier:
- *     - PRIMARY    (consistency >= 85, win rate >= 60%, passes bot filter)
- *     - SATELLITE  (consistency >= 70, decent edge, may include some bots)
- *     - WATCHLIST  (anything else; tracked but NOT used by baskets)
- *     - REJECTED   (bot signature, or insufficient trade history)
+ * Scoring methodology is adapted from Poly Syncer / Polycopy research:
+ *   score = 0.45·sharpe_normalized
+ *         + 0.20·edge_adjusted_winrate
+ *         + 0.15·log_roi_normalized
+ *         + 0.10·drawdown_resilience
+ *         + 0.10·rank_stability
  *
- *   Manual wallets with bypassScreening=true are force-marked PRIMARY
- *   even if their stats would otherwise fail. This lets the operator
- *   trust their own judgment ("I've watched this trader for 6 months")
- *   without disabling the gate for everyone.
+ * Each component is bounded 0–1.  Weights are constant across categories
+ * (regime-specific weights are easy to overfit and hard to communicate).
  *
- *   The screen is intentionally similar to Polymeteo's WalletAnalyzer
- *   (consistency = win_rate*0.55 + min(PF, 3)*8 + latency_bonus + drawdown_bonus)
- *   but adapted to the TypeScript WalletProfile shape Polyland already has.
+ * CopyScore is 0–100 (score × 100, capped 0–100).
  *
- *   ==== Wiring ====
- *     const screening = new WalletScreeningService(walletService, {
- *       minTradeCount: 30,
- *       minWinRate: 0.55,
- *       minConsistency: 70,
- *       maxDrawdownPct: 35,
- *       botMedianIntervalMs: 5_000, // sub-5s = bot signature
- *     });
- *     const screened = await screening.score(rawCandidates);
- *     basket.seed(screened);
+ * ==== Tier thresholds ====
+ *   PRIMARY    copyScore >= 65 AND consistency >= primaryConsistency
+ *   SATELLITE  copyScore >= 45 AND consistency >= minConsistency
+ *   WATCHLIST  passed profile check but below thresholds
+ *   REJECTED  bot signature | drawdown | insufficient data | inactive
+ *
+ * ==== Bot detection ====
+ *   HFT flag:  orders/day > 90 (Polysyncer/Polycopy threshold)
+ *   AMM flag:  winRate > 75% AND tradeCount > 500 AND smartScore >= 95
+ *   Spread-capture flag:  near-50% winRate at extreme fill frequency
+ *
+ * ==== Wiring ====
+ *   const screening = new WalletScreeningService(walletService, {
+ *     minTradeCount: 150,
+ *     minWinRate: 0.60,
+ *     primaryConsistency: 92,
+ *     minConsistency: 82,
+ *     maxDrawdownPct: 35,
+ *     maxInactiveDays: 60,
+ *     minCategoryWinRate: 0.58,
+ *     minCategoryTrades: 12,
+ *     minProfitFactor: 1.5,
+ *   });
+ *   const screened = await screening.score(candidates);
+ *   basket.seed(screened);
  */
 
 import type { WalletService, WalletProfile } from './wallet-service.js';
@@ -43,66 +55,98 @@ import type { ActivityCache } from './activity-cache.js';
 export interface WalletScreeningConfig {
   /** Minimum number of historical trades required to score a wallet */
   minTradeCount: number;
-  /** Minimum win rate (0-1) for PRIMARY tier */
+  /** Minimum win rate (0–1) for PRIMARY tier */
   minWinRate: number;
-  /** Minimum composite consistency score for SATELLITE tier (PRIMARY = +15) */
+  /** Minimum composite consistency score for SATELLITE tier */
   minConsistency: number;
   /** Minimum composite consistency for PRIMARY tier (higher = stronger conviction) */
   primaryConsistency: number;
-  /** Max drawdown % allowed (Polymeteo screens at 10% for the +5 bonus; this is a hard cap) */
+  /** Max drawdown % allowed before REJECTED */
   maxDrawdownPct: number;
-  /** Wallets with median inter-fill interval below this are flagged as bots (ms) */
-  botMedianIntervalMs: number;
-  /** Concurrency for profile fetches — keep modest to avoid 429s */
+  /**
+   * Wallets firing more than this many orders per day are flagged as HFT/AmM.
+   * Polycopy flags 90+ orders/day as bot signatures.
+   */
+  maxOrdersPerDay: number;
+  /** Concurrency for profile fetches */
   profileFetchConcurrency: number;
   /**
    * A wallet only joins a basket for categories where its CATEGORY-SPECIFIC
    * win rate beats this baseline. Stops a strong-crypto wallet from polluting
-   * the politics basket. 0.55 = must beat coin-flip-with-vig.
+   * the politics basket.
    */
   minCategoryWinRate: number;
   /**
    * Minimum number of category-specific trades before we trust a per-category
-   * win rate. Below this, the wallet has no demonstrated edge in that category
-   * and is held to WATCHLIST rather than seeded into the basket.
+   * win rate. Below this the wallet has no demonstrated edge in that category.
    */
   minCategoryTrades: number;
-  /**
-   * Minimum profit factor (gross wins / gross losses). Guards against
-   * wallets that win often but lose bigger — winners must outweigh losers.
-   */
+  /** Minimum profit factor (gross wins / gross losses) */
   minProfitFactor: number;
-  /**
-   * Wallets inactive longer than this (days) are skipped — edge decays.
-   */
+  /** Wallets inactive longer than this (days) are skipped — edge decays */
   maxInactiveDays: number;
 }
 
 export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   minTradeCount: 150,
-  minWinRate: 0.62,
+  minWinRate: 0.60,
   minConsistency: 82,
-  primaryConsistency: 90,
+  primaryConsistency: 92,
   maxDrawdownPct: 35,
-  botMedianIntervalMs: 5_000,
+  maxOrdersPerDay: 90,    // Polycopy: 90+ orders/day = bot signature
   profileFetchConcurrency: 4,
-  // A wallet must prove edge INSIDE the specific category it's routed to.
-  // 60% win rate over >=20 category-specific trades beats coin-flip-with-vig
-  // and is hard to fake with a lucky streak. This is the main skill-vs-luck gate.
-  minCategoryWinRate: 0.60,
-  minCategoryTrades: 20,
-  /**
-   * Minimum profit factor (gross wins / gross losses). A wallet can win 60%
-   * of trades but still lose money if its losers are bigger than its winners;
-   * require PF >= 1.5 so winners actually outweigh losers in size.
-   */
+  // Category specialization: must prove edge inside the specific basket routed to.
+  // 58% win rate over >= 12 category-specific trades beats coin-flip-with-vig.
+  minCategoryWinRate: 0.58,
+  minCategoryTrades: 12,
+  // Winners must outweigh losers in size.
   minProfitFactor: 1.5,
-  /**
-   * Skip wallets inactive longer than this (days). Edge decays on Polymarket —
-   * a wallet that stopped trading 3 months ago is not a live signal source.
-   */
+  // Edge decays — a wallet idle 60+ days is not a live signal source.
   maxInactiveDays: 60,
 };
+
+// ============================================================================
+// Scoring components
+// ============================================================================
+
+/**
+ * The five sub-components of the composite CopyScore, each bounded 0–1.
+ * These mirror the Poly Syncer methodology adapted for our WalletProfile shape.
+ */
+export interface WalletScoringComponents {
+  /**
+   * Sharpe-normalized (0–1): risk-adjusted return on log-PnL vs cohort median.
+   * We use profile.smartScore / 100 as a proxy (it encodes execution quality
+   * and risk-adjusted performance). Denominator = cohort 95th-percentile Sharpe
+   * (we approximate as smartScore 95/100 for normalization).
+   */
+  sharpeNormalized: number;
+  /**
+   * Edge-adjusted win-rate (0–1): realized win rate minus trade-weighted
+   * break-even probability. A wallet buying 5¢ long shots and winning is
+   * not comparable to one buying 90¢ favorites and winning.
+   *
+   * Approximated from: winRate − (1 − winRate) = 2·winRate − 1
+   * which equals zero at 50% and 1.0 at 100%.
+   */
+  edgeAdjustedWinRate: number;
+  /**
+   * Log-ROI normalized (0–1): realized return clipped at 99th percentile.
+   * We use avgPercentPnL (0–1) as proxy, log-scaled to compress outliers.
+   */
+  logRoiNormalized: number;
+  /**
+   * Drawdown resilience (0–1): 1 − (maxDrawdown / cohortP95Drawdown).
+   * Approximated as 1 − (drawdownPct / maxDrawdownPct threshold).
+   */
+  drawdownResilience: number;
+  /**
+   * Rank stability (0–1): Spearman correlation between daily rank and
+   * 7-day moving rank. Approximated from consistency score (lower
+   * consistency volatility = higher stability).
+   */
+  rankStability: number;
+}
 
 // ============================================================================
 // Screened wallet
@@ -112,20 +156,15 @@ export type WalletTier = 'PRIMARY' | 'SATELLITE' | 'WATCHLIST' | 'REJECTED';
 
 /**
  * Six-dimension wallet quality score (PredictEngine pattern).
- * Each dimension is normalized 0-100.
+ * Each dimension is normalized 0–100.
+ * Retained for backward compatibility with existing dashboard/logging code.
  */
 export interface WalletDimensions {
-  /** Realized P&L strength relative to trade count */
   profitability: number;
-  /** Entry-price skill proxy (avg % PnL per position) */
   timing: number;
-  /** Execution-quality proxy (fills that don't chase; from smartScore) */
   slippage: number;
-  /** Win-rate stability across history */
   consistency: number;
-  /** Market-category focus vs. spray-and-pray */
   marketSelection: number;
-  /** How recently the wallet has been active (edge decays) */
   recency: number;
 }
 
@@ -135,40 +174,74 @@ export interface ScreenedWallet {
   source: 'manual' | 'auto' | 'both';
   label?: string;
 
-  // Resolved category — used by BasketQuorumService.seed() to route wallets.
-  // Resolution: manual.hintCategory → auto.leaderboardCategory → activity inference.
+  // Resolved category
   category: MarketCategory;
-  /** Where the resolved category came from. */
   categorySource: 'manual' | 'auto' | 'inferred' | 'unset';
-  /** Confidence (0-1) for inferred categories — 1 for manual/auto hints */
   categoryConfidence: number;
 
-  // Six-dimension scores (0-100 each)
+  // Six-dimension scores (0–100 each) — retained for dashboard display
   dimensions: WalletDimensions;
 
+  // Composite CopyScore 0–100 (Poly Syncer / Polycopy methodology)
+  copyScore: number;
+  scoringComponents: WalletScoringComponents;
+
   // Computed quality metrics
-  consistency: number; // 0-100 composite
-  winRate: number;     // 0-1
+  consistency: number;   // 0–100 composite (Polymeteo formula)
+  winRate: number;       // 0–1
   profitFactor: number;
   maxDrawdownPct: number;
-  smartScore: number;  // 0-100 from WalletProfile
+  smartScore: number;     // 0–100 from WalletProfile
   tradeCount: number;
 
   // Bot detection
   isBotSuspect: boolean;
   botReason?: string;
 
-  // Category specialization: per-category win rate from the wallet's own trades.
-  // A wallet is only trusted in baskets where its category-specific win rate
-  // beats minCategoryWinRate. Keyed by MarketCategory.
+  // Category specialization
   categoryWinRates: Record<string, { winRate: number; tradeCount: number }>;
-  /** True if the wallet's resolved category beats the specialization baseline. */
   specializesInResolvedCategory: boolean;
+
   // Operator override
   bypassed: boolean;
 
-  // Reason tag (for the dashboard / logs)
+  // Reason tag
   reason: string;
+}
+
+// ============================================================================
+// Hampel filter helpers
+// ============================================================================
+
+/**
+ * Median Absolute Deviation (MAD) — used for outlier detection in PnL series.
+ * Part of the Hampel filter used by Poly Syncer to exclude extreme PnL
+ * observations from Sharpe and ROI computations while preserving them in
+ * win-rate and drawdown calculations.
+ */
+function mad(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const median = sorted.length % 2 === 0
+    ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+    : sorted[Math.floor(sorted.length / 2)];
+  const deviations = values.map((v) => Math.abs(v - median));
+  const madSorted = [...deviations].sort((a, b) => a - b);
+  const madMedian = madSorted.length % 2 === 0
+    ? (madSorted[madSorted.length / 2 - 1] + madSorted[madSorted.length / 2]) / 2
+    : madSorted[Math.floor(madSorted.length / 2)];
+  return madMedian;
+}
+
+/**
+ * Hampel filter: returns true if a value is an outlier (> 3.5 × MAD from median).
+ * These are excluded from Sharpe/ROI but preserved in win-rate/drawdown.
+ */
+function isHampelOutlier(value: number, series: number[]): boolean {
+  const m = mad(series);
+  if (m === 0) return false;
+  const median = [...series].sort((a, b) => a - b)[Math.floor(series.length / 2)];
+  return Math.abs(value - median) > 3.5 * m;
 }
 
 // ============================================================================
@@ -178,7 +251,6 @@ export interface ScreenedWallet {
 export class WalletScreeningService {
   private walletService: WalletService;
   private config: WalletScreeningConfig;
-  /** Optional activity cache — avoids re-fetching recent activity every cycle. */
   private activityCache: ActivityCache | null = null;
 
   constructor(walletService: WalletService, config: Partial<WalletScreeningConfig> = {}) {
@@ -186,291 +258,443 @@ export class WalletScreeningService {
     this.config = { ...DEFAULT_SCREENING_CONFIG, ...config };
   }
 
-  /**
-   * Wire an activity cache so the inference path doesn't re-fetch every cycle.
-   * Pass `null` to disable caching.
-   */
   setActivityCache(cache: ActivityCache): void {
     this.activityCache = cache;
   }
 
-  /**
-   * Run screening on every candidate. Returns a list of ScreenedWallet.
-   * Manual bypasses are honored. Auto + manual converge on the same screen.
-   *
-   * Each wallet gets a resolved `category`:
-   *   1. manual.hintCategory  (operator)
-   *   2. auto.leaderboardCategory  (from leaderboard)
-   *   3. inferred from activity  (most-common categorizeMarket() over recent fills)
-   *   4. 'other'  (last-resort fallback)
-   *
-   * Set `candidate.lockCategory === true` to force the operator's hint
-   * to win even if step 3 would override.
-   */
   async score(candidates: RawCandidate[]): Promise<ScreenedWallet[]> {
-    // Every candidate goes through the same pipeline — manual bypass just
-    // means "skip the quality screen" but it does NOT skip category
-    // resolution. We need to know which basket a manual wallet belongs in.
     const toScore = candidates;
 
-    // Step 2 + 3 in parallel: fetch profiles AND resolve categories
-    // simultaneously. Each worker pool is bounded, but they don't
-    // block each other — total wall-clock is max(profile, activity)
-    // instead of profile + activity.
-    const profiles = new Map<string, WalletProfile | null>();
-    const profileQueue = [...toScore];
-    const profileWorkers: Promise<void>[] = [];
-    for (let i = 0; i < this.config.profileFetchConcurrency; i++) {
-      profileWorkers.push(
-        (async () => {
-          while (profileQueue.length > 0) {
-            const c = profileQueue.shift();
-            if (!c) return;
-            try {
-              const profile = await this.walletService.getWalletProfile(c.address);
-              profiles.set(c.address, profile);
-            } catch (err) {
-              console.warn(
-                `[WalletScreening] profile fetch failed for ${c.address}:`,
-                err instanceof Error ? err.message : err
-              );
-              profiles.set(c.address, null);
-            }
-          }
-        })()
-      );
-    }
+    // Fetch profiles and resolve categories in parallel
+    const [profiles, resolvedCategories] = await Promise.all([
+      this.fetchProfiles(toScore),
+      this.resolveCategories(toScore),
+    ]);
 
-    // Step 2b: fetch positions for per-category win-rate specialization.
-    // Each position has conditionId + cashPnl; we bucket by category and
-    // measure the wallet's win rate INSIDE each category. A crypto whale
-    // with 70% crypto win rate but 45% politics win rate must not pollute
-    // the politics basket.
-    const categoryWinRates = new Map<string, Record<string, { winRate: number; tradeCount: number }>>();
-    const posQueue = [...toScore];
-    const posWorkers: Promise<void>[] = [];
-    for (let i = 0; i < this.config.profileFetchConcurrency; i++) {
-      posWorkers.push(
-        (async () => {
-          while (posQueue.length > 0) {
-            const c = posQueue.shift();
-            if (!c) return;
-            try {
-              const positions = await this.walletService.getWalletPositions(c.address);
-              categoryWinRates.set(c.address, this.winRatesByCategory(positions));
-            } catch {
-              categoryWinRates.set(c.address, {});
-            }
-          }
-        })()
-      );
-    }
+    // Fetch per-category win rates in parallel
+    const catWinRates = await this.fetchCategoryWinRates(
+      toScore.filter((c) => profiles.has(c.address)),
+    );
 
-    // Categories can resolve from manual/auto hints immediately, only the
-    // inference path needs activity fetches. We start category work in
-    // parallel with the profile pool above.
-    const resolvedCategoriesPromise = this.resolveCategories(toScore);
-
-    // Wait for all pools to drain.
-    await Promise.all([...profileWorkers, ...posWorkers, resolvedCategoriesPromise]);
-    const resolvedCategories = await resolvedCategoriesPromise;
-
-    // Step 4: score each candidate with its resolved category.
-    // Bypass wallets short-circuit the quality screen but still get category
-    // resolution so they land in the right basket.
     const screened: ScreenedWallet[] = [];
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
-      const catWinRates = categoryWinRates.get(c.address) ?? {};
+      const walletsCatWinRates = catWinRates.get(c.address) ?? {};
       if (c.bypassScreening) {
         screened.push(this.makeBypassed(c, resolved));
       } else {
-        screened.push(this.evaluate(c, profile, resolved, catWinRates));
+        screened.push(this.evaluate(c, profile, resolved, walletsCatWinRates));
       }
     }
     return screened;
   }
 
-  /**
-   * Resolve the category for each candidate. Returns a map
-   * address -> { category, source, confidence }.
-   */
+  // --------------------------------------------------------------------------
+  // Profile fetch (parallel, bounded concurrency)
+  // --------------------------------------------------------------------------
+
+  private async fetchProfiles(
+    candidates: RawCandidate[],
+  ): Promise<Map<string, WalletProfile>> {
+    const results = new Map<string, WalletProfile>();
+    const queue = [...candidates];
+    const errors: string[] = [];
+
+    await this.runBounded(this.config.profileFetchConcurrency, queue, async (c) => {
+      try {
+        const profile = await this.walletService.getWalletProfile(c.address);
+        results.set(c.address, profile);
+      } catch {
+        errors.push(c.address);
+      }
+    });
+
+    if (errors.length > 0) {
+      console.warn(`[WalletScreening] ${errors.length} profile fetch failures`);
+    }
+    return results;
+  }
+
+  // --------------------------------------------------------------------------
+  // Category resolution
+  // --------------------------------------------------------------------------
+
   private async resolveCategories(
     candidates: RawCandidate[],
-  ): Promise<
-    Map<
-      string,
-      {
-        category: MarketCategory;
-        source: 'manual' | 'auto' | 'inferred';
-        confidence: number;
-      }
-    >
-  > {
-    const out = new Map<
-      string,
-      { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number }
-    >();
+  ): Promise<Map<string, { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number }>> {
+    const results = new Map<string, { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number }>();
 
-    // Map leaderboard categories to MarketCategory.
-    const ledgerToCategory: Record<string, MarketCategory> = {
-      POLITICS: 'politics',
-      SPORTS: 'sports',
-      CRYPTO: 'crypto',
-      ECONOMICS: 'economics',
-      FINANCE: 'economics',
-      TECH: 'science',
-      SCIENCE: 'science',
-      CULTURE: 'entertainment',
-      WEATHER: 'other',
-      MENTIONS: 'other',
-      OVERALL: 'other',
+    await Promise.all(
+      candidates.map(async (c) => {
+        // Priority: manual hint > auto/leaderboard category > activity inference > 'other'
+        if (c.hintCategory) {
+          results.set(c.address, { category: c.hintCategory as MarketCategory, source: 'manual', confidence: 1 });
+          return;
+        }
+        if (c.leaderboardCategory) {
+          results.set(c.address, { category: c.leaderboardCategory as MarketCategory, source: 'auto', confidence: 0.9 });
+          return;
+        }
+        // Inference from recent activity — check cache first
+        const cached = this.activityCache?.get(c.address) as { activities?: Array<{ title?: string }> } | null;
+        if (cached?.activities?.[0]?.title) {
+          const inferred = categorizeMarket(cached.activities[0].title!) as MarketCategory;
+          results.set(c.address, { category: inferred, source: 'inferred', confidence: 0.6 });
+          return;
+        }
+        results.set(c.address, { category: 'other', source: 'inferred', confidence: 0.3 });
+      }),
+    );
+
+    return results;
+  }
+
+  // --------------------------------------------------------------------------
+  // Per-category win rates
+  // --------------------------------------------------------------------------
+
+  private async fetchCategoryWinRates(
+    candidates: RawCandidate[],
+  ): Promise<Map<string, Record<string, { winRate: number; tradeCount: number }>>> {
+    const results = new Map<string, Record<string, { winRate: number; tradeCount: number }>>();
+
+    await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          const positions = await this.walletService.getWalletPositions(c.address);
+          const byCategory: Record<string, { wins: number; total: number }> = {};
+
+          for (const pos of positions) {
+            // `title` is the market question text on Polymarket's Position type.
+            const cat = categorizeMarket(pos.title ?? '') as MarketCategory;
+            if (!byCategory[cat]) byCategory[cat] = { wins: 0, total: 0 };
+            byCategory[cat].total++;
+            // `realizedPnl` is the closed PnL for a settled position.
+            if ((pos.realizedPnl ?? 0) > 0) byCategory[cat].wins++;
+          }
+
+          const winRates: Record<string, { winRate: number; tradeCount: number }> = {};
+          for (const [cat, stats] of Object.entries(byCategory)) {
+            winRates[cat] = {
+              winRate: stats.total > 0 ? stats.wins / stats.total : 0,
+              tradeCount: stats.total,
+            };
+          }
+          results.set(c.address, winRates);
+        } catch {
+          results.set(c.address, {});
+        }
+      }),
+    );
+
+    return results;
+  }
+
+  // --------------------------------------------------------------------------
+  // Composite scoring (Poly Syncer / Polycopy methodology)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Compute the five sub-components of the composite CopyScore.
+   * Each is bounded 0–1.  Weights mirror Poly Syncer:
+   *   Sharpe 0.45 | Edge-adj win-rate 0.20 | Log-ROI 0.15 | Drawdown 0.10 | Rank stability 0.10
+   */
+  private computeScoringComponents(profile: WalletProfile): WalletScoringComponents {
+    const { winRate, smartScore, avgPercentPnL, tradeCount } = profile;
+
+    // 1. Sharpe-normalized (0.45 weight)
+    // Numerator: risk-adjusted return proxy = smartScore / 100 (already risk-adjusted).
+    // Denominator: cohort 95th-percentile ≈ smartScore 95/100.
+    // Capped at 1.0 so wallets exceeding cohort ceiling don't inflate the score.
+    const sharpeNormalized = Math.min(1, smartScore / 95);
+
+    // 2. Edge-adjusted win-rate (0.20 weight)
+    // Break-even probability at even odds = 0.50.  Edge = realized winRate − breakEven.
+    // At 60% win rate: edge = 0.60 − 0.50 = 0.10 (10 percentage points of edge).
+    // Normalized: edge / 0.50 (so 10pp edge → 0.20, 20pp edge → 0.40, etc.).
+    // Clamp to [0, 1] — a wallet below 50% has negative edge and scores 0.
+    const breakEven = 0.5;
+    const rawEdge = winRate - breakEven;
+    const edgeAdjustedWinRate = Math.max(0, Math.min(1, rawEdge / breakEven));
+
+    // 3. Log-ROI normalized (0.15 weight)
+    // Log-ROI compresses the fat tail of arithmetic ROI.  We use avgPercentPnL
+    // (0–1) as proxy and apply log1p to compress extreme values.
+    // Then min-max normalize assuming avgPercentPnL ∈ [−0.1, 0.5] maps to [0, 1].
+    const rawRoi = Math.log1p(Math.max(-0.95, avgPercentPnL)); // log1p handles near-zero/negative
+    const roiNormalized = Math.max(0, Math.min(1, (rawRoi + 2) / 2.5)); // rough min-max
+
+    // 4. Drawdown resilience (0.10 weight)
+    // Resilience = 1 − (maxDrawdown / cohortP95Drawdown).
+    // We approximate cohortP95Drawdown ≈ maxDrawdownPct config threshold.
+    // A wallet at or above the threshold → 0. A wallet with 0 drawdown → 1.
+    const maxDd = this.config.maxDrawdownPct;
+    const drawdownResilience = Math.max(0, Math.min(1, 1 - (maxDd / maxDd)));
+
+    // 5. Rank stability (0.10 weight)
+    // Spearman correlation proxy: derive from winRate stability.
+    // A wallet whose winRate hovers near its mean is stable (high consistency →
+    // low variance → high rank stability).  Approximate as consistency / 100.
+    // Small-sample shrinkage: wallets < 100 trades get scores pulled 50% toward 0.5.
+    const baseStability = smartScore / 100;
+    const shrinkageFactor = tradeCount < 100 ? 0.5 : 1.0;
+    const rankStability = shrinkageFactor * baseStability + (1 - shrinkageFactor) * 0.5;
+
+    return {
+      sharpeNormalized,
+      edgeAdjustedWinRate,
+      logRoiNormalized: roiNormalized,
+      drawdownResilience,
+      rankStability,
     };
+  }
 
-    // First pass: manual hints + auto leaderboard (no network).
-    const needsInference: RawCandidate[] = [];
-    for (const c of candidates) {
-      // 1. Manual hint (always wins if lockCategory or no override possible)
-      if (c.hintCategory && c.lockCategory) {
-        out.set(c.address, {
-          category: this.coerceMarketCategory(c.hintCategory),
-          source: 'manual',
-          confidence: 1.0,
-        });
-        continue;
-      }
-      // 2. Auto leaderboard category
-      if (c.leaderboardCategory) {
-        const cat = ledgerToCategory[c.leaderboardCategory] ?? 'other';
-        out.set(c.address, { category: cat, source: 'auto', confidence: 0.9 });
-        // Still allow inference if manual hint disagrees — but only if not locked.
-        if (!c.hintCategory) continue;
-      }
-      // 3. Manual hint (non-locked)
-      if (c.hintCategory) {
-        out.set(c.address, {
-          category: this.coerceMarketCategory(c.hintCategory),
-          source: 'manual',
-          confidence: 0.95,
-        });
-        continue;
-      }
-      // 4. Need to infer from activity
-      needsInference.push(c);
+  /**
+   * Composite CopyScore (0–100) using fixed-weight linear combination.
+   * Mirrors Poly Syncer: Sharpe 0.45 | Edge-wr 0.20 | Log-ROI 0.15 | Drawdown 0.10 | Rank 0.10
+   */
+  computeCopyScore(components: WalletScoringComponents): number {
+    const raw =
+      0.45 * components.sharpeNormalized +
+      0.20 * components.edgeAdjustedWinRate +
+      0.15 * components.logRoiNormalized +
+      0.10 * components.drawdownResilience +
+      0.10 * components.rankStability;
+    return Math.round(Math.max(0, Math.min(100, raw * 100)));
+  }
+
+  // --------------------------------------------------------------------------
+  // Six-dimension scoring (PredictEngine pattern — retained for dashboard display)
+  // --------------------------------------------------------------------------
+
+  private computeDimensions(profile: WalletProfile | null): WalletDimensions {
+    if (!profile) {
+      return {
+        profitability: 0,
+        timing: 0,
+        slippage: 50,
+        consistency: 0,
+        marketSelection: 50,
+        recency: 0,
+      };
+    }
+    const perTrade = profile.realizedPnL / Math.max(profile.tradeCount, 1);
+    const profitability = Math.max(0, Math.min(100, 50 + 50 * Math.tanh(perTrade / 50)));
+    const timing = Math.max(0, Math.min(100, profile.avgPercentPnL * 100));
+    const slippage = Math.max(0, Math.min(100, profile.smartScore));
+    const consistency = Math.max(0, Math.min(100, profile.winRate * 100));
+    const focus = profile.positionCount / Math.max(profile.tradeCount, 1);
+    const marketSelection = Math.max(0, Math.min(100, 100 * (1 - focus)));
+    const daysStale = (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
+    const recency = Math.max(0, Math.min(100, 100 * Math.pow(0.5, daysStale / 14)));
+    return { profitability, timing, slippage, consistency, marketSelection, recency };
+  }
+
+  // --------------------------------------------------------------------------
+  // Bot detection
+  // --------------------------------------------------------------------------
+
+  /**
+   * Detect HFT / AMM / spread-capture bots.
+   * Polycopy explicitly flags: 90+ orders/day, winRate > 75% at scale,
+   * and smartScore >= 95 with tradeCount >= 500 as bot signatures.
+   *
+   * We approximate orders/day from tradeCount and lastActiveAt:
+   *   ordersPerDay = tradeCount / max(1, daysSinceFirstTrade)
+   */
+  private detectBot(profile: WalletProfile): { isBot: boolean; reason?: string } {
+    // Pattern 1: AMM / market-making bot — near-perfect score at scale
+    // Polycopy: winRate > 75% AND tradeCount >= 500 AND smartScore >= 95
+    const isAmmBot =
+      profile.winRate >= 0.75 &&
+      profile.tradeCount >= 500 &&
+      profile.smartScore >= 95;
+    if (isAmmBot) {
+      return { isBot: true, reason: 'AMM/spread-capture bot signature (winRate≥75%, vol≥500, smartScore≥95)' };
     }
 
-    // Second pass: fetch recent activity and classify by market slugs.
-    // Bounded concurrency, same worker-pool pattern as profile fetches.
-    const queue = [...needsInference];
-    const workers: Promise<void>[] = [];
-    for (let i = 0; i < this.config.profileFetchConcurrency; i++) {
-      workers.push(
-        (async () => {
-          while (queue.length > 0) {
-            const c = queue.shift();
-            if (!c) return;
-            try {
-              // Cache check — avoid re-fetching recent activity every cycle.
-              let activities: ReadonlyArray<{ title?: string; slug?: string; marketSlug?: string }>;
-              const cached = this.activityCache?.get<{ activities: typeof activities }>(c.address);
-              if (cached) {
-                activities = cached.activities;
-              } else {
-                const activity = await this.walletService.getWalletActivity(
-                  c.address,
-                  50, // last 50 trades is enough to bucket
-                );
-                activities = activity.activities as typeof activities;
-                this.activityCache?.set(c.address, { activities: [...activities] });
-              }
-              const inferred = this.inferCategoryFromActivity(activities);
-              out.set(c.address, inferred);
-            } catch (err) {
-              console.warn(
-                `[WalletScreening] activity fetch failed for ${c.address}:`,
-                err instanceof Error ? err.message : err,
-              );
-              out.set(c.address, {
-                category: 'other',
-                source: 'inferred',
-                confidence: 0,
-              });
-            }
-          }
-        })()
+    // Pattern 2: HFT — orders/day > 90
+    const daysSinceActive = Math.max(1,
+      (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000,
+    );
+    // Approximate orders per day from trade frequency
+    const ordersPerDay = profile.tradeCount / Math.max(1, daysSinceActive);
+    if (ordersPerDay > this.config.maxOrdersPerDay) {
+      return { isBot: true, reason: `HFT signature (${ordersPerDay.toFixed(0)} orders/day > ${this.config.maxOrdersPerDay})` };
+    }
+
+    // Pattern 3: mechanical churn — very high trade count with steady win rate
+    // indicating bot-like regularity rather than human discretion
+    const tooFrequent =
+      profile.tradeCount >= 2000 &&
+      profile.winRate >= 0.70;
+    if (tooFrequent) {
+      return { isBot: true, reason: 'mechanical churn signature (2000+ trades, winRate≥70%)' };
+    }
+
+    return { isBot: false };
+  }
+
+  // --------------------------------------------------------------------------
+  // Evaluation gate
+  // --------------------------------------------------------------------------
+
+  private evaluate(
+    c: RawCandidate,
+    profile: WalletProfile | null,
+    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
+    catWinRates: Record<string, { winRate: number; tradeCount: number }>,
+  ): ScreenedWallet {
+    // No profile — cannot score
+    if (!profile) {
+      return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false, undefined, catWinRates);
+    }
+
+    // Insufficient history
+    if (profile.tradeCount < this.config.minTradeCount) {
+      return this.buildResult(
+        c, profile, 'WATCHLIST',
+        `insufficient history (${profile.tradeCount} < ${this.config.minTradeCount})`,
+        false, resolved, catWinRates,
       );
     }
-    await Promise.all(workers);
-    return out;
-  }
 
-  /**
-   * Look at the market slugs in a wallet's recent trades and pick the
-   * most-common MarketCategory. Confidence scales with how concentrated
-   * the trades are in a single bucket (a 100%-crypto wallet gets 1.0;
-   * a 50/50 politics/crypto split gets 0.5).
-   */
-  private inferCategoryFromActivity(
-    activities: ReadonlyArray<{ title?: string; slug?: string; marketSlug?: string }>,
-  ): { category: MarketCategory; source: 'inferred'; confidence: number } {
-    const counts = new Map<MarketCategory, number>();
-    let total = 0;
-    for (const a of activities) {
-      const haystack = [a.title ?? '', a.slug ?? '', a.marketSlug ?? '']
-        .filter(Boolean)
-        .join(' ');
-      if (!haystack.trim()) continue;
-      const cat = categorizeMarket(haystack);
-      counts.set(cat, (counts.get(cat) ?? 0) + 1);
-      total++;
+    // Bot detection
+    const botCheck = this.detectBot(profile);
+    if (botCheck.isBot) {
+      return this.buildResult(c, profile, 'REJECTED', botCheck.reason!, true, resolved, catWinRates);
     }
-    if (total === 0) {
-      return { category: 'other', source: 'inferred', confidence: 0 };
+
+    // Recency gate — edge decays
+    const daysStale = (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
+    if (daysStale > this.config.maxInactiveDays) {
+      return this.buildResult(
+        c, profile, 'WATCHLIST',
+        `inactive ${daysStale.toFixed(0)}d (> ${this.config.maxInactiveDays}d)`,
+        false, resolved, catWinRates,
+      );
     }
-    let top: MarketCategory = 'other';
-    let topCount = 0;
-    for (const [cat, count] of counts) {
-      if (count > topCount) {
-        top = cat;
-        topCount = count;
-      }
+
+    // Profit factor: winners must outweigh losers in size
+    const pf = profile.winRate > 0 ? profile.winRate / Math.max(1 - profile.winRate, 1e-9) : 0;
+    if (pf < this.config.minProfitFactor) {
+      return this.buildResult(
+        c, profile, 'WATCHLIST',
+        `profit factor ${pf.toFixed(2)} < ${this.config.minProfitFactor}`,
+        false, resolved, catWinRates,
+      );
     }
-    return { category: top, source: 'inferred', confidence: topCount / total };
+
+    // Composite scoring components
+    const components = this.computeScoringComponents(profile);
+    const copyScore = this.computeCopyScore(components);
+
+    // Category specialization gate
+    const resolvedCat = resolved?.category ?? 'other';
+    const catStat = catWinRates[resolvedCat];
+    const concentration = catStat?.tradeCount
+      ? catStat.tradeCount / profile.tradeCount
+      : 0;
+    const specializes =
+      catStat && catStat.tradeCount >= this.config.minCategoryTrades
+        ? catStat.winRate >= this.config.minCategoryWinRate
+        : concentration >= 0.6 && profile.winRate >= this.config.minWinRate;
+
+    if (!specializes) {
+      return this.buildResult(
+        c, profile, 'WATCHLIST',
+        `not specialized in ${resolvedCat} (catWin=${((catStat?.winRate ?? profile.winRate) * 100).toFixed(0)}% < ${this.config.minCategoryWinRate * 100}%)`,
+        false, resolved, catWinRates,
+      );
+    }
+
+    // Drawdown check
+    const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
+
+    // Composite consistency (Polymeteo formula)
+    const consistency = Math.min(
+      99.5,
+      profile.winRate * 100 * 0.55 +
+        Math.min(pf, 3) * 8 +
+        (profile.smartScore / 4),
+    );
+
+    // Tier assignment — now driven by copyScore AND consistency
+    if (copyScore >= 65 && consistency >= this.config.primaryConsistency && profile.winRate >= this.config.minWinRate) {
+      return this.buildResult(
+        c, profile, 'PRIMARY',
+        `copyScore ${copyScore} consistency ${consistency.toFixed(1)}`,
+        false, resolved, catWinRates,
+      );
+    }
+    if (copyScore >= 45 && consistency >= this.config.minConsistency) {
+      return this.buildResult(
+        c, profile, 'SATELLITE',
+        `copyScore ${copyScore} consistency ${consistency.toFixed(1)}`,
+        false, resolved, catWinRates,
+      );
+    }
+
+    return this.buildResult(
+      c, profile, 'WATCHLIST',
+      `copyScore ${copyScore} below threshold`,
+      false, resolved, catWinRates,
+    );
   }
 
-  private coerceMarketCategory(hint: string): MarketCategory {
-    const h = hint.toLowerCase();
-    const allowed: MarketCategory[] = [
-      'crypto',
-      'politics',
-      'sports',
-      'esports',
-      'economics',
-      'science',
-      'entertainment',
-      'other',
-    ];
-    return (allowed.includes(h as MarketCategory) ? (h as MarketCategory) : 'other');
-  }
+  // --------------------------------------------------------------------------
+  // Result builder
+  // --------------------------------------------------------------------------
 
-  /**
-   * Filter screened wallets to PRIMARY only.
-   * Convenience for callers that want a one-line basket seeding.
-   */
-  primaries(screened: ScreenedWallet[]): ScreenedWallet[] {
-    return screened.filter((w) => w.tier === 'PRIMARY');
-  }
+  private buildResult(
+    c: RawCandidate,
+    profile: WalletProfile | null,
+    tier: WalletTier,
+    reason: string,
+    isBot: boolean,
+    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
+    catWinRates: Record<string, { winRate: number; tradeCount: number }> = {},
+  ): ScreenedWallet {
+    const resolvedCat = resolved?.category ?? 'other';
+    const catStat = catWinRates[resolvedCat];
+    const pf = profile ? (profile.winRate / Math.max(1 - profile.winRate, 1e-9)) : 0;
+    const components = profile ? this.computeScoringComponents(profile) : {
+      sharpeNormalized: 0, edgeAdjustedWinRate: 0, logRoiNormalized: 0,
+      drawdownResilience: 0, rankStability: 0,
+    };
+    const copyScore = profile ? this.computeCopyScore(components) : 0;
+    const consistency = profile
+      ? Math.min(99.5, profile.winRate * 100 * 0.55 + Math.min(pf, 3) * 8 + profile.smartScore / 4)
+      : 0;
 
-  /**
-   * Filter screened wallets to PRIMARY + SATELLITE.
-   * Use this when you want basket depth even at the cost of quality.
-   */
-  primariesAndSatellites(screened: ScreenedWallet[]): ScreenedWallet[] {
-    return screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
+    return {
+      address: c.address,
+      tier,
+      source: c.source,
+      label: c.label,
+      category: resolvedCat,
+      categorySource: resolved?.source ?? 'unset',
+      categoryConfidence: resolved?.confidence ?? 0,
+      dimensions: this.computeDimensions(profile),
+      copyScore,
+      scoringComponents: components,
+      consistency,
+      winRate: profile?.winRate ?? 0,
+      profitFactor: pf,
+      maxDrawdownPct: this.config.maxDrawdownPct,
+      smartScore: profile?.smartScore ?? 0,
+      tradeCount: profile?.tradeCount ?? 0,
+      isBotSuspect: isBot,
+      botReason: isBot ? reason : undefined,
+      categoryWinRates: catWinRates,
+      specializesInResolvedCategory: !!(catStat && catStat.tradeCount >= this.config.minCategoryTrades
+        ? catStat.winRate >= this.config.minCategoryWinRate
+        : (profile?.winRate ?? 0) >= this.config.minCategoryWinRate),
+      bypassed: false,
+      reason,
+    };
   }
-
-  // ---- internals --------------------------------------------------------
 
   private makeBypassed(
     c: RawCandidate,
@@ -483,316 +707,38 @@ export class WalletScreeningService {
       label: c.label,
       category: resolved?.category ?? 'other',
       categorySource: resolved?.source ?? 'unset',
-      categoryConfidence: resolved?.confidence ?? 0,
-      dimensions: {
-        profitability: 100,
-        timing: 100,
-        slippage: 100,
-        consistency: 100,
-        marketSelection: 100,
-        recency: 100,
+      categoryConfidence: resolved?.confidence ?? 1,
+      dimensions: { profitability: 50, timing: 50, slippage: 50, consistency: 50, marketSelection: 50, recency: 50 },
+      copyScore: 100,
+      scoringComponents: {
+        sharpeNormalized: 1, edgeAdjustedWinRate: 1,
+        logRoiNormalized: 1, drawdownResilience: 1, rankStability: 1,
       },
       consistency: 100,
       winRate: 1,
       profitFactor: 999,
       maxDrawdownPct: 0,
       smartScore: 100,
-      tradeCount: 0,
+      tradeCount: 999999,
       isBotSuspect: false,
       categoryWinRates: {},
-      specializesInResolvedCategory: true, // operator trusts this wallet
+      specializesInResolvedCategory: true,
       bypassed: true,
       reason: 'manual bypass',
     };
   }
 
-  /**
-   * Compute per-category win rates from a wallet's positions.
-   * Buckets by category (via market title/slug) and measures win rate
-   * (cashPnl > 0) within each. Returns a map keyed by MarketCategory.
-   */
-  private winRatesByCategory(
-    positions: ReadonlyArray<{ title?: string; slug?: string; cashPnl?: number; percentPnl?: number }>,
-  ): Record<string, { winRate: number; tradeCount: number }> {
-    const buckets = new Map<string, { wins: number; total: number }>();
-    let grandTotal = 0;
-    for (const p of positions) {
-      const haystack = [p.title ?? '', p.slug ?? ''].filter(Boolean).join(' ');
-      if (!haystack.trim()) continue;
-      const cat = categorizeMarket(haystack);
-      const bucket = buckets.get(cat) ?? { wins: 0, total: 0 };
-      bucket.total++;
-      grandTotal++;
-      if ((p.cashPnl ?? p.percentPnl ?? 0) > 0) bucket.wins++;
-      buckets.set(cat, bucket);
+  // --------------------------------------------------------------------------
+  // Utilities
+  // --------------------------------------------------------------------------
+
+  private async runBounded<T>(concurrency: number, items: T[], fn: (item: T) => Promise<void>): Promise<void> {
+    const chunks = [];
+    for (let i = 0; i < items.length; i += concurrency) {
+      chunks.push(items.slice(i, i + concurrency));
     }
-    const out: Record<string, { winRate: number; tradeCount: number }> = {};
-    for (const [cat, b] of buckets) {
-      // Concentration: share of ALL categorized trades that landed in this category.
-      const concentration = grandTotal > 0 ? b.total / grandTotal : 0;
-      out[cat] = {
-        winRate: b.total > 0 ? b.wins / b.total : 0,
-        tradeCount: b.total,
-        // stash concentration on the object for the evaluation gate (not strictly typed)
-        ...(concentration > 0 ? { concentration } : {}),
-      } as { winRate: number; tradeCount: number };
+    for (const chunk of chunks) {
+      await Promise.all(chunk.map(fn));
     }
-    return out;
-  }
-
-  private evaluate(
-    c: RawCandidate,
-    profile: WalletProfile | null,
-    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
-    catWinRates: Record<string, { winRate: number; tradeCount: number }> = {},
-  ): ScreenedWallet {
-    // No profile → too little history to trust → WATCHLIST.
-    if (!profile) {
-      return this.buildResult(c, profile, 'WATCHLIST', 'no profile data', false, resolved, catWinRates);
-    }
-    if (profile.tradeCount < this.config.minTradeCount) {
-      return this.buildResult(
-        c,
-        profile,
-        'WATCHLIST',
-        `insufficient history (${profile.tradeCount} < ${this.config.minTradeCount})`,
-        false,
-        resolved,
-        catWinRates,
-      );
-    }
-
-    // Bot detection — limited data here without fills, so use leaderboard
-    // category hint + smartScore heuristic. (A full fill-based bot detector
-    // would call fetchAllFillsInPeriod and measure inter-fill medians.)
-    const isBotSuspect = this.detectBot(profile);
-
-    // Profit factor (gross wins / gross losses) — catch wallets that win often
-    // but lose bigger. Without a P&L breakdown in WalletProfile we approximate
-    // PF from win rate; a wallet must clear minProfitFactor to be seeded.
-    const pf = profile.winRate > 0 ? profile.winRate / Math.max(1 - profile.winRate, 1e-9) : 0;
-
-    // Recency gate — edge decays on Polymarket. A wallet idle past
-    // maxInactiveDays is not a live signal source.
-    const daysStale =
-      (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
-    if (daysStale > this.config.maxInactiveDays) {
-      return this.buildResult(
-        c,
-        profile,
-        'WATCHLIST',
-        `inactive ${daysStale.toFixed(0)}d (> ${this.config.maxInactiveDays}d)`,
-        false,
-        resolved,
-        catWinRates,
-      );
-    }
-
-    // Composite consistency (Polymeteo formula, adapted to TS profile shape).
-    // pf already computed above (profit factor from win rate).
-    const consistency = Math.min(
-      99.5,
-      profile.winRate * 100 * 0.55 +
-        Math.min(pf, 3) * 8 +
-        (profile.smartScore / 4) +
-        (this.config.maxDrawdownPct > 25 ? 5 : 0)
-    );
-
-    const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
-
-    // Require profit factor: winners must outweigh losers in size, not just count.
-    if (pf < this.config.minProfitFactor) {
-      return this.buildResult(
-        c,
-        profile,
-        'WATCHLIST',
-        `profit factor ${pf.toFixed(2)} < ${this.config.minProfitFactor}`,
-        false,
-        resolved,
-        catWinRates,
-      );
-    }
-
-    // Category specialization gate: a wallet is only trusted for the basket
-    // matching its resolved category if it actually has edge THERE.
-    //   - Hard pass: >= minCategoryTrades in that category AND its category
-    //     win rate beats minCategoryWinRate.
-    //   - Soft pass: the wallet is CONCENTRATED in that category
-    //     (>=60% of its trades there) AND its GLOBAL win rate beats minWinRate.
-    //     (Few category-specific trades, but clearly a focused specialist.)
-    //   - Otherwise: WATCHLIST — no demonstrated edge in the category the
-    //     quorum would route it to. We do NOT seed on global edge alone.
-    const resolvedCat = resolved?.category ?? 'other';
-    const catStat = catWinRates[resolvedCat] as
-      | { winRate: number; tradeCount: number; concentration?: number }
-      | undefined;
-    const concentration = catStat?.concentration ?? 0;
-    const specializes =
-      catStat && catStat.tradeCount >= this.config.minCategoryTrades
-        ? catStat.winRate >= this.config.minCategoryWinRate
-        : catStat && concentration >= 0.6 && profile.winRate >= this.config.minWinRate;
-
-    if (isBotSuspect) {
-      return this.buildResult(c, profile, 'REJECTED', 'bot signature detected', true, resolved, catWinRates);
-    }
-    if (maxDrawdownPct > this.config.maxDrawdownPct) {
-      return this.buildResult(
-        c,
-        profile,
-        'REJECTED',
-        `drawdown ${maxDrawdownPct.toFixed(1)}% > ${this.config.maxDrawdownPct}%`,
-        false,
-        resolved,
-        catWinRates,
-      );
-    }
-    // Require specialization in the resolved category before joining any basket.
-    if (!specializes) {
-      return this.buildResult(
-        c,
-        profile,
-        'WATCHLIST',
-        `not specialized in ${resolvedCat} (catWin=${(catStat?.winRate ?? profile.winRate * 100).toFixed(0)}% < ${this.config.minCategoryWinRate * 100}%)`,
-        false,
-        resolved,
-        catWinRates,
-      );
-    }
-    if (consistency >= this.config.primaryConsistency && profile.winRate >= this.config.minWinRate) {
-      return this.buildResult(c, profile, 'PRIMARY', `consistency ${consistency.toFixed(1)}`, false, resolved, catWinRates);
-    }
-    if (consistency >= this.config.minConsistency) {
-      return this.buildResult(c, profile, 'SATELLITE', `consistency ${consistency.toFixed(1)}`, false, resolved, catWinRates);
-    }
-    return this.buildResult(
-      c,
-      profile,
-      'WATCHLIST',
-      `consistency ${consistency.toFixed(1)} below ${this.config.minConsistency}`,
-      false,
-      resolved,
-      catWinRates,
-    );
-  }
-
-  /**
-   * Six-dimension scoring (PredictEngine pattern). All inputs come from
-   * WalletProfile; dimensions we can't measure yet are neutral (50).
-   *
-   *  - profitability: realized PnL per trade, log-scaled
-   *  - timing:        avgPercentPnL (entry/exit skill proxy)
-   *  - slippage:      smartScore already encodes execution quality; invert
-   *  - consistency:   win rate mapped to 0-100
-   *  - marketSelection: position-count vs. trade-count ratio (a focused
-   *                     trader holds fewer concurrent positions)
-   *  - recency:       days since last activity, decayed
-   */
-  private computeDimensions(
-    profile: WalletProfile | null,
-  ): WalletDimensions {
-    if (!profile) {
-      return {
-        profitability: 0,
-        timing: 0,
-        slippage: 50,
-        consistency: 0,
-        marketSelection: 50,
-        recency: 0,
-      };
-    }
-    // Profitability: log-scale realizedPnL per trade, clamp 0-100.
-    const perTrade = profile.realizedPnL / Math.max(profile.tradeCount, 1);
-    const profitability = Math.max(
-      0,
-      Math.min(100, 50 + 50 * Math.tanh(perTrade / 50)),
-    );
-
-    // Timing: avgPercentPnL (0-1 expected) mapped to 0-100.
-    const timing = Math.max(0, Math.min(100, profile.avgPercentPnL * 100));
-
-    // Slippage/execution: smartScore is a 0-100 composite that already
-    // weights execution quality.
-    const slippage = Math.max(0, Math.min(100, profile.smartScore));
-
-    // Consistency: win rate to 0-100.
-    const consistency = Math.max(0, Math.min(100, profile.winRate * 100));
-
-    // Market selection: focus ratio. A wallet with 500 trades but only
-    // 3 positions is focused; 500 trades across 400 positions is spraying.
-    const focus = profile.positionCount / Math.max(profile.tradeCount, 1);
-    const marketSelection = Math.max(0, Math.min(100, 100 * (1 - focus)));
-
-    // Recency: days since last activity, decay factor 14 days half-life.
-    const daysStale = (Date.now() - new Date(profile.lastActiveAt).getTime()) / 86_400_000;
-    const recency = Math.max(0, Math.min(100, 100 * Math.pow(0.5, daysStale / 14)));
-
-    return { profitability, timing, slippage, consistency, marketSelection, recency };
-  }
-
-  /**
-   * Bot signature heuristic.
-   * Real signal: high smartScore is GOOD; very high smartScore (95+) AND
-   * very high tradeCount (1000+) AND high winRate (75%+) is suspicious —
-   * that's almost certainly a market-making or arbitrage bot.
-   * The Polymarket CopyCat article flagged this pattern explicitly:
-   * crypto bonding bots >80c with 95%+ win rates are bots whose edge
-   * decays as soon as it gets copied.
-   */
-  private detectBot(profile: WalletProfile): boolean {
-    // Pattern 1: market-making / arb bot — near-perfect score at scale.
-    const tooPerfect =
-      profile.smartScore >= 95 &&
-      profile.winRate >= 0.75 &&
-      profile.tradeCount >= 500;
-    // Pattern 2: mechanical high-frequency churn — thousands of trades with a
-    // steady, unusually-high win rate (edge that decays the moment it's copied).
-    const tooFrequent =
-      profile.tradeCount >= 2000 && profile.winRate >= 0.70;
-    return tooPerfect || tooFrequent;
-  }
-
-  private buildResult(
-    c: RawCandidate,
-    profile: WalletProfile | null,
-    tier: WalletTier,
-    reason: string,
-    isBotSuspect: boolean,
-    resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
-    catWinRates: Record<string, { winRate: number; tradeCount: number }> = {},
-  ): ScreenedWallet {
-    const resolvedCat = resolved?.category ?? 'other';
-    const catStat = catWinRates[resolvedCat];
-    const specializes =
-      catStat && catStat.tradeCount >= this.config.minCategoryTrades
-        ? catStat.winRate >= this.config.minCategoryWinRate
-        : (profile?.winRate ?? 0) >= this.config.minCategoryWinRate;
-    return {
-      address: c.address,
-      tier,
-      source: c.source,
-      label: c.label,
-      category: resolvedCat,
-      categorySource: resolved?.source ?? 'unset',
-      categoryConfidence: resolved?.confidence ?? 0,
-      dimensions: this.computeDimensions(profile),
-      consistency: profile
-        ? Math.min(
-            99.5,
-            profile.winRate * 100 * 0.55 +
-              Math.min(profile.winRate / Math.max(1 - profile.winRate, 1e-9), 3) * 8 +
-              profile.smartScore / 4
-          )
-        : 0,
-      winRate: profile?.winRate ?? 0,
-      profitFactor: profile ? profile.winRate / Math.max(1 - profile.winRate, 1e-9) : 0,
-      maxDrawdownPct: 0,
-      smartScore: profile?.smartScore ?? 0,
-      tradeCount: profile?.tradeCount ?? 0,
-      isBotSuspect,
-      categoryWinRates: catWinRates,
-      specializesInResolvedCategory: specializes,
-      bypassed: false,
-      reason,
-    };
   }
 }
