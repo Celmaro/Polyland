@@ -110,6 +110,8 @@ interface Vote {
   price: number;
   size: number;
   timestamp: number;
+  /** Wallet tier when vote was cast — used for tiered quorum (2×PRIMARY or 1P+2S) */
+  tier: 'PRIMARY' | 'SATELLITE';
 }
 
 interface QuorumSignal {
@@ -164,6 +166,9 @@ export class BasketQuorumService {
 
   /** conditionId -> outcome -> wallet -> Vote */
   private votes = new Map<string, Map<string, Map<string, Vote>>>();
+
+  /** Wallet address -> tier map. Populated in seed(). Used for tiered quorum. */
+  private walletTierMap = new Map<string, 'PRIMARY' | 'SATELLITE'>();
 
   /** conditionId:outcome -> last fired timestamp (cooldown/one-shot) */
   private lastFired = new Map<string, number>();
@@ -227,7 +232,7 @@ export class BasketQuorumService {
    */
   setStateStore(store: VoteStateStore): void {
     this.stateStore = store;
-    this.votes = store.votes;
+    this.votes = store.votes as typeof this.votes;
     this.lastFired = store.lastFired;
     // Prune anything already past the window
     let maxWindow = 0;
@@ -415,6 +420,9 @@ export class BasketQuorumService {
         if (!byCategory.has(cat)) byCategory.set(cat, []);
         byCategory.get(cat)!.push(w.address.toLowerCase());
       }
+
+      // Populate tier map for tiered quorum checks (2×PRIMARY or 1P+2S).
+      this.walletTierMap.set(w.address.toLowerCase(), w.tier as 'PRIMARY' | 'SATELLITE');
     }
 
     // Rebuild baskets Map using existing config defaults.
@@ -435,6 +443,7 @@ export class BasketQuorumService {
     this.votes.clear();
     this.lastFired.clear();
     this.basketSpend.clear();
+    this.walletTierMap.clear();
     this._schedulePersist();
     const summary = [...byCategory.entries()]
       .map(([c, ws]) => c + '=' + ws.length)
@@ -513,12 +522,14 @@ export class BasketQuorumService {
     }
 
     // 6. Record the vote — one vote per wallet per outcome.
+    const walletTier = this.walletTierMap.get(traderKey) ?? 'SATELLITE';
     outcomeVotes.set(traderKey, {
       wallet: traderKey,
       side: trade.side,
       price: trade.price,
       size: trade.size,
       timestamp: now,
+      tier: walletTier,
     });
 
     this.stats.voters = this.votes.size;
@@ -603,17 +614,21 @@ export class BasketQuorumService {
       return;
     }
 
-    // Distinct agreeing wallets (this is the quorum count).
-    const agreeing = [...outcomeVotes.values()].filter(
-      (v) => v.side === 'BUY'
-    );
-    if (agreeing.length < basket.quorum) {
-      // Not enough consensus yet — wait for more basket members.
+    // Tiered quorum: 2× PRIMARY or 1× PRIMARY + 2× SATELLITE fires a signal.
+    // This ensures signals come from genuine elite consensus, not just wallet count.
+    const primaryCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'PRIMARY').length;
+    const satelliteCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'SATELLITE').length;
+    const tieredFires =
+      primaryCount >= 2 ||
+      (primaryCount >= 1 && satelliteCount >= 2);
+    if (!tieredFires) {
+      // Not enough tier-weighted consensus — wait for more basket members.
       return;
     }
 
-    // Consensus reached. Compute median entry price.
-    const prices = agreeing.map((v) => v.price).sort((a, b) => a - b);
+    // Consensus reached. Compute median entry price across all BUY votes.
+    const buyVotes = [...outcomeVotes.values()].filter((v) => v.side === 'BUY');
+    const prices = buyVotes.map((v) => v.price).sort((a, b) => a - b);
     const mid = Math.floor(prices.length / 2);
     const consensusPrice =
       prices.length % 2 === 0
@@ -627,12 +642,12 @@ export class BasketQuorumService {
       outcome,
       category: basket.category,
       basketName: basket.name,
-      walletCount: agreeing.length,
-      wallets: agreeing.map((v) => v.wallet),
+      walletCount: primaryCount + satelliteCount,
+      wallets: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').map((v) => v.wallet),
       consensusPrice,
       winRate: basket.winRate ?? 0.6,
       side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
-      totalSize: agreeing.reduce((sum, v) => sum + v.size, 0),
+      totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
     };
 
     // Record the fire in SignalAuditStore (price calibration + fee math done inside)
@@ -833,6 +848,7 @@ export class BasketQuorumService {
     this.votes.clear();
     this.lastFired.clear();
     this.basketSpend.clear();
+    this.walletTierMap.clear();
     if (this._persistTimer !== null) {
       clearTimeout(this._persistTimer);
       this._persistTimer = null;

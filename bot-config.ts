@@ -468,19 +468,20 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   });
   const screeningConfig = {
     profileFetchConcurrency: 10,
+    // CopyScore thresholds (Poly Syncer/Polycopy composite 0–100):
+    // PRIMARY: >= 65 (elite, top ~15%). SATELLITE: >= 45 (above-median).
+    primaryCopyScoreThreshold: 65,
+    satelliteCopyScoreThreshold: 45,
     // Proven-good baseline: 150 trades (now accurate thanks to getAllActivity),
     // consistency floor 85, category win 0.58 over >=12 category trades.
-    // The root-cause bug (tradeCount capped at 100) is fixed; these values
-    // previously yielded 7 quality wallets. PF/recency checks remain in the
-    // DEFAULT config and apply as soft guards.
+    // Profitability gate: totalPnL > 0 (actual net profit, not win-rate proxy).
     minTradeCount: 150,
     minConsistency: 85,
     primaryConsistency: 92,
     minWinRate: 0.60,
     minCategoryWinRate: 0.58,
     minCategoryTrades: 12,
-    minProfitFactor: 1.5,
-    maxInactiveDays: 45,
+    maxInactiveDays: 60,   // edge decays — 60d matches Poly Syncer window
   };
   const screening = new WalletScreeningService(sdk.wallets, screeningConfig);
   const stateStore = new VoteStateStore('./data/quorum-state.json');

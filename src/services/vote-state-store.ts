@@ -33,6 +33,7 @@ interface PersistedVote {
   price: number;
   size: number;
   timestamp: number;
+  tier: 'PRIMARY' | 'SATELLITE';
 }
 
 interface PersistedState {

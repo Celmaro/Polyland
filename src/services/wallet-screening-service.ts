@@ -85,6 +85,16 @@ export interface WalletScreeningConfig {
   minProfitFactor: number;
   /** Wallets inactive longer than this (days) are skipped — edge decays */
   maxInactiveDays: number;
+  /**
+   * Minimum CopyScore (0–100) for PRIMARY tier.
+   * PRIMARY: elite wallets with score >= primaryCopyScoreThreshold.
+   */
+  primaryCopyScoreThreshold: number;
+  /**
+   * Minimum CopyScore (0–100) for SATELLITE tier.
+   * SATELLITE: above-median wallets scoring >= satelliteCopyScoreThreshold.
+   */
+  satelliteCopyScoreThreshold: number;
 }
 
 export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
@@ -103,6 +113,11 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   minProfitFactor: 1.5,
   // Edge decays — a wallet idle 60+ days is not a live signal source.
   maxInactiveDays: 60,
+  // CopyScore thresholds (0–100 composite — Poly Syncer/Polycopy methodology).
+  // PRIMARY: top-tier elite wallets (score >= 65).
+  // SATELLITE: above-median contributors (score >= 45).
+  primaryCopyScoreThreshold: 65,
+  satelliteCopyScoreThreshold: 45,
 };
 
 // ============================================================================
@@ -184,7 +199,7 @@ export interface ScreenedWallet {
 
   // Composite CopyScore 0–100 (Poly Syncer / Polycopy methodology)
   copyScore: number;
-  scoringComponents: WalletScoringComponents;
+  scoringComponents?: WalletScoringComponents;
 
   // Computed quality metrics
   consistency: number;   // 0–100 composite (Polymeteo formula)
@@ -277,22 +292,14 @@ export class WalletScreeningService {
     );
 
     const screened: ScreenedWallet[] = [];
-    const gateCounts: Record<string, number> = {};
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
       const walletsCatWinRates = catWinRates.get(c.address) ?? {};
-      const result = c.bypassScreening
+      screened.push(c.bypassScreening
         ? this.makeBypassed(c, resolved)
-        : this.evaluate(c, profile, resolved, walletsCatWinRates);
-      if (result.tier !== 'PRIMARY' && result.tier !== 'SATELLITE') {
-        const key = result.reason.split(' (')[0];
-        gateCounts[key] = (gateCounts[key] ?? 0) + 1;
-      }
-      screened.push(result);
+        : this.evaluate(c, profile, resolved, walletsCatWinRates));
     }
-    console.log('[WalletScreening] gate tally: ' +
-      Object.entries(gateCounts).map(([k, v]) => `${k}=${v}`).join(' ') || '(none rejected)');
     return screened;
   }
 
@@ -589,12 +596,14 @@ export class WalletScreeningService {
       );
     }
 
-    // Profit factor: winners must outweigh losers in size
-    const pf = profile.winRate > 0 ? profile.winRate / Math.max(1 - profile.winRate, 1e-9) : 0;
-    if (pf < this.config.minProfitFactor) {
+    // Profitability: wallet must have net positive realized PnL.
+    // Poly Syncer/Polycopy use realized PnL as the primary metric, not win-rate.
+    // A wallet can win 60%+ of trades but still lose money if losers outweigh winners.
+    // We use totalPnL > 0 as the gate; this is the actual bottom line.
+    if (profile.totalPnL <= 0) {
       return this.buildResult(
         c, profile, 'WATCHLIST',
-        `profit factor ${pf.toFixed(2)} < ${this.config.minProfitFactor}`,
+        `unprofitable (totalPnL=${profile.totalPnL.toFixed(2)} <= 0)`,
         false, resolved, catWinRates,
       );
     }
@@ -625,23 +634,24 @@ export class WalletScreeningService {
     // Drawdown check
     const maxDrawdownPct = this.config.maxDrawdownPct; // profile doesn't expose this directly
 
-    // Composite consistency (Polymeteo formula)
+    // Composite consistency (Polymeteo formula — adapted to WalletProfile shape).
+    // Uses smartScore as a risk-adjusted performance proxy for drawdown/resilience.
     const consistency = Math.min(
       99.5,
       profile.winRate * 100 * 0.55 +
-        Math.min(pf, 3) * 8 +
+        Math.min(profile.smartScore / 25, 3) * 8 +  // smartScore/25 maps 0-100 to 0-4
         (profile.smartScore / 4),
     );
 
-    // Tier assignment — now driven by copyScore AND consistency
-    if (copyScore >= 65 && consistency >= this.config.primaryConsistency && profile.winRate >= this.config.minWinRate) {
+    // Tier assignment — driven by CopyScore AND consistency
+    if (copyScore >= this.config.primaryCopyScoreThreshold && consistency >= this.config.primaryConsistency && profile.winRate >= this.config.minWinRate) {
       return this.buildResult(
         c, profile, 'PRIMARY',
         `copyScore ${copyScore} consistency ${consistency.toFixed(1)}`,
         false, resolved, catWinRates,
       );
     }
-    if (copyScore >= 45 && consistency >= this.config.minConsistency) {
+    if (copyScore >= this.config.satelliteCopyScoreThreshold && consistency >= this.config.minConsistency) {
       return this.buildResult(
         c, profile, 'SATELLITE',
         `copyScore ${copyScore} consistency ${consistency.toFixed(1)}`,
@@ -671,14 +681,12 @@ export class WalletScreeningService {
   ): ScreenedWallet {
     const resolvedCat = resolved?.category ?? 'other';
     const catStat = catWinRates[resolvedCat];
-    const pf = profile ? (profile.winRate / Math.max(1 - profile.winRate, 1e-9)) : 0;
-    const components = profile ? this.computeScoringComponents(profile) : {
-      sharpeNormalized: 0, edgeAdjustedWinRate: 0, logRoiNormalized: 0,
-      drawdownResilience: 0, rankStability: 0,
-    };
-    const copyScore = profile ? this.computeCopyScore(components) : 0;
+    const components = profile ? this.computeScoringComponents(profile) : null;
+    const copyScore = profile && components
+      ? this.computeCopyScore(components)
+      : 0;
     const consistency = profile
-      ? Math.min(99.5, profile.winRate * 100 * 0.55 + Math.min(pf, 3) * 8 + profile.smartScore / 4)
+      ? Math.min(99.5, profile.winRate * 100 * 0.55 + Math.min(profile.smartScore / 25, 3) * 8 + profile.smartScore / 4)
       : 0;
 
     return {
@@ -691,10 +699,10 @@ export class WalletScreeningService {
       categoryConfidence: resolved?.confidence ?? 0,
       dimensions: this.computeDimensions(profile),
       copyScore,
-      scoringComponents: components,
+      scoringComponents: components ?? undefined,
       consistency,
       winRate: profile?.winRate ?? 0,
-      profitFactor: pf,
+      profitFactor: 0,  // no longer computed (replaced by totalPnL > 0 gate)
       maxDrawdownPct: this.config.maxDrawdownPct,
       smartScore: profile?.smartScore ?? 0,
       tradeCount: profile?.tradeCount ?? 0,
@@ -729,7 +737,7 @@ export class WalletScreeningService {
       },
       consistency: 100,
       winRate: 1,
-      profitFactor: 999,
+      profitFactor: 0,
       maxDrawdownPct: 0,
       smartScore: 100,
       tradeCount: 999999,
