@@ -561,6 +561,23 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     }
   }, 5 * 60 * 1000);
 
+  // DIAGNOSTIC: raw trade-firehose counter — counts ALL trades arriving over the
+  // websocket (before any address filtering). If rawTrades stays 0, the websocket
+  // feed itself is dead. If rawTrades grows but observed stays 0, the seeded
+  // wallets simply haven't traded yet (human-pace activity).
+  let rawTrades = 0;
+  let seededMatches = 0;
+  const seededSet = new Set(primaries.map((w) => w.address.toLowerCase()));
+  sdk.realtime.subscribeAllActivity({
+    onTrade: (t) => {
+      rawTrades++;
+      if (t.trader?.address && seededSet.has(t.trader.address.toLowerCase())) seededMatches++;
+    },
+  });
+  setInterval(() => {
+    log('DIAG', `firehose: rawTrades=${rawTrades} seededMatches=${seededMatches} (0 raw = dead websocket)`);
+  }, 5 * 60 * 1000);
+
   const basketCount = basketQuorum.getBasketCount();
   log('QUORUM', `Basket quorum running — monitoring ${primaries.length} wallets across ${basketCount} baskets`);
 }
