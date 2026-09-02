@@ -60,31 +60,31 @@ const CONFIG = {
   },
 
   smartMoney: {
-    enabled: true,  // basket-quorum copy trading — do NOT disable
-    topN: 20,
-    // 🔴 FIXED: Stricter criteria
-    minWinRate: 0.60,  // Up from 0.50 to 60%
-    minPnl: 500,       // Up from 100 to $500
-    minTrades: 30,     // Up from 20 to 30
+      enabled: true,  // basket-quorum copy trading — do NOT disable
+      topN: 50,        // 50 per category × 5 categories ≈ 200+ candidates after dedup
+      // 🔴 FIXED: Stricter criteria
+      minWinRate: 0.60,  // Up from 0.50 to 60%
+      minPnl: 500,       // Up from 100 to $500
+      minTrades: 30,     // Up from 20 to 30
 
-    // 🔴 NEW: Quality filters
-    minProfitFactor: 1.5,  // Total wins / total losses >= 1.5x
-    minConsistencyScore: 0.7,  // Recent performance score
-    maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
-    checkLastNTrades: 10,  // Analyze last 10 trades for consistency
+      // 🔴 NEW: Quality filters
+      minProfitFactor: 1.5,  // Total wins / total losses >= 1.5x
+      minConsistencyScore: 0.7,  // Recent performance score
+      maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
+      checkLastNTrades: 10,  // Analyze last 10 trades for consistency
 
-    sizeScale: 0.1,
-    maxSizePerTrade: 15,
-    maxSlippage: 0.03,
-    minTradeSize: 10,
-    delay: 500,
-    // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
-    customWallets: [
-      '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',  // Top Polymarket trader
-      '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',  // simonbanza
-      // Add more wallet addresses here...
-    ] as string[],
-  },
+      sizeScale: 0.1,
+      maxSizePerTrade: 15,
+      maxSlippage: 0.03,
+      minTradeSize: 10,
+      delay: 500,
+      // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
+      customWallets: [
+        '0xc2e7800b5af46e6093872b177b7a5e7f0563be51',  // Top Polymarket trader
+        '0x58c3f5d66c95d4c41b093fbdd2520e46b6c9de74',  // simonbanza
+        // Add more wallet addresses here...
+      ] as string[],
+    },
 
   arbitrage: {
     enabled: false,
@@ -461,7 +461,7 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
       enabled: true,
       period: 'week',
       topN: CONFIG.smartMoney.topN,
-      categories: ['OVERALL', 'CRYPTO', 'SPORTS', 'POLITICS'],
+      categories: ['OVERALL', 'CRYPTO', 'SPORTS', 'POLITICS', 'CULTURE', 'TECH', 'FINANCE', 'ECONOMICS'],
       refreshIntervalMs: 6 * 60 * 60 * 1000,
       sortBy: 'pnl',
     },
