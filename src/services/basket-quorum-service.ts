@@ -615,21 +615,26 @@ export class BasketQuorumService {
     }
 
     // Tiered quorum: 2× PRIMARY or 1× PRIMARY + 2× SATELLITE fires a signal.
-    // This ensures signals come from genuine elite consensus, not just wallet count.
-    const primaryCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'PRIMARY').length;
-    const satelliteCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'SATELLITE').length;
-    const tieredFires =
-      primaryCount >= 2 ||
-      (primaryCount >= 1 && satelliteCount >= 2);
-    if (!tieredFires) {
-      // Diagnostic: log NEAR-MISSES so we can see if consensus is *almost* there.
-      if (primaryCount + satelliteCount >= 2) {
-        const voters = [...outcomeVotes.values()].map(v => `${v.tier}@${v.price}`).join(',');
-        console.log(`[Quorum near-miss] ${marketSlug} ${outcome} primary=${primaryCount} sat=${satelliteCount} votes=[${voters}]`);
-      }
-      // Not enough tier-weighted consensus — wait for more basket members.
-      return;
-    }
+        // This ensures signals come from genuine elite consensus, not just wallet count.
+        // ALSO: a strong crowd consensus (5+ SATELLITE votes on same market) fires
+        // — empirical near-miss data showed 18 SATELLITE voting on BTC up/down
+        // with 0 PRIMARY in that window; elite consensus is also numerical
+        // consensus when enough wallets agree.
+        const primaryCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'PRIMARY').length;
+        const satelliteCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'SATELLITE').length;
+        const tieredFires =
+          primaryCount >= 2 ||
+          (primaryCount >= 1 && satelliteCount >= 2) ||
+          satelliteCount >= 5;  // crowd consensus escape hatch
+        if (!tieredFires) {
+          // Diagnostic: log NEAR-MISSES so we can see if consensus is *almost* there.
+          if (primaryCount + satelliteCount >= 2) {
+            const voters = [...outcomeVotes.values()].map(v => `${v.tier}@${v.price}`).join(',');
+            console.log(`[Quorum near-miss] ${marketSlug} ${outcome} primary=${primaryCount} sat=${satelliteCount} votes=[${voters}]`);
+          }
+          // Not enough tier-weighted consensus — wait for more basket members.
+          return;
+        }
 
     // Consensus reached. Compute median entry price across all BUY votes.
     const buyVotes = [...outcomeVotes.values()].filter((v) => v.side === 'BUY');
