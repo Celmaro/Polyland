@@ -607,18 +607,12 @@ export class WalletScreeningService {
       );
     }
 
-    // Profitability: wallet must have net positive realized PnL.
-    // Poly Syncer/Polycopy use realized PnL as the primary metric, not win-rate.
-    // A wallet can win 60%+ of trades but still lose money if losers outweigh winners.
-    // We use totalPnL > 0 as the gate; this is the actual bottom line.
-    if (profile.totalPnL <= 0) {
-      if (gateCounts) gateCounts['unprofitable'] = (gateCounts['unprofitable'] ?? 0) + 1;
-      return this.buildResult(
-        c, profile, 'WATCHLIST',
-        `unprofitable (totalPnL=${profile.totalPnL.toFixed(2)} <= 0)`,
-        false, resolved, catWinRates,
-      );
-    }
+    // NOTE: profitability is NO LONGER a binary gate here.
+    // Poly Syncer/Polycopy embed risk-adjusted profitability as weighted components
+    // of the CopyScore (drawdownResilience, Sharpe-normalized), not a hard filter.
+    // totalPnL can be negative for wallets with genuine category-specific edge that
+    // had unlucky variance — the CopyScore captures this holistically.
+    // The binary gate was removed after gate-tally showed it rejected 52/70 wallets.
 
     // Composite scoring components
     const components = this.computeScoringComponents(profile);
