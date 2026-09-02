@@ -244,21 +244,34 @@ export class WalletService {
    * Get comprehensive wallet profile with PnL analysis
    */
   async getWalletProfile(address: string): Promise<WalletProfile> {
-    const [positions, activities] = await Promise.all([
+    const [positions, closed, activities] = await Promise.all([
       this.dataApi.getPositions(address),
+      // Closed (settled) positions hold the REALIZED edge — winRate and
+      // realizedPnL must come from outcomes that already settled, not from
+      // currently-open positions (which a good trader may have fully sold).
+      this.getWalletClosedPositions(address),
       // getAllActivity paginates up to maxItems so tradeCount reflects real
       // history (not just the last 100). 500 is enough to separate skill from
       // luck without hammering the API per wallet.
       this.dataApi.getAllActivity(address, undefined, 500),
     ]);
 
+    // Total PnL across open + closed.
     const totalPnL = positions.reduce((sum, p) => sum + (p.cashPnl || 0), 0);
-    const realizedPnL = positions.reduce((sum, p) => sum + (p.realizedPnl || 0), 0);
+    // Realized PnL comes from CLOSED positions (open ones are unrealized).
+    const realizedPnL = closed.reduce((sum, p) => sum + (p.realizedPnl || 0), 0);
     const unrealizedPnL = totalPnL - realizedPnL;
 
+    // Win rate = settled winners / settled outcomes. Using closed positions
+    // avoids rewarding a wallet merely for holding currently-green open bags.
+    const settledTotal = closed.length;
+    const settledWins = closed.filter((p) => (p.realizedPnl || 0) > 0).length;
+    const winRate = settledTotal > 0 ? settledWins / settledTotal : 0;
+
+    // Average percent PnL across all closed positions (realized edge per market).
     const avgPercentPnL =
-      positions.length > 0
-        ? positions.reduce((sum, p) => sum + (p.percentPnl || 0), 0) / positions.length
+      closed.length > 0
+        ? closed.reduce((sum, p) => sum + (p.realizedPnl || 0) / Math.max(1, (p.avgPrice * p.totalBought)), 0) / closed.length
         : 0;
 
     const lastActivity = activities[0];
@@ -277,9 +290,7 @@ export class WalletService {
       positionCount: positions.length,
       tradeCount: activities.filter((a) => a.type === 'TRADE').length,
       smartScore: this.calculateSmartScore(positions, activities),
-      winRate: positions.length > 0
-        ? positions.filter((p) => (p.cashPnl || 0) > 0).length / positions.length
-        : 0,
+      winRate,
       lastActiveAt: lastActivity ? new Date(lastActivity.timestamp) : new Date(0),
       openConditionIds,
     };
