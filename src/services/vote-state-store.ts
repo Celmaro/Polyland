@@ -43,6 +43,12 @@ interface PersistedState {
   votes: Record<string, Record<string, Record<string, PersistedVote>>>;
   // conditionId:outcome -> last fired ms
   lastFired: Record<string, number>;
+  /**
+   * conditionId:outcome -> last processed fire ms.
+   * Survives process restart — checked BEFORE firing to prevent double-execution.
+   * Only written when an order is actually placed (not suppressed by cooldown).
+   */
+  lastProcessedFire: Record<string, number>;
 }
 
 const STATE_VERSION = 1;
@@ -55,6 +61,13 @@ export class VoteStateStore {
   private filePath: string;
   private _votes: Map<string, Map<string, Map<string, PersistedVote>>> = new Map();
   private _lastFired: Map<string, number> = new Map();
+  /**
+   * conditionId:outcome -> last processed fire ms.
+   * Used for dedup on restart (survives process crash).
+   * Stored separately from lastFired so we can distinguish
+   * "fire was suppressed by cooldown" from "fire was already executed".
+   */
+  private _lastProcessedFire: Map<string, number> = new Map();
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -90,6 +103,11 @@ export class VoteStateStore {
       for (const [key, ts] of Object.entries(parsed.lastFired ?? {})) {
         this._lastFired.set(key, ts);
       }
+      // Hydrate lastProcessedFire (dedup on restart)
+      this._lastProcessedFire.clear();
+      for (const [key, ts] of Object.entries(parsed.lastProcessedFire ?? {})) {
+        this._lastProcessedFire.set(key, ts);
+      }
     } catch (err) {
       console.warn(
         `[VoteStateStore] load failed:`,
@@ -119,6 +137,7 @@ export class VoteStateStore {
         ]),
       ),
       lastFired: Object.fromEntries(this._lastFired.entries()),
+      lastProcessedFire: Object.fromEntries(this._lastProcessedFire.entries()),
     };
     const tmp = this.filePath + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(state), 'utf8');
@@ -152,5 +171,26 @@ export class VoteStateStore {
 
   get lastFired() {
     return this._lastFired;
+  }
+
+  /** Last-processed-fire map for dedup across restarts. */
+  get lastProcessedFire(): Map<string, number> {
+    return this._lastProcessedFire;
+  }
+
+  /**
+   * Prune entries from lastProcessedFire older than maxAgeMs.
+   * Call on load and periodically to keep the file bounded.
+   */
+  pruneLastProcessedFire(maxAgeMs: number): number {
+    const cutoff = Date.now() - maxAgeMs;
+    let pruned = 0;
+    for (const [key, ts] of this._lastProcessedFire) {
+      if (ts < cutoff) {
+        this._lastProcessedFire.delete(key);
+        pruned++;
+      }
+    }
+    return pruned;
   }
 }

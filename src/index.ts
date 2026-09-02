@@ -11,7 +11,7 @@
 // Core infrastructure
 export { RateLimiter, ApiType } from './core/rate-limiter.js';
 export { Cache, CACHE_TTL } from './core/cache.js';
-export { PolymarketError, ErrorCode, withRetry } from './core/errors.js';
+export { PolymarketError, ErrorCode, withRetry, sanitizeErrorMessage, type RestrictionType } from './core/errors.js';
 export * from './core/types.js';
 
 // Cache integration (new)

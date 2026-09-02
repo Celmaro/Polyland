@@ -160,6 +160,8 @@ export interface QuorumStats {
   quorumFired: number;
   quorumSkippedDrift: number;
   quorumSkippedCooldown: number;
+  /** Skipped because market+outcome was already executed (survives restart via VoteStateStore) */
+  quorumSkippedRestartDedup: number;
   /** Dropped by thin_edge filter (vote USD value below $1 floor) */
   quorumSkippedThinEdge: number;
   /** Dropped by stale-market filter (market already expired) */
@@ -202,12 +204,16 @@ export class BasketQuorumService {
   /** conditionId:outcome -> last fired timestamp (cooldown/one-shot) */
   private lastFired = new Map<string, number>();
 
+  /** Local ref to stateStore.lastProcessedFire — set in setStateStore() */
+  private _lastProcessedFire = new Map<string, number>();
+
   private stats: QuorumStats = {
     votesObserved: 0,
     voters: 0,
     quorumFired: 0,
     quorumSkippedDrift: 0,
     quorumSkippedCooldown: 0,
+    quorumSkippedRestartDedup: 0,
     quorumSkippedThinEdge: 0,
     quorumSkippedStaleMarket: 0,
     quorumSkippedRiskHalt: 0,
@@ -273,6 +279,7 @@ export class BasketQuorumService {
     this.stateStore = store;
     this.votes = store.votes as typeof this.votes;
     this.lastFired = store.lastFired;
+    this._lastProcessedFire = store.lastProcessedFire;
     // Prune anything already past the window
     let maxWindow = 0;
     for (const [, basket] of this.baskets) {
@@ -281,6 +288,11 @@ export class BasketQuorumService {
     const pruned = store.pruneStale(maxWindow);
     if (pruned > 0) {
       console.log(`[BasketQuorum] pruned ${pruned} stale votes on load`);
+    }
+    // Also prune old lastProcessedFire entries (7-day dedup window)
+    const dedupPruned = store.pruneLastProcessedFire(7 * 24 * 60 * 60 * 1000);
+    if (dedupPruned > 0) {
+      console.log(`[BasketQuorum] pruned ${dedupPruned} stale dedup entries on load`);
     }
   }
 
@@ -508,6 +520,7 @@ export class BasketQuorumService {
     // Drop any prior vote state — baskets changed.
     this.votes.clear();
     this.lastFired.clear();
+    this._lastProcessedFire.clear();
     this.basketSpend.clear();
     this.walletTierMap.clear();
     this._schedulePersist();
@@ -680,6 +693,13 @@ export class BasketQuorumService {
       return;
     }
 
+    // Restart-dedup: if a fire was already executed for this market+outcome
+    // AND persisted to VoteStateStore, skip on restart to prevent double-execution.
+    if (this._lastProcessedFire.has(key)) {
+      this.stats.quorumSkippedRestartDedup++;
+      return;
+    }
+
     // Tiered quorum: 2× PRIMARY or 1× PRIMARY + 2× SATELLITE fires a signal.
         // This ensures signals come from genuine elite consensus, not just wallet count.
         // ALSO: a strong crowd consensus (5+ SATELLITE votes on same market) fires
@@ -806,13 +826,15 @@ export class BasketQuorumService {
 
     // 7c. Price-band / drift filter — the CRITICAL edge decoy. If the market
     //     has already moved past maxDrift from consensus entry, skip.
-    this.executeIfInBand(trade, signal, basket);
+    this.executeIfInBand(trade, signal, basket, key, now);
   }
 
   private async executeIfInBand(
     trade: SmartMoneyTrade,
     signal: QuorumSignal,
     basket: BasketConfig,
+    key: string,
+    now: number,
   ): Promise<void> {
     // In production, fetch the current market price here via
     //   this.tradingService.getMarketPrice?.(signal.conditionId)
@@ -948,6 +970,9 @@ export class BasketQuorumService {
           basket.category,
           (this.basketSpend.get(basket.category) ?? 0) + usdcAmount,
         );
+        // Persist dedup so we skip this market+outcome on restart.
+        // The cooldown above uses this._lastProcessedFire (linked to store).
+        this._lastProcessedFire.set(key, now);
         // Record fire in the anti-sniper guard so cooldown takes effect.
         if (this.antiSniper && trade.tokenId) {
           this.antiSniper.recordFire(trade.tokenId);
@@ -1042,6 +1067,7 @@ export class BasketQuorumService {
   reset(): void {
     this.votes.clear();
     this.lastFired.clear();
+    this._lastProcessedFire.clear();
     this.basketSpend.clear();
     this.walletTierMap.clear();
     if (this._persistTimer !== null) {
@@ -1054,6 +1080,7 @@ export class BasketQuorumService {
       quorumFired: 0,
       quorumSkippedDrift: 0,
       quorumSkippedCooldown: 0,
+      quorumSkippedRestartDedup: 0,
       quorumSkippedThinEdge: 0,
       quorumSkippedStaleMarket: 0,
       quorumSkippedRiskHalt: 0,

@@ -23,6 +23,8 @@ export enum ErrorCode {
   ORDER_REJECTED = 'ORDER_REJECTED',
   ORDER_FAILED = 'ORDER_FAILED',
   MARKET_CLOSED = 'MARKET_CLOSED',
+  TRADING_RESTRICTION = 'TRADING_RESTRICTION',
+  INSUFFICIENT_LIQUIDITY = 'INSUFFICIENT_LIQUIDITY',
 
   // API errors
   API_ERROR = 'API_ERROR',
@@ -34,12 +36,19 @@ export enum ErrorCode {
   INVALID_CONFIG = 'INVALID_CONFIG',
 }
 
+/** Restriction type from Polymarket CLOB trading restriction responses */
+export type RestrictionType = 'cancel_only' | 'post_only' | 'restarting';
+
 export class PolymarketError extends Error {
   constructor(
     public code: ErrorCode,
     message: string,
     public retryable: boolean = false,
-    public originalError?: Error
+    public originalError?: Error,
+    /** For TRADING_RESTRICTION errors: what restriction is active */
+    public restrictionType?: RestrictionType,
+    /** Server-reported Retry-After ms (from headers or body) */
+    public retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'PolymarketError';
@@ -77,6 +86,32 @@ export class PolymarketError extends Error {
           bodyMessage || 'Resource not found'
         );
       case 400:
+        // Check for trading restriction in body
+        if (body && typeof body === 'object') {
+          const r = (body as Record<string, unknown>).restriction;
+          if (typeof r === 'string') {
+            const restrictionMap: Record<string, RestrictionType> = {
+              cancel_only: 'cancel_only',
+              post_only: 'post_only',
+              restarting: 'restarting',
+            };
+            const rt = restrictionMap[r];
+            if (rt) {
+              const retryAfter =
+                typeof (body as Record<string, unknown>).retryAfterMs === 'number'
+                  ? Number((body as Record<string, unknown>).retryAfterMs)
+                  : undefined;
+              return new PolymarketError(
+                ErrorCode.TRADING_RESTRICTION,
+                `Trading restriction: ${r}${retryAfter ? ` (retry in ${retryAfter}ms)` : ''}`,
+                rt === 'restarting',
+                undefined,
+                rt,
+                retryAfter,
+              );
+            }
+          }
+        }
         return new PolymarketError(
           ErrorCode.INVALID_RESPONSE,
           bodyMessage || 'Bad request'
@@ -92,17 +127,49 @@ export class PolymarketError extends Error {
 }
 
 /**
+ * Exponential backoff with full jitter (AWS architecture blog pattern).
+ * Caps at maxDelayMs to avoid unbounded waits.
+ * Jitter prevents thundering-herd when many clients reconnect simultaneously.
+ */
+function sleepWithJitter(baseDelayMs: number, attempt: number, maxDelayMs = 30_000): number {
+  const exponential = baseDelayMs * Math.pow(2, attempt);
+  const capped = Math.min(exponential, maxDelayMs);
+  // Full jitter: uniform random in [0, capped]
+  return Math.random() * capped;
+}
+
+/**
+ * Sanitize an error message for safe logging.
+ * Redacts private keys, signatures, and other sensitive hex strings.
+ *
+ * Targets:
+ * - Private keys: 64 hex chars (前后没有 0x 前缀)
+ * - 0x-prefixed keys: 0x + 32+ hex chars (旧版格式)
+ * - Signatures: 64 hex chars after '0x'
+ * - JWT/bearer tokens
+ */
+export function sanitizeErrorMessage(message: string): string {
+  return message
+    // Redact bare 64-char hex strings (raw private keys)
+    .replace(/([\s"(,=[])([a-fA-F0-9]{64})([\s")],=]|$)/g, '$1[REDACTED]$3')
+    // Redact 0x-prefixed keys/sigs (32+ hex chars after 0x)
+    .replace(/0x([a-fA-F0-9]{32,})/g, '0x[REDACTED]')
+    // Redact JWT/bearer tokens in Authorization headers
+    .replace(/(Authorization[\s:=]+)[^"\s,}]+/gi, '$1[REDACTED]');
+}
+
+/**
  * Retry decorator for async functions
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  options: { maxRetries?: number; delay?: number } = {}
+  options: { maxRetries?: number; baseDelayMs?: number; maxDelayMs?: number } = {}
 ): Promise<T> {
-  const { maxRetries = 3, delay = 1000 } = options;
+  const { maxRetries = 3, baseDelayMs = 1_000, maxDelayMs = 30_000 } = options;
 
   let lastError: Error | undefined;
 
-  for (let i = 0; i < maxRetries; i++) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
@@ -110,8 +177,8 @@ export async function withRetry<T>(
       if (error instanceof PolymarketError && !error.retryable) {
         throw error;
       }
-      if (i < maxRetries - 1) {
-        await new Promise((r) => setTimeout(r, delay * Math.pow(2, i)));
+      if (attempt < maxRetries - 1) {
+        await new Promise((r) => setTimeout(r, sleepWithJitter(baseDelayMs, attempt, maxDelayMs)));
       }
     }
   }
