@@ -621,10 +621,8 @@ export class WalletScreeningService {
     const resolvedCat = resolved?.category ?? 'other';
     const catStat = catWinRates[resolvedCat];
 
-    // DEBUG: log top 2 candidates' copyScore vs specializes evaluation
-    // (only fires once per cycle via static callCount guard)
-    if ((this as any).__dbg === undefined) { (this as any).__dbg = 0; }
-    if ((this as any).__dbg++ < 2) {
+    // DEBUG: log high-copyScore candidates' copyScore vs specializes evaluation
+    if (copyScore >= 75) {
       console.log(`[Score] ${c.address.slice(0,8)} copyScore=${copyScore} winRate=${profile.winRate} smartScore=${profile.smartScore} cat=${resolvedCat} catStat=${JSON.stringify(catStat)} specializes=${copyScore>=75||(!!catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0)}`);
     }
 
