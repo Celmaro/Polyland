@@ -277,16 +277,22 @@ export class WalletScreeningService {
     );
 
     const screened: ScreenedWallet[] = [];
+    const gateCounts: Record<string, number> = {};
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
       const walletsCatWinRates = catWinRates.get(c.address) ?? {};
-      if (c.bypassScreening) {
-        screened.push(this.makeBypassed(c, resolved));
-      } else {
-        screened.push(this.evaluate(c, profile, resolved, walletsCatWinRates));
+      const result = c.bypassScreening
+        ? this.makeBypassed(c, resolved)
+        : this.evaluate(c, profile, resolved, walletsCatWinRates);
+      if (result.tier !== 'PRIMARY' && result.tier !== 'SATELLITE') {
+        const key = result.reason.split(' (')[0];
+        gateCounts[key] = (gateCounts[key] ?? 0) + 1;
       }
+      screened.push(result);
     }
+    console.log('[WalletScreening] gate tally: ' +
+      Object.entries(gateCounts).map(([k, v]) => `${k}=${v}`).join(' ') || '(none rejected)');
     return screened;
   }
 
