@@ -279,16 +279,27 @@ export class WalletScreeningService {
     // Bypass wallets short-circuit the quality screen but still get category
     // resolution so they land in the right basket.
     const screened: ScreenedWallet[] = [];
+    const gateCounts: Record<string, number> = {};
     for (const c of toScore) {
       const profile = profiles.get(c.address) ?? null;
       const resolved = resolvedCategories.get(c.address);
       const catWinRates = categoryWinRates.get(c.address) ?? {};
-      if (c.bypassScreening) {
-        screened.push(this.makeBypassed(c, resolved));
-      } else {
-        screened.push(this.evaluate(c, profile, resolved, catWinRates));
+      const result = c.bypassScreening
+        ? this.makeBypassed(c, resolved)
+        : this.evaluate(c, profile, resolved, catWinRates);
+      // Tally rejection reasons for tuning visibility.
+      if (result.tier !== 'PRIMARY' && result.tier !== 'SATELLITE') {
+        const key = result.reason.split(' (')[0]; // normalize "x (<detail)" -> "x"
+        gateCounts[key] = (gateCounts[key] ?? 0) + 1;
       }
+      screened.push(result);
     }
+    console.log(
+      `[WalletScreening] gate tally (${screened.length} scored): ` +
+        Object.entries(gateCounts)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(' ') || '(none rejected)',
+    );
     return screened;
   }
 
