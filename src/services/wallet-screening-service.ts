@@ -618,16 +618,24 @@ export class WalletScreeningService {
     const components = this.computeScoringComponents(profile);
     const copyScore = this.computeCopyScore(components);
 
-    // Category specialization gate
+    // Category specialization gate.
+    // A wallet routing to a specific basket must prove it actually wins there.
+    // APPROXIMATION: category trades / total trades must exceed concentration
+    // threshold. The "concentration" part is loosened from 60% to 30% because
+    // generalist-expert wallets (CopyScore 75+) are legitimately skilled across
+    // categories — their CopyScore proves edge without needing category concentration.
+    // CopyScore >= 75 bypasses specializes entirely (top-tier generalists).
     const resolvedCat = resolved?.category ?? 'other';
     const catStat = catWinRates[resolvedCat];
     const concentration = catStat?.tradeCount
       ? catStat.tradeCount / profile.tradeCount
       : 0;
+    const minConcentration = copyScore >= 75 ? 0 : 0.30;
     const specializes =
-      catStat && catStat.tradeCount >= this.config.minCategoryTrades
+      copyScore >= 75 ||  // elite generalist — CopyScore is the proof
+      (catStat && catStat.tradeCount >= this.config.minCategoryTrades
         ? catStat.winRate >= this.config.minCategoryWinRate
-        : concentration >= 0.6 && profile.winRate >= this.config.minWinRate;
+        : concentration >= minConcentration && profile.winRate >= this.config.minWinRate);
 
     if (!specializes) {
       if (gateCounts) gateCounts['not specialized'] = (gateCounts['not specialized'] ?? 0) + 1;
