@@ -464,8 +464,10 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   });
   const screeningConfig = {
     profileFetchConcurrency: 10,
-    // Real track record: 200+ closed trades separates skill from luck.
-    minTradeCount: 200,
+    // Real track record: 150+ trades in the measured window separates
+    // skill from luck. (Polymarket's profile.tradeCount is period-scoped,
+    // not lifetime — 200 was empirically too high and zeroed the basket.)
+    minTradeCount: 150,
     minConsistency: 88,      // tighter floor for SATELLITE
     primaryConsistency: 94,  // PRIMARY stays elite
     minWinRate: 0.60,
