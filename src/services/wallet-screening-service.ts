@@ -818,7 +818,7 @@ export class WalletScreeningService {
       : 0;
 
     return {
-      address: c.address,
+      address: c.address.toLowerCase(),
       tier,
       source: c.source,
       label: c.label,
@@ -850,7 +850,7 @@ export class WalletScreeningService {
     resolved: { category: MarketCategory; source: 'manual' | 'auto' | 'inferred'; confidence: number } | undefined,
   ): ScreenedWallet {
     return {
-      address: c.address,
+      address: c.address.toLowerCase(),
       tier: 'PRIMARY',
       source: c.source,
       label: c.label,

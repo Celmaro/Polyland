@@ -533,6 +533,9 @@ export class BasketQuorumService {
       }
 
       // Populate tier map for tiered quorum checks (2×PRIMARY or 1P+2S).
+      // Key MUST be lowercased here because onTrade() lowercases traderKey
+      // before basket.wallets.includes() — if cases differ the vote is silently
+      // dropped and every wallet shows primary=0 in logs.
       this.walletTierMap.set(w.address.toLowerCase(), w.tier as 'PRIMARY' | 'SATELLITE');
     }
 
