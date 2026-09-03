@@ -17,7 +17,6 @@
 
 import WebSocket from 'isomorphic-ws';
 import { sanitizeErrorMessage } from '../core/errors.js';
-import { withRetry } from '../core/errors.js';
 
 // ============================================================================
 // Types
@@ -31,10 +30,16 @@ export interface ClobMidObservation {
 
 export type MidObserver = (obs: ClobMidObservation) => void;
 
-interface ClobSubscriptionMessage {
-  action: 'subscribe' | 'unsubscribe';
+interface ClobSubscribeMessage {
+  assets_ids: string[];
+  operation: 'subscribe' | 'unsubscribe';
+  custom_feature_enabled: true;
+}
+
+interface ClobInitialMessage {
   assets_ids: string[];
   type: 'market';
+  custom_feature_enabled: true;
 }
 
 interface ClobBookUpdate {
@@ -55,16 +60,21 @@ interface ClobLastTrade {
 }
 
 type ClobMessageType =
+  | 'book'
   | 'book_update'
   | 'price_change'
   | 'last_trade_price'
   | 'tick_size_change'
+  | 'best_bid_ask'
+  | 'new_market'
+  | 'market_resolved'
   | 'subscribed'
   | 'unsubscribed'
   | 'error';
 
 interface ClobMessage {
-  type: ClobMessageType;
+  event_type?: ClobMessageType;
+  type?: ClobMessageType;
   [key: string]: unknown;
 }
 
@@ -80,8 +90,10 @@ export class ClobMarketWsService {
   private reconnectDelayMs = 1_000;
   private maxReconnectDelayMs = 30_000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
   private intentionallyClosed = false;
   private destroyed = false;
+  private pingPongSeenAt = 0;
 
   /** Book mid price per asset (best bid + best ask) / 2 */
   private bookMids = new Map<string, number>();
@@ -139,6 +151,10 @@ export class ClobMarketWsService {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
     if (this.ws) {
       this.ws.close(1000, 'service stop');
       this.ws = null;
@@ -158,15 +174,43 @@ export class ClobMarketWsService {
 
     this.ws.onopen = () => {
       this.reconnectDelayMs = 1_000;
-      // Re-subscribe all assets on reconnect
+      // Initial subscription message (type: market)
       if (this.subscribedAssets.size > 0) {
-        this.sendSubscribe([...this.subscribedAssets]);
+        const initial: ClobInitialMessage = {
+          assets_ids: [...this.subscribedAssets],
+          type: 'market',
+          custom_feature_enabled: true,
+        };
+        this.send(initial);
+      } else {
+        // Some servers require the initial subscribe even with empty list.
+        // Send with a dummy asset id to establish the channel.
+        const initial: ClobInitialMessage = {
+          assets_ids: [],
+          type: 'market',
+          custom_feature_enabled: true,
+        };
+        this.send(initial);
       }
+
+      // Heartbeat: server replies "PONG" to a plain-text "PING".
+      if (this.pingTimer) clearInterval(this.pingTimer);
+      this.pingTimer = setInterval(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send('PING');
+        }
+      }, 10_000);
     };
 
     this.ws.onmessage = (event: WebSocket.MessageEvent) => {
       try {
-        const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+        const raw = typeof event.data === 'string' ? event.data : (event.data as Buffer).toString();
+        // Heartbeat: plain-text "PONG" response.
+        if (raw === 'PONG') {
+          this.pingPongSeenAt = Date.now();
+          return;
+        }
+        const data = JSON.parse(raw);
         this.handleMessage(data as ClobMessage);
       } catch (err) {
         // Don't log raw event objects — sanitize message only
@@ -186,6 +230,10 @@ export class ClobMarketWsService {
     this.ws.onclose = (event: WebSocket.CloseEvent) => {
       const code = event.code ?? 0;
       const reason = sanitizeErrorMessage(event.reason ?? '');
+      if (this.pingTimer) {
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
+      }
       if (!this.intentionallyClosed && !this.destroyed) {
         console.warn(`[ClobMarketWs] disconnected code=${code} reason=${reason || 'unknown'} — reconnecting in ${this.reconnectDelayMs}ms`);
         this.scheduleReconnect();
@@ -210,11 +258,21 @@ export class ClobMarketWsService {
   }
 
   private sendSubscribe(assetIds: string[]): void {
-    this.send({ action: 'subscribe', assets_ids: assetIds, type: 'market' });
+    const msg: ClobSubscribeMessage = {
+      assets_ids: assetIds,
+      operation: 'subscribe',
+      custom_feature_enabled: true,
+    };
+    this.send(msg);
   }
 
   private sendUnsubscribe(assetIds: string[]): void {
-    this.send({ action: 'unsubscribe', assets_ids: assetIds, type: 'market' });
+    const msg: ClobSubscribeMessage = {
+      assets_ids: assetIds,
+      operation: 'unsubscribe',
+      custom_feature_enabled: true,
+    };
+    this.send(msg);
   }
 
   private send(msg: object): void {
@@ -224,29 +282,73 @@ export class ClobMarketWsService {
   }
 
   private handleMessage(msg: ClobMessage): void {
-    switch (msg.type) {
+    // Polymarket CLOB WS uses `event_type` for the message kind.
+    const eventType = (msg.event_type ?? msg.type) as ClobMessageType | undefined;
+    switch (eventType) {
+      case 'book':
       case 'book_update': {
-        const b = msg as unknown as { type: 'book_update' } & ClobBookUpdate;
+        const b = msg as unknown as { asset_id: string } & ClobBookUpdate;
         this.handleBookUpdate(b);
         break;
       }
       case 'price_change': {
-        const p = msg as unknown as { type: 'price_change' } & ClobPriceChange;
-        this.handlePriceChange(p);
+        // price_change delivers an array of asset_id+price pairs
+        const p = msg as unknown as {
+          price_changes?: Array<{ asset_id: string; price: string }>;
+          asset_id?: string;
+          price?: string;
+        };
+        if (Array.isArray(p.price_changes)) {
+          for (const change of p.price_changes) {
+            this.handlePriceChange({
+              asset_id: change.asset_id,
+              price: change.price,
+            });
+          }
+        } else if (p.asset_id && p.price !== undefined) {
+          this.handlePriceChange({ asset_id: p.asset_id, price: p.price });
+        }
         break;
       }
       case 'last_trade_price': {
-        const t = msg as unknown as { type: 'last_trade_price' } & ClobLastTrade;
-        this.handleLastTrade(t);
+        const t = msg as unknown as { asset_id?: string } & ClobLastTrade;
+        if (t.asset_id) {
+          this.handleLastTrade(t);
+        }
+        break;
+      }
+      case 'best_bid_ask': {
+        const bba = msg as unknown as {
+          asset_id?: string;
+          best_bid?: string;
+          best_ask?: string;
+        };
+        if (bba.asset_id && bba.best_bid && bba.best_ask) {
+          const bid = parseFloat(bba.best_bid);
+          const ask = parseFloat(bba.best_ask);
+          if (!isNaN(bid) && !isNaN(ask)) {
+            this.bookMids.set(bba.asset_id, (bid + ask) / 2);
+            this.emitMid({
+              assetId: bba.asset_id,
+              price: (bid + ask) / 2,
+              timestamp: Date.now(),
+            });
+          }
+        }
         break;
       }
       case 'tick_size_change':
         // Currently unused by anti-sniper; no action needed
         break;
-      case 'subscribed':
-        // Acknowledged — no action needed
+      case 'new_market':
+        // Lifecycle event — not needed for mid feed
         break;
+      case 'market_resolved':
+        // Resolution handled by Gamma poller; this is a notification only
+        break;
+      case 'subscribed':
       case 'unsubscribed':
+        // Acknowledged — no action needed
         break;
       case 'error': {
         const errMsg = sanitizeErrorMessage(String(msg.message ?? msg.error ?? 'clob ws error'));
