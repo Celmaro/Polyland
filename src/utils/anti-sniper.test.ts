@@ -43,6 +43,18 @@ describe('AntiSniperGuard', () => {
     expect(decision.reason).toMatch(/mid_unstable/);
   });
 
+  it('sub-tolerance price noise does NOT reset the stable-mid timer', () => {
+    // Regression: trade-price vs book-mid observations alternate by <1 tick
+    // on high-frequency markets. Previously every such observation reset
+    // midLastChangeMs → mid_unstable rejected every fire (95% block rate).
+    const now = 1_000_000;
+    guard.observe('tok-1', 0.5, now - 5_000);          // real change: starts timer
+    guard.observe('tok-1', 0.502, now - 100);          // +0.002 < 0.005 tolerance
+    guard.observe('tok-1', 0.501, now - 50);           // noise again
+    const decision = guard.allowFire('tok-1', now);    // stable since now-5000
+    expect(decision.allow).toBe(true);
+  });
+
   it('rejects second fire within fill cooldown', () => {
     const now = 1_000_000;
     guard.observe('tok-1', 0.5, now - 2_000);

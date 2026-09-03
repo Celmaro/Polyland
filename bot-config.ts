@@ -19,7 +19,7 @@ import {
   type SmartMoneyTrade,
   type BasketQuorumConfig,
 } from './src/index.js';
-import { signalAuditStore } from './src/services/signal-audit-store.js';
+import { signalAuditStore, setBonferroniGroups } from './src/services/signal-audit-store.js';
 import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from './src/utils/anti-sniper.js';
 import { ChainlinkTwapOracle } from './src/services/chainlink-twap-oracle.js';
 
@@ -383,6 +383,10 @@ function calculatePositionSize(baseSize: number): number {
 
 let basketQuorum: BasketQuorumService | null = null;
 let quorumSubscription: { id: string; unsubscribe: () => void } | null = null;
+/** Market-resolution WS subscription (edge/risk settlement loop) */
+let resolutionSubscription: { id: string; unsubscribe: () => void } | null = null;
+/** Anti-sniper mid-feed book subscription */
+let midFeedSubscription: { unsubscribe: () => void } | null = null;
 
 const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
   // Quorum of 2 distinct, vetted wallets per basket. With ~67 leaderboard
@@ -400,11 +404,18 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
   minTradeSize: CONFIG.smartMoney.minTradeSize,
   dryRun: CONFIG.dryRun,
   bankrollAllocation: {
-    crypto: 0.60,
+    crypto: 0.35,
     sports: 0.10,
     politics: 0.10,
     esports: 0.05,
-    // remainder (0.15) = reserve, unallocated
+    economics: 0.05,
+    entertainment: 0.05,
+    science: 0.05,
+    other: 0.05,
+    // remainder (0.20) = reserve, unallocated.
+    // NOTE: every category MUST be listed — seed() rebuilds baskets for all
+    // 8 categories from wallet data, and an unlisted category defaults to a
+    // 100%-of-capital slice (observed: other=107 wallets got the full bankroll).
   },
   baskets: [
     {
@@ -437,6 +448,42 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
     {
       name: 'Esports Quorum',
       category: 'esports',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
+    },
+    {
+      name: 'Economics Quorum',
+      category: 'economics',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
+    },
+    {
+      name: 'Entertainment Quorum',
+      category: 'entertainment',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
+    },
+    {
+      name: 'Science Quorum',
+      category: 'science',
+      enabled: true,
+      wallets: [],
+      quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.6,
+    },
+    {
+      name: 'Other Quorum',
+      category: 'other',
       enabled: true,
       wallets: [],
       quorum: 3,
@@ -578,11 +625,92 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
       { filterAddresses: [], smartMoneyOnly: false },
     );
 
+    // --- Market resolution feed (fixes the dead [edge]/[risk] loop) ---
+    // Subscribes to clob_market market_created/market_resolved events. On
+    // resolution we fetch the market from Gamma, determine the winning
+    // outcome (final price→1), and settle every fired signal on that market:
+    //   SignalAuditStore.recordBacktestSettlement → realized edge
+    //   basket winRate EMA                        → edge math stays calibrated
+    //   risk.recordTrade(perShare * size)         → [risk] daily/monthly/drawdown
+    // Without this, recordResolution() is never called and [edge]/[risk]
+    // stay at their boot values forever.
+    resolutionSubscription = sdk.realtime.subscribeMarketEvents({
+      onMarketEvent: (event) => {
+        if (event.type !== 'resolved' || !event.conditionId) return;
+        const cid = event.conditionId;
+        sdk.gammaApi
+          .getMarketByConditionId(cid)
+          .then((m) => {
+            if (!m) return;
+            // Winning outcome = the one whose final price resolved to ~1.
+            let winnerIdx = -1;
+            const prices = m.outcomePrices ?? [];
+            for (let i = 0; i < prices.length; i++) {
+              if (prices[i] >= 0.99) { winnerIdx = i; break; }
+            }
+            const winningOutcome =
+              winnerIdx >= 0 ? m.outcomes?.[winnerIdx] : undefined;
+            basketQuorum?.handleMarketResolved(cid, winningOutcome, prices);
+          })
+          .catch((err) => {
+            log('WARN', `Resolution handling failed for ${cid.slice(0, 10)}: ${err instanceof Error ? err.message : err}`);
+          });
+      },
+    });
+    // lives for the process lifetime; unsubscribed in SIGINT below
+    log('QUORUM', 'Market resolution feed wired (edge/risk settlement loop active)');
+
+    // --- Mid-price feed for the anti-sniper guard ---
+    // FIX for antiSniper=95% block rate: observeMid() was never called because
+    // nothing subscribed to orderbook updates. Now we subscribe to the book
+    // for markets with live quorum interest (fired-or-near-miss tokenIds) and
+    // feed every mid to the guard, so allowFire() has the observations it
+    // needs instead of dying on no_mid_observations.
+    const midFeedTokens = new Set<string>();
+    const midFeedSubRef: { current: { unsubscribe: () => void } | null } = { current: null };
+    let midFeedTimer: NodeJS.Timeout | null = null;
+    const resubscribeMidFeed = () => {
+      if (!sdk.realtime || midFeedTokens.size === 0) return;
+      try {
+        midFeedSubRef.current?.unsubscribe();
+      } catch { /* already gone */ }
+      const tokens = [...midFeedTokens].slice(0, 50); // cap: 50 book subscriptions
+      midFeedSubRef.current = sdk.realtime.subscribeMarkets(tokens, {
+        onOrderbook: (book) => {
+          const bestBid = book.bids?.[0]?.price;
+          const bestAsk = book.asks?.[0]?.price;
+          if (bestBid && bestAsk && bestAsk > bestBid) {
+            basketQuorum?.observeMid(book.tokenId, (bestBid + bestAsk) / 2);
+          }
+        },
+        onLastTrade: (t) => {
+          basketQuorum?.observeMid(t.assetId, t.price);
+        },
+      });
+      midFeedSubscription = midFeedSubRef.current;
+    };
+    // Debounced: near-miss + fire events can burst; one resub per 10s max.
+    const requestMidFeed = (tokenId: string) => {
+      if (midFeedTokens.has(tokenId)) return;
+      midFeedTokens.add(tokenId);
+      if (midFeedTimer) return;
+      midFeedTimer = setTimeout(() => {
+        midFeedTimer = null;
+        resubscribeMidFeed();
+      }, 10_000);
+    };
+    log('QUORUM', 'Mid-price feed ready (activates on first quorum interest)');
+
     // Screen and score wallets
     log('QUORUM', 'Screening wallets...');
     const screened = await screening.score(candidates);
     const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
-    log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE`);
+    const nPrimary = screened.filter((w) => w.tier === 'PRIMARY').length;
+    const nSatellite = screened.filter((w) => w.tier === 'SATELLITE').length;
+    log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE (${nPrimary}P/${nSatellite}S)`);
+    if (nPrimary === 0) {
+      log('WARN', 'ZERO PRIMARY wallets — tiered quorum needs 2xPRIMARY or 1P+2S; only the 5xSATELLITE escape hatch can fire');
+    }
 
     // Debug: log top 10 candidates by CopyScore (even if not seeded) to diagnose thresholds
     const sorted = [...screened].sort((a, b) => b.copyScore - a.copyScore);
@@ -598,6 +726,15 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
 
     // Seed baskets with screened wallets
     basketQuorum.seed(primaries);
+
+    // Bonferroni correction denominator = number of active baskets.
+    // More filter dimensions tested → stricter significance threshold.
+    setBonferroniGroups(basketQuorum.getBasketCount());
+
+    // Anti-sniper mid feed: whenever a market+outcome builds near-miss
+    // consensus or gets blocked by the guard, subscribe its book so the
+    // guard accumulates real mid observations (fixes no_mid_observations).
+    basketQuorum.onMidInterest = (tokenId) => requestMidFeed(tokenId);
 
     // Drain the buffered trades captured during screening. These are trades from
     // wallets that may already be PRIMARY/SATELLITE; replaying them lets the
@@ -739,12 +876,18 @@ async function main() {
   displayStatus();
   setInterval(displayStatus, 60000);
 
-  process.on('SIGINT', async () => {
-    console.log('\n\nShutting down...');
+  const shutdown = async (sig: string) => {
+    console.log(`\n\nShutting down (${sig})...`);
     if (quorumSubscription) quorumSubscription.unsubscribe();
+    if (resolutionSubscription) resolutionSubscription.unsubscribe();
+    if (midFeedSubscription) midFeedSubscription.unsubscribe();
     sdk.stop();
     process.exit(0);
-  });
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  // Zeabur sends SIGTERM before killing the container on redeploy — without
+  // this handler, deploys orphan in-flight state (no vote persist, no WS close).
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   log('INFO', '🚀 Bot v3.0 running! Press Ctrl+C to stop.\n');
 }

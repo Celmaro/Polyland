@@ -101,6 +101,13 @@ export interface BasketQuorumConfig {
   maxPriceDrift: number;
   /** Cooldown (ms) before a market+outcome can fire again after an action */
   fireCooldownMs: number;
+  /**
+   * Min interval (ms) between near-miss diagnostic logs for the same
+   * market+outcome. Defaults to 5 minutes. Without this, high-frequency
+   * crypto up/down markets re-log the same near-miss state on every vote
+   * (observed: 92% of all log output).
+   */
+  nearMissLogIntervalMs?: number;
   /** Reuse the existing copy sizing */
   sizeScale: number;
   maxSizePerTrade: number;
@@ -180,6 +187,10 @@ export interface QuorumStats {
   quorumSkippedThinLiquidity?: number;
   /** Dropped by the fee-adjusted edge filter (no profitable edge after fees) */
   quorumSkippedNegativeEdge?: number;
+  /** Dropped because dynamic sizing shrank the order below minTradeSize */
+  quorumSkippedMinSize?: number;
+  /** Breakdown of anti-sniper block reasons (no_mid_observations, mid_jump, ...) */
+  antiSniperReasons?: Record<string, number>;
   executed: number;
   failed: number;
 }
@@ -203,6 +214,12 @@ export class BasketQuorumService {
 
   /** conditionId:outcome -> last fired timestamp (cooldown/one-shot) */
   private lastFired = new Map<string, number>();
+
+  /** conditionId:outcome -> last near-miss diagnostic log timestamp */
+  private nearMissLogAt = new Map<string, number>();
+
+  /** Resolved min interval between near-miss logs (config default 5 min). */
+  private nearMissLogIntervalMs: number;
 
   /** Local ref to stateStore.lastProcessedFire — set in setStateStore() */
   private _lastProcessedFire = new Map<string, number>();
@@ -333,6 +350,14 @@ export class BasketQuorumService {
   }
 
   /**
+   * Optional callback: the service signals that a tokenId has live quorum
+   * interest (near-miss consensus building). The operator wiring should
+   * subscribe to that token's orderbook so observeMid() gets continuous
+   * data — without it, allowFire() rejects with no_mid_observations/mid_unstable.
+   */
+  onMidInterest: ((tokenId: string) => void) | null = null;
+
+  /**
    * Schedule a debounced state save. Called whenever votes or lastFired
    * change so we don't write the file on every single trade.
    */
@@ -417,6 +442,7 @@ export class BasketQuorumService {
   constructor(tradingService: TradingService, config: BasketQuorumConfig) {
     this.tradingService = tradingService;
     this.config = config;
+    this.nearMissLogIntervalMs = config.nearMissLogIntervalMs ?? 5 * 60 * 1000;
     for (const basket of config.baskets) {
       if (!basket.enabled) continue;
       this.baskets.set(basket.category, {
@@ -453,6 +479,13 @@ export class BasketQuorumService {
       console.warn('[BasketQuorum] seed() called with no eligible wallets');
       return;
     }
+
+    // Clear the tier map BEFORE the population loop — NOT in the
+    // drop-state block below (an earlier version cleared it there, which
+    // wiped the tiers this loop just set and made every vote fall back to
+    // 'SATELLITE' → primary=0 forever → only the 5-satellite escape hatch
+    // could ever fire).
+    this.walletTierMap.clear();
 
     // Route each wallet into the basket(s) where IT has demonstrated edge.
     // A wallet is seeded into a category basket only if its own per-category
@@ -518,11 +551,13 @@ export class BasketQuorumService {
     }
 
     // Drop any prior vote state — baskets changed.
+    // (walletTierMap was already cleared at the top of seed(); do NOT clear
+    // it here or the tiers populated above are wiped — the PRIMARY=0 bug.)
     this.votes.clear();
     this.lastFired.clear();
+    this.nearMissLogAt.clear();
     this._lastProcessedFire.clear();
     this.basketSpend.clear();
-    this.walletTierMap.clear();
     this._schedulePersist();
     const summary = [...byCategory.entries()]
       .map(([c, ws]) => c + '=' + ws.length)
@@ -714,9 +749,19 @@ export class BasketQuorumService {
           satelliteCount >= 5;  // crowd consensus escape hatch
         if (!tieredFires) {
           // Diagnostic: log NEAR-MISSES so we can see if consensus is *almost* there.
-          if (primaryCount + satelliteCount >= 2) {
-            const voters = [...outcomeVotes.values()].map(v => `${v.tier}@${v.price}`).join(',');
-            console.log(`[Quorum near-miss] ${marketSlug} ${outcome} primary=${primaryCount} sat=${satelliteCount} votes=[${voters}]`);
+          // Rate-limited: one line per market+outcome per nearMissLogIntervalMs.
+          // Only logs the "waiting" state the operator cares about: 2+ wallets
+          // already aligned (primary>=1 or satellite>=2), still short of quorum.
+          if (primaryCount + satelliteCount >= 2 && trade.tokenId) {
+            const lastLog = this.nearMissLogAt.get(key) ?? 0;
+            if (now - lastLog >= this.nearMissLogIntervalMs) {
+              this.nearMissLogAt.set(key, now);
+              const voters = [...outcomeVotes.values()].map(v => `${v.tier}@${v.price}`).join(',');
+              console.log(`[Quorum near-miss] ${marketSlug} ${outcome} primary=${primaryCount} sat=${satelliteCount} votes=[${voters}]`);
+              // Signal live quorum interest so the operator wiring can feed
+              // the anti-sniper guard a real mid buffer for this token.
+              if (this.onMidInterest) this.onMidInterest(trade.tokenId);
+            }
           }
           // Not enough tier-weighted consensus — wait for more basket members.
           return;
@@ -787,6 +832,15 @@ export class BasketQuorumService {
       if (!decision.allow) {
         this.stats.quorumSkippedAntiSniper =
           (this.stats.quorumSkippedAntiSniper ?? 0) + 1;
+        // Tally the reason so the funnel shows WHY fires are blocked
+        // (no_mid_observations vs mid_jump vs mid_unstable vs fill_cooldown).
+        const reason = (decision.reason ?? 'unknown').split(' ')[0];
+        this.stats.antiSniperReasons = this.stats.antiSniperReasons ?? {};
+        this.stats.antiSniperReasons[reason] =
+          (this.stats.antiSniperReasons[reason] ?? 0) + 1;
+        // This token has live quorum interest — ask the wiring to keep its
+        // book subscribed so the guard accumulates mid observations.
+        if (this.onMidInterest) this.onMidInterest(trade.tokenId);
         if (process.env['DEBUG_QUORUM']) {
           console.log(
             `[BasketQuorum] SKIP anti-sniper: ${signal.marketSlug} ` +
@@ -880,6 +934,11 @@ export class BasketQuorumService {
 
       const usdcAmount = copyValue;
       if (usdcAmount < this.config.minTradeSize || usdcAmount < 1) {
+        // Silent-drop counter: these fires passed every quality gate but the
+        // scaled size (sizeScale × whale size, then RiskManager shrink) fell
+        // below the $20 floor. Previously invisible in the funnel.
+        this.stats.quorumSkippedMinSize =
+          (this.stats.quorumSkippedMinSize ?? 0) + 1;
         return;
       }
 
@@ -1015,11 +1074,15 @@ export class BasketQuorumService {
     skipped_negative_edge: number;
     executed: number;
     failed: number;
+    skipped_min_size: number;
     conversion_pct: number;
   } {
     const s = this.stats;
     const filtered = s.quorumSkippedThinEdge + s.quorumSkippedStaleMarket;
-    const conversion = s.votesObserved === 0 ? 0 : (s.executed / s.votesObserved) * 100;
+    // Conversion = executions per quorum fire (the actionable rate).
+    // The old metric divided by raw vote events (executed/votesObserved),
+    // which always rounds to 0.0% and tells the operator nothing.
+    const conversion = s.quorumFired === 0 ? 0 : (s.executed / s.quorumFired) * 100;
     const funnel = {
       observed: s.votesObserved,
       filtered,
@@ -1035,11 +1098,17 @@ export class BasketQuorumService {
       skipped_twap_misaligned: s.quorumSkippedTwapMisaligned ?? 0,
       skipped_thin_liquidity: s.quorumSkippedThinLiquidity ?? 0,
       skipped_negative_edge: s.quorumSkippedNegativeEdge ?? 0,
+      skipped_min_size: s.quorumSkippedMinSize ?? 0,
       executed: s.executed,
       failed: s.failed,
       conversion_pct: Math.round(conversion * 100) / 100,
     };
     const edgeStats = signalAuditStore.getStats();
+    // Compact anti-sniper reason breakdown, e.g. "no_mid_observations:1200/mid_unstable:300"
+    const reasons = Object.entries(s.antiSniperReasons ?? {})
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => `${k}:${v}`)
+      .join('/');
     console.log(
       `[BasketQuorum${label ? ':' + label : ''}] funnel: ` +
         `observed=${funnel.observed} ` +
@@ -1047,9 +1116,10 @@ export class BasketQuorumService {
         `fired=${funnel.quorum_fired} ` +
         `risk=${funnel.skipped_risk} bankroll=${funnel.skipped_bankroll} ` +
         `drift=${funnel.skipped_drift} cooldown=${funnel.skipped_cooldown} ` +
-        `antiSniper=${funnel.skipped_anti_sniper} ` +
+        `antiSniper=${funnel.skipped_anti_sniper}${reasons ? `(${reasons})` : ''} ` +
         `twap=${funnel.skipped_twap_stale}/${funnel.skipped_twap_misaligned} ` +
         `liq=${funnel.skipped_thin_liquidity} negEdge=${funnel.skipped_negative_edge} ` +
+        `minSize=${funnel.skipped_min_size} ` +
         `executed=${funnel.executed} failed=${funnel.failed} ` +
         `conversion=${funnel.conversion_pct}%` +
         (edgeStats.signalsSettled > 0
@@ -1067,6 +1137,7 @@ export class BasketQuorumService {
   reset(): void {
     this.votes.clear();
     this.lastFired.clear();
+    this.nearMissLogAt.clear();
     this._lastProcessedFire.clear();
     this.basketSpend.clear();
     this.walletTierMap.clear();
@@ -1122,6 +1193,72 @@ export class BasketQuorumService {
   recordSettledTrade(pnlUsd: number, ts: number = Date.now(), side: 'BUY' | 'SELL' = 'BUY'): void {
     if (this.riskManager) {
       this.riskManager.recordTrade({ pnlUsd, ts, side });
+    }
+  }
+
+  /**
+   * Handle a market_resolved event from the realtime feed.
+   *
+   * Completes the audit loop that was previously dead code:
+   *   market_resolved → recordResolution() → SignalAuditStore.recordSettlement()
+   *                   → basket winRate EMA update
+   *                   → risk.recordTrade() for each fired signal on this market
+   *
+   * After this is wired, [edge] shows realized vs expected edge and [risk]
+   * shows real daily/monthly P&L and streaks.
+   *
+   * @param conditionId  the resolving market's condition id
+   * @param winningOutcome  outcome name that won ('Yes'/'No' etc.)
+   * @param outcomePrices  final prices per outcome from Gamma (index-aligned
+   *                       with outcome names); used to determine 0|1 resolution
+   */
+  handleMarketResolved(
+    conditionId: string,
+    winningOutcome?: string,
+    outcomePrices?: number[],
+  ): void {
+    // Determine resolution per-signal: a signal on the winning outcome
+    // resolves 1; a signal on the losing outcome resolves 0.
+    // `winningOutcome` (outcome name) is authoritative when provided;
+    // outcomePrices fallback: price→1 means that outcome won (binary markets).
+    const signals = signalAuditStore.getSignalsByCondition(conditionId);
+    if (signals.length === 0) return;
+
+    // 1. Settle each signal with its own resolved value + update the
+    //    owning basket's rolling win rate (EMA, α=0.1 — same math as
+    //    recordResolution but per-signal outcome aware).
+    const ALPHA = 0.1;
+    let anySettled = false;
+    for (const sig of signals) {
+      if (sig.settledAt !== undefined) continue; // already settled
+      let sigResolved: 0 | 1;
+      if (winningOutcome) {
+        sigResolved = sig.outcome === winningOutcome ? 1 : 0;
+      } else if (outcomePrices && outcomePrices.length >= 2) {
+        // Binary fallback: if outcomePrices[0] >= 0.99 the first outcome won.
+        sigResolved = outcomePrices[0] >= 0.99 ? 1 : 0;
+      } else {
+        // No way to determine the winner — leave unsettled.
+        continue;
+      }
+      signalAuditStore.recordBacktestSettlement(sig.id, sigResolved);
+      anySettled = true;
+
+      // Basket win-rate EMA on the basket the signal actually fired from.
+      const basket = this.baskets.get(sig.basket as MarketCategory);
+      if (basket && basket.enabled) {
+        basket.winRate = basket.winRate * (1 - ALPHA) + (sigResolved === 1 ? 1 : 0) * ALPHA;
+      }
+    }
+    if (!anySettled) return;
+
+    // 2. Feed settled P&L into the RiskManager — one recordTrade per newly
+    //    settled signal. P&L per share (BUY): won → 1 - price; lost → -price.
+    for (const sig of signals) {
+      if (sig.settledAt === undefined) continue;
+      const won = sig.resolved === 1;
+      const perShare = won ? (1 - sig.pricePaid) : -sig.pricePaid;
+      this.recordSettledTrade(perShare * sig.size, sig.settledAt, sig.side);
     }
   }
 }

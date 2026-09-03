@@ -257,6 +257,12 @@ export class SignalAuditStore {
   getSignal(id: string): FiredSignal | undefined {
     return this.signals[id];
   }
+
+  /** All signals fired on a given conditionId (for resolution handling). */
+  getSignalsByCondition(conditionId: string): FiredSignal[] {
+    const ids = this.byConditionId.get(conditionId) ?? [];
+    return ids.map((id) => this.signals[id]).filter((s): s is FiredSignal => !!s);
+  }
 }
 
 // ============================================================================

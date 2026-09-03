@@ -37,6 +37,14 @@ export interface AntiSniperConfig {
   maxRepriceTicks: number;
   /** Lookback window for mid-jump detection (ms). */
   midJumpLookbackMs: number;
+  /**
+   * Price changes smaller than this are treated as NOISE (do not reset the
+   * stable-mid timer). Default 0.005 = half a 0.01 tick. Without a tolerance,
+   * alternating trade-price vs book-mid observations (which differ by <1 tick)
+   * keep resetting midLastChangeMs, so mid_unstable rejects every fire on
+   * high-frequency markets — the observed 95% anti-sniper block rate.
+   */
+  midTickTolerance: number;
 }
 
 export const DEFAULT_ANTI_SNIPER_CONFIG: AntiSniperConfig = {
@@ -45,6 +53,7 @@ export const DEFAULT_ANTI_SNIPER_CONFIG: AntiSniperConfig = {
   fillCooldownMs: 5_000,          // 5 seconds between fills
   maxRepriceTicks: 2,             // max 2 ticks per re-quote
   midJumpLookbackMs: 2_000,       // 2-second lookback for mid jumps
+  midTickTolerance: 0.005,        // sub-half-tick moves = noise, not instability
 };
 
 // ============================================================================
@@ -119,8 +128,9 @@ export class AntiSniperGuard {
     const k = this.key(tokenId);
     const arr = this.state.midHistory.get(k) ?? [];
     const last = arr[arr.length - 1];
-    if (last && Math.abs(last.mid - mid) < 1e-9) {
-      // No change, no update needed
+    if (last && Math.abs(last.mid - mid) < this.config.midTickTolerance) {
+      // Sub-tolerance move = noise, not instability. Do NOT reset the
+      // stable-mid timer (that was the mid_unstable starvation bug).
       return;
     }
     arr.push({ t: now, mid });

@@ -58,7 +58,7 @@ export type MarketCategory =
 export const CATEGORY_KEYWORDS: Record<MarketCategory, RegExp> = {
   crypto: /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto|doge|ada|matic|cardano|polkadot|avax|toncoin|ton|stablecoin|usdc|usdt|altcoin|defi|dex|swap|halving|airdrop|staking|yield)\b/i,
   politics: /\b(trump|biden|election|president|senate|congress|vote|political|maga|democrat|republican|governor|mayor|polls|primary|caucus|impeach|pelosi|gop|dnc|rnc|ballot|cabinet|legislat|amendment|partisan)\b/i,
-  sports: /\b(nfl|nba|mlb|nhl|super bowl|world cup|championship|game|match|ufc|soccer|football|basketball|baseball|tennis|golf|boxing|mma|olympics|ncaa|premier league|la liga|bundesliga|serie a|ligue 1|champions league|epl|copa|del rey|fa cup|stanley cup|playoff|quarterback|touchdown|hat trick)\b/i,
+  sports: /\b(nfl|nba|mlb|nhl|super bowl|world cup|championship|game|match|ufc|soccer|football|basketball|baseball|tennis|atp|wta|wimbledon|us open|french open|australian open|f1|formula 1|grand prix|golf|pga|boxing|mma|olympics|ncaa|premier league|la liga|bundesliga|serie a|ligue 1|champions league|epl|copa|del rey|fa cup|stanley cup|playoff|quarterback|touchdown|hat trick|cricket|ipl|t20|handball|volleyball|rugby|cycling|tour de france|darts|snooker|skiing|biathlon|swimming|athletics|marathon)\b/i,
   esports: /\b(esports|e-sports|valorant|csgo|cs2|counter-strike|counter strike|lol|league of legends|dota|dota 2|overwatch|apex legends|fortnite|call of duty|cod|warzone|rocket league|hearthstone|starcraft|pubg|rainbow six|r6|twitch|gaming|gamer|pro league|grand final|the international)\b/i,
   economics: /\b(fed|interest rate|inflation|gdp|recession|economic|unemployment|cpi|powell|taper|rate hike|rate cut|jobs report|nfp|nonfarm|consumer price|treasury|bond yield|yield curve|housing starts|wage growth|consumer confidence|pmi|ism|fomc)\b/i,
   entertainment: /\b(oscar|grammy|movie|film|twitter|celebrity|entertainment|netflix|spotify|disney|marvel|dc|emmy|tony award|album|artist|actor|actress|box office|theater|premiere|streaming|tiktok|youtube|reality tv|kardashian)\b/i,
@@ -83,7 +83,10 @@ export const CATEGORY_KEYWORDS: Record<MarketCategory, RegExp> = {
  * ```
  */
 export function categorizeMarket(title: string): MarketCategory {
-  const lowerTitle = title.toLowerCase();
+  // Polymarket slugs are hyphen-separated ('us-open-final', 'la-liga'),
+  // but the keyword lists use spaces for multi-word phrases. Normalize so
+  // both 'us open' and 'us-open' match.
+  const lowerTitle = title.toLowerCase().replace(/[-_]+/g, ' ');
 
   // Check each category in priority order. Esports is checked BEFORE
   // entertainment because 'league' alone is ambiguous but 'league of
