@@ -22,6 +22,8 @@ import {
 import { signalAuditStore, setBonferroniGroups } from './src/services/signal-audit-store.js';
 import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from './src/utils/anti-sniper.js';
 import { ChainlinkTwapOracle } from './src/services/chainlink-twap-oracle.js';
+import { ClobMarketWsService } from './src/services/clob-market-ws.js';
+import { GammaResolutionPoller } from './src/services/gamma-resolution-poller.js';
 
 // ============================================================================
 // CONFIGURATION
@@ -383,8 +385,10 @@ function calculatePositionSize(baseSize: number): number {
 
 let basketQuorum: BasketQuorumService | null = null;
 let quorumSubscription: { id: string; unsubscribe: () => void } | null = null;
-/** Market-resolution WS subscription (edge/risk settlement loop) */
-let resolutionSubscription: { id: string; unsubscribe: () => void } | null = null;
+/** Gamma API resolution poller (replaces dead RTDS market_resolved topic) */
+let gammaPoller: GammaResolutionPoller | null = null;
+/** CLOB market WebSocket (replaces dead RTDS clob_market topic for mid feed) */
+let clobWs: ClobMarketWsService | null = null;
 /** Anti-sniper mid-feed book subscription */
 let midFeedSubscription: { unsubscribe: () => void } | null = null;
 
@@ -625,81 +629,42 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
       { filterAddresses: [], smartMoneyOnly: false },
     );
 
-    // --- Market resolution feed (fixes the dead [edge]/[risk] loop) ---
-    // Subscribes to clob_market market_created/market_resolved events. On
-    // resolution we fetch the market from Gamma, determine the winning
-    // outcome (final price→1), and settle every fired signal on that market:
-    //   SignalAuditStore.recordBacktestSettlement → realized edge
-    //   basket winRate EMA                        → edge math stays calibrated
-    //   risk.recordTrade(perShare * size)         → [risk] daily/monthly/drawdown
-    // Without this, recordResolution() is never called and [edge]/[risk]
-    // stay at their boot values forever.
-    resolutionSubscription = sdk.realtime.subscribeMarketEvents({
-      onMarketEvent: (event) => {
-        if (event.type !== 'resolved' || !event.conditionId) return;
-        const cid = event.conditionId;
-        sdk.gammaApi
-          .getMarketByConditionId(cid)
-          .then((m) => {
-            if (!m) return;
-            // Winning outcome = the one whose final price resolved to ~1.
-            let winnerIdx = -1;
-            const prices = m.outcomePrices ?? [];
-            for (let i = 0; i < prices.length; i++) {
-              if (prices[i] >= 0.99) { winnerIdx = i; break; }
-            }
-            const winningOutcome =
-              winnerIdx >= 0 ? m.outcomes?.[winnerIdx] : undefined;
-            basketQuorum?.handleMarketResolved(cid, winningOutcome, prices);
-          })
-          .catch((err) => {
-            log('WARN', `Resolution handling failed for ${cid.slice(0, 10)}: ${err instanceof Error ? err.message : err}`);
-          });
-      },
-    });
-    // lives for the process lifetime; unsubscribed in SIGINT below
-    log('QUORUM', 'Market resolution feed wired (edge/risk settlement loop active)');
+    // --- Gamma resolution poller (replaces dead RTDS market_resolved topic) ---
+    // The RTDS clob_market/market_resolved topic is deprecated and delivers
+    // nothing.  Poll Gamma every 5 min for settled markets; any that have
+    // resolved are settled via basketQuorum.handleMarketResolved(), which
+    // updates the audit trail, basket winRate EMAs, and RiskManager P&L.
+    gammaPoller = new GammaResolutionPoller(sdk.gammaApi, basketQuorum, 5 * 60 * 1000);
+    gammaPoller.start();
+    log('QUORUM', 'Gamma resolution poller active (edge/risk settlement loop active)');
 
-    // --- Mid-price feed for the anti-sniper guard ---
-    // FIX for antiSniper=95% block rate: observeMid() was never called because
-    // nothing subscribed to orderbook updates. Now we subscribe to the book
-    // for markets with live quorum interest (fired-or-near-miss tokenIds) and
-    // feed every mid to the guard, so allowFire() has the observations it
-    // needs instead of dying on no_mid_observations.
-    const midFeedTokens = new Set<string>();
-    const midFeedSubRef: { current: { unsubscribe: () => void } | null } = { current: null };
-    let midFeedTimer: NodeJS.Timeout | null = null;
-    const resubscribeMidFeed = () => {
-      if (!sdk.realtime || midFeedTokens.size === 0) return;
-      try {
-        midFeedSubRef.current?.unsubscribe();
-      } catch { /* already gone */ }
-      const tokens = [...midFeedTokens].slice(0, 50); // cap: 50 book subscriptions
-      midFeedSubRef.current = sdk.realtime.subscribeMarkets(tokens, {
-        onOrderbook: (book) => {
-          const bestBid = book.bids?.[0]?.price;
-          const bestAsk = book.asks?.[0]?.price;
-          if (bestBid && bestAsk && bestAsk > bestBid) {
-            basketQuorum?.observeMid(book.tokenId, (bestBid + bestAsk) / 2);
-          }
-        },
-        onLastTrade: (t) => {
-          basketQuorum?.observeMid(t.assetId, t.price);
-        },
-      });
-      midFeedSubscription = midFeedSubRef.current;
-    };
-    // Debounced: near-miss + fire events can burst; one resub per 10s max.
+    // --- CLOB market WebSocket for mid-price feed (replaces dead RTDS clob_market) ---
+    // The RTDS clob_market topic is deprecated ("CLOB messages not supported").
+    // Use the official CLOB market WebSocket instead, which provides book_update,
+    // price_change, and last_trade_price for subscribed assets.
+    // The mid-price feed is used by the anti-sniper guard to confirm price
+    // stability before allowing a fire; without it the guard blocks on
+    // no_mid_observations or mid_unstable.
+    clobWs = new ClobMarketWsService();
+
+    // Wire mid observations to the anti-sniper guard.
+    // onMid fires on every price_change / last_trade from the CLOB WS.
+    clobWs.onMid(({ assetId, price }) => {
+      basketQuorum?.observeMid(assetId, price);
+    });
+
+    clobWs.start();
+
+    // Dynamic subscription to CLOB market WS — request mid observations for a token
+    // whenever the anti-sniper guard shows interest.  The CLOB WS subscribes to
+    // all assets globally (server-side filtering), so we just call subscribe()
+    // with the tokenId to start receiving its book/price/lastTrade events.
     const requestMidFeed = (tokenId: string) => {
-      if (midFeedTokens.has(tokenId)) return;
-      midFeedTokens.add(tokenId);
-      if (midFeedTimer) return;
-      midFeedTimer = setTimeout(() => {
-        midFeedTimer = null;
-        resubscribeMidFeed();
-      }, 10_000);
+      if (!clobWs) return;
+      // ClobMarketWsService.subscribe() is idempotent; calling repeatedly is safe.
+      clobWs.subscribe([tokenId]);
     };
-    log('QUORUM', 'Mid-price feed ready (activates on first quorum interest)');
+    log('QUORUM', 'CLOB market WS ready (mid feed active)');
 
     // Screen and score wallets
     log('QUORUM', 'Screening wallets...');
@@ -788,7 +753,7 @@ function displayStatus() {
   const lines: string[] = [];
   lines.push(`[status] t=${runtime}m mode=${mode} ${status}`);
   if (f) {
-    const conversion = f.votesObserved === 0 ? 0 : (f.executed / f.votesObserved * 100).toFixed(1);
+    const conversion = f.quorumFired === 0 ? 0 : (f.executed / f.quorumFired * 100).toFixed(1);
     const antiSniper = f.quorumSkippedAntiSniper ?? 0;
     const twapStale = f.quorumSkippedTwapStale ?? 0;
     const twapMisaligned = f.quorumSkippedTwapMisaligned ?? 0;
@@ -879,7 +844,8 @@ async function main() {
   const shutdown = async (sig: string) => {
     console.log(`\n\nShutting down (${sig})...`);
     if (quorumSubscription) quorumSubscription.unsubscribe();
-    if (resolutionSubscription) resolutionSubscription.unsubscribe();
+    if (gammaPoller) gammaPoller.stop();
+    if (clobWs) clobWs.stop();
     if (midFeedSubscription) midFeedSubscription.unsubscribe();
     sdk.stop();
     process.exit(0);

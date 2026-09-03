@@ -263,6 +263,16 @@ export class SignalAuditStore {
     const ids = this.byConditionId.get(conditionId) ?? [];
     return ids.map((id) => this.signals[id]).filter((s): s is FiredSignal => !!s);
   }
+
+  /**
+   * All conditionIds that have been fired but not yet settled.
+   * Used by GammaResolutionPoller to batch-check resolutions.
+   */
+  getUnsettledConditionIds(): string[] {
+    return Object.values(this.signals)
+      .filter((s) => s.settledAt === undefined)
+      .map((s) => s.cluster);
+  }
 }
 
 // ============================================================================

@@ -1188,6 +1188,14 @@ export class BasketQuorumService {
   }
 
   /**
+   * Delegate to SignalAuditStore — all fired-but-unsettled conditionIds.
+   * Used by GammaResolutionPoller to batch-check resolutions.
+   */
+  getUnsettledConditionIds(): string[] {
+    return signalAuditStore.getUnsettledConditionIds();
+  }
+
+  /**
    * Record the settled P&L of a trade so the RiskManager can update
    * its halts, dynamic sizing, and bankroll slice accounting.
    * Call this from your executor (or the TradingService wrapper) AFTER
