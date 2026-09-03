@@ -30,16 +30,23 @@ export interface ClobMidObservation {
 
 export type MidObserver = (obs: ClobMidObservation) => void;
 
-interface ClobSubscribeMessage {
-  assets_ids: string[];
-  operation: 'subscribe' | 'unsubscribe';
-  custom_feature_enabled: true;
-}
-
 interface ClobInitialMessage {
   assets_ids: string[];
   type: 'market';
-  custom_feature_enabled: true;
+  /**
+   * Note: setting custom_feature_enabled: true triggers full book_snapshot
+   * delivery on subscribe (one per asset, hundreds of bytes each).
+   * For 20+ assets the server floods the buffer → 1013 slow-consumer.
+   * Default (no custom_feature_enabled) gives price_change and
+   * last_trade_price only, which is all the anti-sniper guard needs.
+   */
+  custom_feature_enabled?: false;
+}
+
+interface ClobSubscribeMessage {
+  assets_ids: string[];
+  operation: 'subscribe' | 'unsubscribe';
+  custom_feature_enabled?: false;
 }
 
 interface ClobBookUpdate {
@@ -112,7 +119,9 @@ export class ClobMarketWsService {
     return () => this.midObservers.delete(observer);
   }
 
-  private static readonly MAX_SUBSCRIBED_ASSETS = 50;
+  private static readonly MAX_SUBSCRIBED_ASSETS = 20;
+  private static readonly SUBSCRIBE_BATCH_SIZE = 5;
+  private static readonly SUBSCRIBE_BATCH_DELAY_MS = 100;
 
   /**
    * Subscribe to one or more asset IDs. Idempotent — safe to call repeatedly.
@@ -206,13 +215,29 @@ export class ClobMarketWsService {
       // Initial subscription message (type: market).
       // Only send if we have assets; an empty list with custom_feature_enabled
       // would make the server push every market's snapshot — slow consumer disconnect.
-      if (this.subscribedAssets.size > 0) {
-        const initial: ClobInitialMessage = {
-          assets_ids: [...this.subscribedAssets],
-          type: 'market',
-          custom_feature_enabled: true,
-        };
-        this.send(initial);
+      // Batch in groups of SUBSCRIBE_BATCH_SIZE with SUBSCRIBE_BATCH_DELAY_MS between
+      // groups to avoid flooding the server with a 50-asset subscribe that triggers
+      // 50 simultaneous book snapshots.
+      const assets = [...this.subscribedAssets];
+      if (assets.length > 0) {
+        const batchSize = ClobMarketWsService.SUBSCRIBE_BATCH_SIZE;
+        for (let i = 0; i < assets.length; i += batchSize) {
+          const batch = assets.slice(i, i + batchSize);
+          if (i === 0) {
+            // First batch: include type: market to establish channel
+            const initial: ClobInitialMessage = {
+              assets_ids: batch,
+              type: 'market',
+            };
+            this.send(initial);
+          } else {
+            const followup: ClobSubscribeMessage = {
+              assets_ids: batch,
+              operation: 'subscribe',
+            };
+            this.send(followup);
+          }
+        }
       }
 
       // Heartbeat: server replies "PONG" to a plain-text "PING".
@@ -283,7 +308,6 @@ export class ClobMarketWsService {
     const msg: ClobSubscribeMessage = {
       assets_ids: assetIds,
       operation: 'subscribe',
-      custom_feature_enabled: true,
     };
     this.send(msg);
   }
@@ -292,7 +316,6 @@ export class ClobMarketWsService {
     const msg: ClobSubscribeMessage = {
       assets_ids: assetIds,
       operation: 'unsubscribe',
-      custom_feature_enabled: true,
     };
     this.send(msg);
   }
