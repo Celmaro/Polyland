@@ -77,25 +77,39 @@ export class GammaResolutionPoller {
       return;
     }
 
+    // Always log when we have unsettled signals to check
+    console.log(`[GammaPoller] checking ${conditionIds.length} unsettled signals...`);
+
     // Batch-fetch each market from Gamma
     const results = await Promise.allSettled(
       conditionIds.map((cid) => this.gamma.getMarketByConditionId(cid))
     );
 
     let settled = 0;
+    let notFound = 0;
+    let notResolved = 0;
+    let errors = 0;
     for (let i = 0; i < conditionIds.length; i++) {
       const result = results[i];
-      if (result.status !== 'fulfilled' || !result.value) continue;
+      if (result.status !== 'fulfilled') {
+        errors++;
+        console.warn(`[GammaPoller] fetch failed for ${conditionIds[i].slice(0, 10)}: ${result.reason}`);
+        continue;
+      }
+      if (!result.value) {
+        notFound++;
+        continue;
+      }
       const market = result.value;
 
-      // Check if market is resolved: Gamma uses `closed` or `resolved` fields
+      // Check if market is resolved: Gamma uses `closed` field
       const raw = market as unknown as Record<string, unknown>;
-      const isResolved =
-        raw.closed === true ||
-        raw.resolved === true ||
-        raw.endDateApproved === true;
+      const isClosed = raw.closed === true;
 
-      if (!isResolved) continue;
+      if (!isClosed) {
+        notResolved++;
+        continue;
+      }
 
       // Determine winning outcome from final prices
       const prices: number[] = (market.outcomePrices ?? []).map(Number);
@@ -110,8 +124,10 @@ export class GammaResolutionPoller {
       settled++;
     }
 
-    if (settled > 0 || this.pollCount % LOG_INTERVAL === 1) {
-      console.log(`[GammaPoller] checked ${conditionIds.length} unsettled, settled ${settled}`);
-    }
+    // Always log results when we had unsettled signals
+    console.log(
+      `[GammaPoller] checked ${conditionIds.length} unsettled: ` +
+      `settled=${settled} notResolved=${notResolved} notFound=${notFound} errors=${errors}`
+    );
   }
 }

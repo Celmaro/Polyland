@@ -112,13 +112,28 @@ export class ClobMarketWsService {
     return () => this.midObservers.delete(observer);
   }
 
+  private static readonly MAX_SUBSCRIBED_ASSETS = 50;
+
   /**
    * Subscribe to one or more asset IDs. Idempotent — safe to call repeatedly.
    * Triggers the initial WS connection if not yet started.
+   * Caps total subscriptions at MAX_SUBSCRIBED_ASSETS; evicts oldest when exceeded.
    */
   subscribe(assetIds: string[]): void {
     const newIds = assetIds.filter((id) => !this.subscribedAssets.has(id));
     if (newIds.length === 0) return;
+
+    // Evict oldest subscriptions if we'd exceed the cap
+    const maxAssets = ClobMarketWsService.MAX_SUBSCRIBED_ASSETS;
+    while (this.subscribedAssets.size + newIds.length > maxAssets) {
+      const oldest = this.subscribedAssets.values().next().value;
+      if (!oldest) break;
+      this.subscribedAssets.delete(oldest);
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.sendUnsubscribe([oldest]);
+      }
+    }
+
     newIds.forEach((id) => this.subscribedAssets.add(id));
 
     if (this.ws?.readyState === WebSocket.OPEN) {
