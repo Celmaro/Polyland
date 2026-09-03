@@ -647,13 +647,15 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     // no_mid_observations or mid_unstable.
     clobWs = new ClobMarketWsService();
 
-    // Wire mid observations to the anti-sniper guard.
-    // onMid fires on every price_change / last_trade from the CLOB WS.
-    clobWs.onMid(({ assetId, price }) => {
-      basketQuorum?.observeMid(assetId, price);
-    });
+        // Wire mid observations to the anti-sniper guard.
+        // onMid fires on every price_change / last_trade from the CLOB WS.
+        clobWs.onMid(({ assetId, price }) => {
+          basketQuorum?.observeMid(assetId, price);
+        });
 
-    clobWs.start();
+        // Note: clobWs.start() is deferred until the first requestMidFeed()
+        // call. An empty subscribe message causes the server to push every
+        // market's snapshot, leading to immediate slow-consumer disconnects.
 
     // Dynamic subscription to CLOB market WS — request mid observations for a token
     // whenever the anti-sniper guard shows interest.  The CLOB WS subscribes to

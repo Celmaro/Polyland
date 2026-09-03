@@ -94,6 +94,7 @@ export class ClobMarketWsService {
   private intentionallyClosed = false;
   private destroyed = false;
   private pingPongSeenAt = 0;
+  private connectPending = false;
 
   /** Book mid price per asset (best bid + best ask) / 2 */
   private bookMids = new Map<string, number>();
@@ -113,6 +114,7 @@ export class ClobMarketWsService {
 
   /**
    * Subscribe to one or more asset IDs. Idempotent — safe to call repeatedly.
+   * Triggers the initial WS connection if not yet started.
    */
   subscribe(assetIds: string[]): void {
     const newIds = assetIds.filter((id) => !this.subscribedAssets.has(id));
@@ -121,8 +123,11 @@ export class ClobMarketWsService {
 
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.sendSubscribe(newIds);
+    } else if (!this.ws && !this.connectPending) {
+      // First asset added — kick off the connection now.
+      this.connect();
     }
-    // If not yet connected, the subscription will be sent on open.
+    // If ws is mid-connect, the onopen handler will subscribe to subscribedAssets.
   }
 
   /**
@@ -170,23 +175,25 @@ export class ClobMarketWsService {
 
   private connect(): void {
     if (this.destroyed) return;
+    // Defer connect until we have at least one asset to subscribe to.
+    // Sending an empty assets_ids list with custom_feature_enabled: true
+    // makes the server push every market's book snapshot + price_change —
+    // an immediate slow-consumer disconnect.
+    if (this.subscribedAssets.size === 0) {
+      this.connectPending = true;
+      return;
+    }
+    this.connectPending = false;
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
       this.reconnectDelayMs = 1_000;
-      // Initial subscription message (type: market)
+      // Initial subscription message (type: market).
+      // Only send if we have assets; an empty list with custom_feature_enabled
+      // would make the server push every market's snapshot — slow consumer disconnect.
       if (this.subscribedAssets.size > 0) {
         const initial: ClobInitialMessage = {
           assets_ids: [...this.subscribedAssets],
-          type: 'market',
-          custom_feature_enabled: true,
-        };
-        this.send(initial);
-      } else {
-        // Some servers require the initial subscribe even with empty list.
-        // Send with a dummy asset id to establish the channel.
-        const initial: ClobInitialMessage = {
-          assets_ids: [],
           type: 'market',
           custom_feature_enabled: true,
         };
