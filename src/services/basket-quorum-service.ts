@@ -696,6 +696,116 @@ export class BasketQuorumService {
     return expiry.getTime() < Date.now();
   }
 
+  /**
+   * L4/L1 helper: infer market end time (ms epoch) from the slug.
+   * Handles the crypto up/down slug scheme 'xxx-updown-5m-<unix>' where
+   * <unix> is the window END in seconds. Returns null when the slug
+   * carries no parseable expiry (weather/politics/etc — EARLY rules apply).
+   */
+  private _inferMarketEndMs(slug: string | undefined): number | null {
+    if (!slug) return null;
+    const m = slug.match(/-updown-(\d+[mh])-ls(\d+)$/)      // btc-updown-5m-ls1738102200
+      ?? slug.match(/-updown-(\d+[mh])-(\d{10})$/)          // eth-updown-5m-1788454500
+      ?? slug.match(/-(\d{10})$/);                          // generic trailing unix
+    if (!m) return null;
+    const unix = parseInt(m[m.length - 1], 10);
+    if (!Number.isFinite(unix) || unix < 1_600_000_000) return null;
+    return unix * 1000;
+  }
+
+  // ==========================================================================
+  // L1: Exit ladder (KaustubhPatange/polymarket-trade-engine simulation.ts)
+  //     - Late-TP: any open position whose market price >= 0.96 is sold
+  //     - Emergency: within 30s of expiry, force-sell at best bid
+  //     Exits run on a 15s interval over openPositions (tokenId -> cost).
+  // ==========================================================================
+
+  /** Open copy positions: tokenId -> { usdc, size, price, slug, outcome, ts } */
+  private openPositions: Map<string, {
+    usdc: number; size: number; entryPrice: number;
+    marketSlug: string; outcome: string; firedAt: number;
+  }> = new Map();
+
+  private exitTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Start the exit ladder loop (15s). Idempotent. */
+  startExitLadder(): void {
+    if (this.exitTimer || this.config.dryRun) return; // DRY-RUN: no real orders
+    this.exitTimer = setInterval(() => {
+      this.runExitPass().catch((err) => {
+        console.warn('[BasketQuorum][exit] pass error:', err instanceof Error ? err.message : err);
+      });
+    }, 15_000);
+    console.log('[BasketQuorum][exit] ladder started (15s interval)');
+  }
+
+  stopExitLadder(): void {
+    if (this.exitTimer) {
+      clearInterval(this.exitTimer);
+      this.exitTimer = null;
+    }
+  }
+
+  /** Record an executed entry so the exit ladder can manage it. */
+  private trackOpenPosition(
+    tokenId: string, usdc: number, size: number, entryPrice: number,
+    marketSlug: string, outcome: string,
+  ): void {
+    this.openPositions.set(tokenId, { usdc, size, entryPrice, marketSlug, outcome, firedAt: Date.now() });
+  }
+
+  private async runExitPass(): Promise<void> {
+    if (this.openPositions.size === 0) return;
+    const LATE_TP_PRICE = 0.96;   // sell when the market has converged
+    const EMERGENCY_WINDOW_MS = 30_000;
+
+    for (const [tokenId, pos] of [...this.openPositions]) {
+      try {
+        const endMs = this._inferMarketEndMs(pos.marketSlug);
+        const msToEnd = endMs ? endMs - Date.now() : Number.POSITIVE_INFINITY;
+
+        // Emergency exit: expiry < 30s — sell at best bid regardless of price.
+        const emergency = msToEnd < EMERGENCY_WINDOW_MS;
+
+        // Current price from the order book (best bid for our SELL side).
+        const book = await this.tradingService.getOrderBook(tokenId);
+        if (!book) continue;
+        const bestBid = book.bids.length > 0 ? parseFloat(book.bids[0].price) : 0;
+        if (bestBid <= 0) continue;
+
+        if (!emergency && bestBid < LATE_TP_PRICE) continue;
+
+        const sellSize = pos.size;
+        if (sellSize <= 0) { this.openPositions.delete(tokenId); continue; }
+
+        console.log(
+          `[BasketQuorum][exit] ${emergency ? 'EMERGENCY' : 'TP'} sell ${pos.marketSlug} ` +
+          `${pos.outcome}: entry=${pos.entryPrice.toFixed(3)} bid=${bestBid.toFixed(3)} ` +
+          `size=${sellSize.toFixed(1)}`
+        );
+
+        const result = await this.tradingService.createMarketOrder({
+          tokenId,
+          side: 'SELL',
+          amount: sellSize,                 // SELL: amount = shares
+          price: bestBid,                   // FAK at best bid (worst-price clamp: alpha-bot pattern)
+          orderType: 'FAK',
+        });
+
+        if (result.success) {
+          const pnl = (bestBid - pos.entryPrice) * sellSize;
+          this.recordSettledTrade(pnl, Date.now(), 'SELL');
+          this.openPositions.delete(tokenId);
+          console.log(`[BasketQuorum][exit] sold ${pos.marketSlug} pnl=$${pnl.toFixed(2)}`);
+        } else {
+          console.warn(`[BasketQuorum][exit] sell failed: ${result.errorMsg}`);
+        }
+      } catch (err) {
+        console.warn('[BasketQuorum][exit] position error:', err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
   private getVoteMap(
     conditionId: string,
     outcome: string
@@ -951,13 +1061,46 @@ export class BasketQuorumService {
       const feePerShareVal = takerFeePerShare(signal.consensusPrice, feeRateBps);
       const winRate = signal.winRate ?? 0.6;
       const expectedEdge = winRate - signal.consensusPrice - feePerShareVal;
-      if (expectedEdge <= 0) {
+
+      // L4: phase-aware edge thresholds (FrondEnt/BTC15mAssistant edge.js
+      // pattern). Late entries into a 5m market have no time to recover
+      // from noise, so required edge rises as expiry approaches. Market
+      // end time is inferred from the slug (updown-5m-<unix> scheme) or
+      // defaults to EARLY (5m crypto slugs carry a Unix expiry suffix).
+      const marketEndMs = this._inferMarketEndMs(signal.marketSlug);
+      const secondsToEnd = marketEndMs
+        ? Math.max(0, Math.floor((marketEndMs - Date.now()) / 1000))
+        : null;
+      let minEdge = 0; // EARLY / unknown: plain positivity
+      let minProb = 0;
+      if (secondsToEnd !== null && secondsToEnd < 60) {
+        minEdge = 0.20;  // LATE
+        minProb = 0.70;
+      } else if (secondsToEnd !== null && secondsToEnd < 180) {
+        minEdge = 0.10;  // MID
+        minProb = 0.60;
+      }
+
+      if (expectedEdge <= minEdge) {
         this.stats.quorumSkippedNegativeEdge =
           (this.stats.quorumSkippedNegativeEdge ?? 0) + 1;
         console.log(
           `[BasketQuorum] SKIP negative-edge: ${signal.marketSlug} ` +
             `winRate=${winRate.toFixed(3)} price=${signal.consensusPrice.toFixed(3)} ` +
-            `fee=${(feePerShareVal * 100).toFixed(2)}% edge=${(expectedEdge * 100).toFixed(2)}%`,
+            `fee=${(feePerShareVal * 100).toFixed(2)}% edge=${(expectedEdge * 100).toFixed(2)}%` +
+            (minEdge > 0 ? ` phase=${secondsToEnd! < 60 ? 'LATE' : 'MID'} minEdge=${(minEdge * 100).toFixed(0)}%` : ''),
+        );
+        return;
+      }
+
+      // L4b: minimum-probability floor in late phases.
+      if (minProb > 0 && winRate < minProb) {
+        this.stats.quorumSkippedNegativeEdge =
+          (this.stats.quorumSkippedNegativeEdge ?? 0) + 1;
+        console.log(
+          `[BasketQuorum] SKIP late-phase-prob: ${signal.marketSlug} ` +
+            `winRate=${winRate.toFixed(3)} < minProb=${minProb.toFixed(2)} ` +
+            `(secondsToEnd=${secondsToEnd})`,
         );
         return;
       }
@@ -1032,6 +1175,17 @@ export class BasketQuorumService {
           basket.category,
           (this.basketSpend.get(basket.category) ?? 0) + usdcAmount,
         );
+        // L1: track the position so the exit ladder can manage it.
+        if (trade.tokenId) {
+          this.trackOpenPosition(
+            trade.tokenId,
+            usdcAmount,
+            copySize,
+            signal.consensusPrice,
+            signal.marketSlug,
+            signal.outcome,
+          );
+        }
         // Persist dedup so we skip this market+outcome on restart.
         // The cooldown above uses this._lastProcessedFire (linked to store).
         this._lastProcessedFire.set(key, now);
