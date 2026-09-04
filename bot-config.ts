@@ -558,6 +558,8 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
 
   basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);
+  // L1: start the exit ladder (no-op in DRY-RUN — no real positions).
+  basketQuorum.startExitLadder();
   basketQuorum.setStateStore(stateStore);
   basketQuorum.setGammaApi(sdk.gammaApi);
   basketQuorum.setSpecializationThresholds(
