@@ -345,6 +345,13 @@ function recordTrade(profit: number, strategy: string) {
     state.consecutiveWins++;
   }
 
+  // Update capital + drawdown (used by [risk] display line)
+  state.currentCapital = CONFIG.capital.totalUsd + state.totalPnL;
+  state.peakCapital = Math.max(state.peakCapital, state.currentCapital);
+  state.currentDrawdown = state.peakCapital > 0
+    ? (state.peakCapital - state.currentCapital) / state.peakCapital
+    : 0;
+
   if (strategy === 'smartMoney') state.smartMoneyTrades++;
   else if (strategy === 'arbitrage') state.arbTrades++;
   else if (strategy === 'dipArb') state.dipArbTrades++;
@@ -560,6 +567,8 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   basketQuorum.setRiskManager(risk);
   // L1: start the exit ladder (no-op in DRY-RUN — no real positions).
   basketQuorum.startExitLadder();
+  // Settled PnL -> BotState so the [risk] display line reflects reality.
+  basketQuorum.onSettledTrade = (pnlUsd: number) => recordTrade(pnlUsd, 'smartMoney');
   basketQuorum.setStateStore(stateStore);
   basketQuorum.setGammaApi(sdk.gammaApi);
   basketQuorum.setSpecializationThresholds(

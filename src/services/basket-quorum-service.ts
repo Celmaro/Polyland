@@ -1375,7 +1375,16 @@ export class BasketQuorumService {
     if (this.riskManager) {
       this.riskManager.recordTrade({ pnlUsd, ts, side });
     }
+    // Fan out to the operator wiring (bot-config's display `state`) — the
+    // [risk] status line reads BotState, not RiskManager, so without this
+    // hook settled PnL never shows in [risk].
+    if (this.onSettledTrade) {
+      try { this.onSettledTrade(pnlUsd); } catch { /* display must not break trading */ }
+    }
   }
+
+  /** Optional callback: invoked with each settled trade's PnL (display/hook). */
+  onSettledTrade: ((pnlUsd: number) => void) | null = null;
 
   /**
    * Handle a market_resolved event from the realtime feed.
