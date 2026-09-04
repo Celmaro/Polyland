@@ -939,6 +939,12 @@ export class BasketQuorumService {
       return;
     }
 
+    // 7a-2. PT4 basket kill switch — suspended baskets take no new entries.
+    if (this.riskManager && this.riskManager.isBasketKilled(basket.name)) {
+      this.stats.quorumSkippedRiskHalt++;
+      return;
+    }
+
     // 7b. Bankroll slice check — the basket's spend must not exceed its slice.
     const basketBankroll = this.bankrollFor(basket.category);
     const spent = this.basketSpend.get(basket.category) ?? 0;
@@ -1423,6 +1429,11 @@ export class BasketQuorumService {
       const basket = this.baskets.get(sig.basket as MarketCategory);
       if (basket && basket.enabled) {
         basket.winRate = basket.winRate * (1 - ALPHA) + (sigResolved === 1 ? 1 : 0) * ALPHA;
+      }
+
+      // PT4: feed the kill switch — per-basket settled outcomes.
+      if (this.riskManager && sig.side === 'BUY') {
+        this.riskManager.recordBasketOutcome(sig.basket, sigResolved === 1);
       }
     }
     if (!anySettled) return;

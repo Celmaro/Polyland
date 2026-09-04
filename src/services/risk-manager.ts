@@ -55,6 +55,13 @@ export interface RiskConfig {
   lossSizingReduction: number;    // 0.20
   winSizingIncrease: number;      // 0.10
 
+  // PT4 (sstklen/trump-code circuit breaker): basket kill switch — a basket
+  // whose recent settled win rate diverges from its rolling baseline by
+  // basketKillSigma std-devs over basketKillWindow settlements is suspended.
+  basketKillSigma: number;
+  basketKillWindow: number;
+  basketKillMinSamples: number;
+
   // Base position size as fraction of capital before dynamic adjustment
   basePositionPct: number;        // 0.02 (matches MrFadiAi config)
 }
@@ -72,6 +79,12 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   lossSizingReduction: 0.20,
   winSizingIncrease: 0.10,
   basePositionPct: 0.02,
+  // PT4 (sstklen/trump-code circuit breaker): basket kill switch fires when
+  // a basket's recent settled win rate diverges from its rolling baseline
+  // by `basketKillSigma` std-devs over `basketKillWindow` settlements.
+  basketKillSigma: 2.0,
+  basketKillWindow: 20,
+  basketKillMinSamples: 8,
 };
 
 // ============================================================================
@@ -281,6 +294,57 @@ export class RiskManager {
 
     // P6: persist after every settled trade so a restart can't wipe a halt.
     this.persistState();
+  }
+
+  // ==========================================================================
+  // PT4: basket kill switch (sstklen/trump-code circuit-breaker pattern)
+  // ==========================================================================
+
+  /** Per-basket settled outcome history (1=win, 0=loss), newest last. */
+  private basketOutcomes: Map<string, (0 | 1)[]> = new Map();
+  /** Baskets currently suspended by the kill switch. */
+  private killedBaskets: Set<string> = new Set();
+
+  /** Record a settled outcome for a named basket and re-evaluate its breaker. */
+  recordBasketOutcome(basketName: string, won: boolean): void {
+    const window = this.config.basketKillWindow ?? 20;
+    const list = this.basketOutcomes.get(basketName) ?? [];
+    list.push(won ? 1 : 0);
+    while (list.length > window) list.shift();
+    this.basketOutcomes.set(basketName, list);
+
+    // Kill: recent performance statistically indistinguishable from a coin
+    // flip biased the wrong way, or N-consecutive-loss divergence vs baseline.
+    const minN = this.config.basketKillMinSamples ?? 8;
+    const sigma = this.config.basketKillSigma ?? 2.0;
+    if (!this.killedBaskets.has(basketName) && list.length >= minN) {
+      const n = list.length;
+      const mean = list.reduce((a, b) => a + b, 0) / n;
+      // Binomial std-dev of the win-rate estimator under the fair-coin null
+      // (p=0.5): sigma = sqrt(0.25/n). Divergence >= sigma * sigmaThresh
+      // below 0.5 means the basket is significantly WORSE than a coin flip.
+      const fairSigma = Math.sqrt(0.25 / n);
+      if (mean < 0.5 - sigma * fairSigma) {
+        this.killedBaskets.add(basketName);
+        console.error(
+          `[RiskManager] BASKET KILL SWITCH: '${basketName}' suspended — ` +
+          `winRate ${mean.toFixed(3)} over ${n} settled is >= ${sigma}σ below fair coin ` +
+          `(requires operator review to re-enable)`
+        );
+      }
+    }
+  }
+
+  /** Is this basket suspended by its kill switch? */
+  isBasketKilled(basketName: string): boolean {
+    return this.killedBaskets.has(basketName);
+  }
+
+  /** Operator action: manually re-enable a killed basket (reset its history). */
+  reviveBasket(basketName: string): void {
+    this.killedBaskets.delete(basketName);
+    this.basketOutcomes.delete(basketName);
+    console.log(`[RiskManager] basket '${basketName}' revived — history reset`);
   }
 
   /**
