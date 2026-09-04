@@ -31,6 +31,8 @@
  *   risk.snapshot();
  */
 
+import * as fs from 'node:fs';
+
 // ============================================================================
 // Config
 // ============================================================================
@@ -142,10 +144,71 @@ export class RiskManager {
   private _sizeMultiplier = 1.0;
   private _haltedUntilMs: number | null = null;
 
+  // Session persistence (P6): survive restarts so a redeploy can't wipe a
+  // daily-loss halt (KaustubhPatange/polymarket-trade-engine early-bird
+  // pattern — refuse to trade into an already-blown session).
+  private static persistPath: string | null = null;
+
   constructor(config: Partial<RiskConfig> = {}, startingCapital = 1000) {
     this.config = { ...DEFAULT_RISK_CONFIG, ...config };
     this.startingCapital = startingCapital;
     this._peakCapital = startingCapital;
+  }
+
+  /**
+   * Enable cross-restart persistence. Call once at boot BEFORE any trading.
+   * Loads prior state (realizedPnl, peak, streaks, halt) if present, then
+   * re-checks halts: if the previous session already breached a limit, the
+   * bot stays halted after the restart.
+   */
+  static enablePersistence(path: string): void {
+    RiskManager.persistPath = path;
+  }
+
+  /** Load persisted state into this instance (no-op if none/enabled=false). */
+  loadPersistedState(): void {
+    const path = RiskManager.persistPath;
+    if (!path) return;
+    try {
+      if (!fs.existsSync(path)) return;
+      const raw = JSON.parse(fs.readFileSync(path, 'utf8'));
+      this._realizedPnl = typeof raw.realizedPnl === 'number' ? raw.realizedPnl : 0;
+      this._peakCapital = typeof raw.peakCapital === 'number'
+        ? Math.max(raw.peakCapital, this.startingCapital)
+        : this.startingCapital;
+      this._consecutiveLosses = raw.consecutiveLosses ?? 0;
+      this._consecutiveWins = 0;
+      this._sizeMultiplier = typeof raw.sizeMultiplier === 'number' ? raw.sizeMultiplier : 1.0;
+      this._haltedUntilMs = typeof raw.haltedUntilMs === 'number' ? raw.haltedUntilMs : null;
+      console.log(
+        `[RiskManager] restored session state: realizedPnl=${this._realizedPnl.toFixed(2)} ` +
+        `peak=${this._peakCapital.toFixed(2)} consecLosses=${this._consecutiveLosses}` +
+        (this.checkHalt() ? ` HALTED (${this.checkHalt()})` : '')
+      );
+    } catch (err) {
+      console.warn('[RiskManager] failed to load persisted state:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  /** Persist current state (atomic write: tmp + rename). */
+  persistState(): void {
+    const path = RiskManager.persistPath;
+    if (!path) return;
+    try {
+      const payload = JSON.stringify({
+        savedAt: Date.now(),
+        realizedPnl: this._realizedPnl,
+        peakCapital: this._peakCapital,
+        consecutiveLosses: this._consecutiveLosses,
+        sizeMultiplier: this._sizeMultiplier,
+        haltedUntilMs: this._haltedUntilMs,
+      });
+      const tmp = path + '.tmp';
+      fs.writeFileSync(tmp, payload, 'utf8');
+      fs.renameSync(tmp, path);
+    } catch (err) {
+      console.warn('[RiskManager] failed to persist state:', err instanceof Error ? err.message : err);
+    }
   }
 
   // ------------------------------------------------------------------------
@@ -184,8 +247,6 @@ export class RiskManager {
   recordTrade(t: TradeRecord): void {
     this.trades.push(t);
     this._realizedPnl += t.pnlUsd;
-
-    // Update peak (used for drawdown calc)
     const current = this.currentCapital();
     if (current > this._peakCapital) this._peakCapital = current;
 
@@ -217,6 +278,9 @@ export class RiskManager {
         );
       }
     }
+
+    // P6: persist after every settled trade so a restart can't wipe a halt.
+    this.persistState();
   }
 
   /**

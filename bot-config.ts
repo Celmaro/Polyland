@@ -429,7 +429,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.52,
     },
     {
       name: 'Sports Quorum',
@@ -438,7 +438,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.52,
     },
     {
       name: 'Politics Quorum',
@@ -447,7 +447,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.5,
     },
     {
       name: 'Esports Quorum',
@@ -456,7 +456,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.52,
     },
     {
       name: 'Economics Quorum',
@@ -465,7 +465,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.5,
     },
     {
       name: 'Entertainment Quorum',
@@ -474,7 +474,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.5,
     },
     {
       name: 'Science Quorum',
@@ -483,7 +483,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.5,
     },
     {
       name: 'Other Quorum',
@@ -492,7 +492,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       wallets: [],
       quorum: 3,
       windowMs: 30 * 60 * 1000,
-      winRate: 0.6,
+      winRate: 0.5,
     },
   ],
 };
@@ -550,6 +550,9 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     },
     CONFIG.capital.totalUsd,
   );
+  // P6: survive restarts — a redeploy must not wipe a breached halt.
+  RiskManager.enablePersistence('./data/risk-state.json');
+  risk.loadPersistedState();
 
   basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);
