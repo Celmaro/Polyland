@@ -48,11 +48,17 @@ export interface AntiSniperConfig {
 }
 
 export const DEFAULT_ANTI_SNIPER_CONFIG: AntiSniperConfig = {
-  midJumpThreshold: 0.03,         // 3% mid move in window = reject
-  midStableConfirmMs: 1_000,      // 1 second of stable mid
+  // Audit finding (16h prod run): mid_jump=1030 + mid_unstable=882 — the
+  // guard was blocking on the LEADER'S OWN market impact (their fill IS the
+  // jump we then refuse to follow). On 5m crypto books, mids legitimately
+  // reprice constantly. Relaxed: 8% jump threshold over 3s lookback,
+  // 500ms stability confirm. Still catches front-running bursts, no longer
+  // eats the signal we're copying.
+  midJumpThreshold: 0.08,         // was 0.03 — leader impact ≠ front-run
+  midStableConfirmMs: 500,        // was 1_000 — 5m books reprice fast
   fillCooldownMs: 5_000,          // 5 seconds between fills
   maxRepriceTicks: 2,             // max 2 ticks per re-quote
-  midJumpLookbackMs: 2_000,       // 2-second lookback for mid jumps
+  midJumpLookbackMs: 3_000,       // was 2_000 — wider lookback, fairer baseline
   midTickTolerance: 0.005,        // sub-half-tick moves = noise, not instability
 };
 
