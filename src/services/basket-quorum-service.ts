@@ -596,6 +596,16 @@ export class BasketQuorumService {
     const outcome = trade.outcome;
     if (!conditionId || !marketSlug || !outcome) return;
 
+    // L10: bounded staleness gate (qualiaenjoyer/polymarket-apis pattern).
+    // A backpressured handler queue must not turn old fills into fresh
+    // signals — a vote older than 2× the basket window is dropped, not
+    // processed. This bounds worst-case signal age.
+    const nowTs = Date.now();
+    if (trade.timestamp && nowTs - trade.timestamp > 2 * this.windowMs(categorizeMarket(marketSlug))) {
+      this.stats.quorumSkippedStaleMarket = (this.stats.quorumSkippedStaleMarket ?? 0) + 1;
+      return;
+    }
+
     // 1. Determine the governing basket by the market's category.
     //    We classify on the slug (words are in slugs, e.g. "will-btc-hit-100k").
     const category = categorizeMarket(marketSlug || outcome || '');
