@@ -57,6 +57,7 @@ export interface EdgeStats {
   isSignificant: boolean;     // true if edgeAlpha > 0 AND t-stat > bonferroni threshold
   tStat: number;
   clusterCount: number;       // number of distinct markets (for Bonferroni denom)
+  brierScore: number;         // PT2: mean (p̂ − outcome)² — lower = better calibrated (0 = perfect, 0.25 = coin flip)
 }
 
 interface SignalMap {
@@ -267,6 +268,7 @@ export class SignalAuditStore {
         isSignificant: false,
         tStat: 0,
         clusterCount: 0,
+        brierScore: 0,
       };
     }
 
@@ -289,6 +291,16 @@ export class SignalAuditStore {
     // Significance: positive alpha AND |tStat| exceeds critical value (~2 for N>30)
     const isSignificant = edgeAlpha > 0 && Math.abs(tStat) > 2.0;
 
+    // PT2 (CloddsBot): Brier score over settled signals. p̂ = implied prob of
+    // OUR side = pricePaid for BUY, 1-pricePaid for SELL. outcome = resolved.
+    // 0 = perfect calibration, 0.25 = coin flip, >0.25 = worse than guessing.
+    const brier = settled.map(s => {
+      const p = s.side === 'BUY' ? s.pricePaid : (1 - s.pricePaid);
+      const o = s.resolved ?? 0;
+      return (p - o) * (p - o);
+    });
+    const brierScore = arrMean(brier);
+
     return {
       signalsFired,
       signalsSettled,
@@ -300,6 +312,7 @@ export class SignalAuditStore {
       isSignificant,
       tStat: Math.round(tStat * 100) / 100,
       clusterCount: clusters.size,
+      brierScore: Math.round(brierScore * 10000) / 10000,
     };
   }
 
