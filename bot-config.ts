@@ -77,10 +77,10 @@ const CONFIG = {
       maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
       checkLastNTrades: 10,  // Analyze last 10 trades for consistency
 
-      sizeScale: 0.1,
+      sizeScale: 0.2,
       maxSizePerTrade: 15,
       maxSlippage: 0.03,
-      minTradeSize: 10,
+      minTradeSize: 5,
       delay: 500,
       // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
       customWallets: [
