@@ -295,6 +295,9 @@ export class ClobMarketWsService {
       if (!this.destroyed && !this.intentionallyClosed) {
         this.ws = null;  // force new connection
         this.connect();
+        // NOTE: onopen already re-sends the initial subscription for all
+        // subscribedAssets — no resubscribe needed here (double-subscribe
+        // would trigger slow-consumer disconnects).
       }
     }, this.reconnectDelayMs);
     // Full jitter backoff
