@@ -19,7 +19,7 @@ import {
   type SmartMoneyTrade,
   type BasketQuorumConfig,
 } from './src/index.js';
-import { signalAuditStore, setBonferroniGroups } from './src/services/signal-audit-store.js';
+import { signalAuditStore, SignalAuditStore, setBonferroniGroups } from './src/services/signal-audit-store.js';
 import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from './src/utils/anti-sniper.js';
 import { ChainlinkTwapOracle } from './src/services/chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './src/services/clob-market-ws.js';
@@ -553,6 +553,8 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   // P6: survive restarts — a redeploy must not wipe a breached halt.
   RiskManager.enablePersistence('./data/risk-state.json');
   risk.loadPersistedState();
+  // L11: JSONL audit trail — every fire/settlement persisted to disk.
+  SignalAuditStore.enableJsonl('./data/signal-audit.jsonl');
 
   basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);

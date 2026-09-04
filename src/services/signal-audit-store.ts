@@ -88,6 +88,29 @@ export class SignalAuditStore {
   private signals: SignalMap = {};
   private byConditionId: Map<string, string[]> = new Map(); // conditionId → signal ids
 
+  // L11: JSONL audit trail — every fire/settlement appends one line to disk
+  // so the full decision log survives restarts (OctagonAI/kalshi-bot pattern).
+  private static jsonlPath: string | null = null;
+
+  /** Enable JSONL audit logging. Call once at boot. */
+  static enableJsonl(path: string): void {
+    SignalAuditStore.jsonlPath = path;
+  }
+
+  private appendJsonl(event: string, data: Record<string, unknown>): void {
+    const path = SignalAuditStore.jsonlPath;
+    if (!path) return;
+    try {
+      // Lazy import keeps this file usable in browser/test contexts
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs = require('node:fs') as typeof import('node:fs');
+      const line = JSON.stringify({ ts: Date.now(), event, ...data }) + '\n';
+      fs.appendFileSync(path, line, 'utf8');
+    } catch {
+      // audit logging must never break trading
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Recording
   // --------------------------------------------------------------------------
@@ -133,6 +156,19 @@ export class SignalAuditStore {
     const list = this.byConditionId.get(params.conditionId) ?? [];
     list.push(id);
     this.byConditionId.set(params.conditionId, list);
+    this.appendJsonl('fire', {
+      id,
+      conditionId: params.conditionId,
+      marketSlug: params.marketSlug,
+      outcome: params.outcome,
+      side: params.side,
+      pricePaid: params.pricePaid,
+      size: params.size,
+      winRate: params.winRate,
+      expectedEdge,
+      basket: params.basket,
+      wallets: params.wallets,
+    });
     return id;
   }
 
@@ -166,6 +202,16 @@ export class SignalAuditStore {
       const grossPayout = s.size * payoutPerShare;
       const netPayout = grossPayout - (s.size * s.feePerShare);
       s.realizedEdge = netPayout - s.pricePaid * s.size; // net profit per share − cost
+      this.appendJsonl('settlement', {
+        id: s.id,
+        conditionId: s.conditionId,
+        marketSlug: s.marketSlug,
+        outcome: s.outcome,
+        side: s.side,
+        resolved,
+        realizedEdge: s.realizedEdge,
+        basket: s.basket,
+      });
     }
   }
 
@@ -183,6 +229,16 @@ export class SignalAuditStore {
     s.realizedEdge = netPayout - s.pricePaid * s.size;
     s.resolved = resolved;
     s.settledAt = Date.now();
+    this.appendJsonl('settlement', {
+      id: s.id,
+      conditionId: s.conditionId,
+      marketSlug: s.marketSlug,
+      outcome: s.outcome,
+      side: s.side,
+      resolved,
+      realizedEdge: s.realizedEdge,
+      basket: s.basket,
+    });
   }
 
   // --------------------------------------------------------------------------
