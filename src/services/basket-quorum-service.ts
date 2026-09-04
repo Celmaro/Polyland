@@ -1265,11 +1265,26 @@ export class BasketQuorumService {
 
     // 2. Feed settled P&L into the RiskManager — one recordTrade per newly
     //    settled signal. P&L per share (BUY): won → 1 - price; lost → -price.
+    //    Also release the position's USDC cost from the owning basket's
+    //    basketSpend — settled capital returns to the basket's slice, so a
+    //    basket that trades and settles keeps rotating instead of locking
+    //    up permanently (the 1149 bankroll blocks in the 16h audit).
     for (const sig of signals) {
       if (sig.settledAt === undefined) continue;
       const won = sig.resolved === 1;
       const perShare = won ? (1 - sig.pricePaid) : -sig.pricePaid;
       this.recordSettledTrade(perShare * sig.size, sig.settledAt, sig.side);
+
+      // Release the entry cost (cost basis = pricePaid × size) from basketSpend.
+      // Only for BUY-side signals — SELL signals never consumed slice budget.
+      if (sig.side === 'BUY') {
+        const basket = this.baskets.get(sig.basket as MarketCategory);
+        if (basket) {
+          const costBasis = sig.pricePaid * sig.size;
+          const spent = this.basketSpend.get(basket.category) ?? 0;
+          this.basketSpend.set(basket.category, Math.max(0, spent - costBasis));
+        }
+      }
     }
   }
 }
