@@ -569,12 +569,14 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
 
   // Wire anti-sniper guard (lihanyu81/polymarket_lp_tool pattern). Protects
   // against copy-sniping and thin-book fills. Configurable via env.
+  // Defaults match the 16h-audit relaxation in DEFAULT_ANTI_SNIPER_CONFIG
+  // (0.08/500ms/3s) — the leader's own fill IS the jump; don't block on it.
   const antiSniperConfig = {
-    midJumpThreshold: parseFloat(process.env.ANTI_SNIPER_MID_JUMP ?? '0.03'),
-    midStableConfirmMs: parseInt(process.env.ANTI_SNIPER_STABLE_MS ?? '1000', 10),
+    midJumpThreshold: parseFloat(process.env.ANTI_SNIPER_MID_JUMP ?? '0.08'),
+    midStableConfirmMs: parseInt(process.env.ANTI_SNIPER_STABLE_MS ?? '500', 10),
     fillCooldownMs: parseInt(process.env.ANTI_SNIPER_FILL_COOLDOWN_MS ?? '5000', 10),
     maxRepriceTicks: parseInt(process.env.ANTI_SNIPER_MAX_REPRICE_TICKS ?? '2', 10),
-    midJumpLookbackMs: parseInt(process.env.ANTI_SNIPER_LOOKBACK_MS ?? '2000', 10),
+    midJumpLookbackMs: parseInt(process.env.ANTI_SNIPER_LOOKBACK_MS ?? '3000', 10),
   };
   const antiSniper = new AntiSniperGuard(null, antiSniperConfig);
   basketQuorum.setAntiSniper(antiSniper);
