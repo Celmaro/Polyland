@@ -1005,19 +1005,6 @@ export class BasketQuorumService {
       totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
     };
 
-    // Record the fire in SignalAuditStore (price calibration + fee math done inside)
-    signalAuditStore.recordFire({
-      conditionId,
-      marketSlug,
-      outcome,
-      side: 'BUY',
-      pricePaid: consensusPrice,
-      size: signal.totalSize,
-      winRate: basket.winRate ?? 0.6,
-      basket: basket.name,
-      wallets: signal.wallets,
-    });
-
     // Schedule 1h and 24h follow-up price checks (whalewatch-style validation loop)
     this._scheduleFollowup(signal);
 
@@ -1282,6 +1269,21 @@ export class BasketQuorumService {
           basket.category,
           (this.basketSpend.get(basket.category) ?? 0) + usdcAmount,
         );
+        // Record the fire in SignalAuditStore — POST-gates, at OUR copy size
+        // (not the whales' totalSize). Every settlement of this signal then
+        // feeds RiskManager/display PnL in magnitudes we actually trade, and
+        // [edge] measures executed trades instead of hypotheticals.
+        signalAuditStore.recordFire({
+          conditionId: signal.conditionId,
+          marketSlug: signal.marketSlug,
+          outcome: signal.outcome,
+          side: 'BUY',
+          pricePaid: signal.consensusPrice,
+          size: copySize,
+          winRate: basket.winRate ?? 0.6,
+          basket: basket.name,
+          wallets: signal.wallets,
+        });
         // L1: track the position so the exit ladder can manage it.
         if (trade.tokenId) {
           this.trackOpenPosition(

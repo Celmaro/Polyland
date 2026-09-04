@@ -189,6 +189,25 @@ export class RiskManager {
       this._peakCapital = typeof raw.peakCapital === 'number'
         ? Math.max(raw.peakCapital, this.startingCapital)
         : this.startingCapital;
+      // Phantom-scale guard: the pre-fix audit store fed RiskManager PnL at
+      // whale size (totalSize), producing daily/drawdown percentages >100%
+      // that can't correspond to real capital. Such state is invalid — reset
+      // instead of inheriting a permanent phantom halt.
+      const dailyAbs = Math.abs(this._realizedPnl) / this.startingCapital;
+      if (dailyAbs > 0.5) {
+        console.warn(
+          `[RiskManager] persisted realizedPnl=${this._realizedPnl.toFixed(2)} exceeds 50% of ` +
+          `starting capital (${this.startingCapital}) — phantom-scale state from the ` +
+          `pre-fix fire sizing; resetting risk state`
+        );
+        this._realizedPnl = 0;
+        this._peakCapital = this.startingCapital;
+        this._consecutiveLosses = 0;
+        this._sizeMultiplier = 1.0;
+        this._haltedUntilMs = null;
+        this.persistState();
+        return;
+      }
       this._consecutiveLosses = raw.consecutiveLosses ?? 0;
       this._consecutiveWins = 0;
       this._sizeMultiplier = typeof raw.sizeMultiplier === 'number' ? raw.sizeMultiplier : 1.0;
