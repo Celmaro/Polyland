@@ -160,17 +160,18 @@ export class GammaResolutionPoller {
       const clobClosed = market.closed === true;
 
       if (!clobClosed) {
-        // Fallback: ask Gamma for the event-market state.
+        // Fallback: Gamma event-market state. NOTE: use getEventBySlug
+        // (/events?slug=) — /markets?slug= is FLAKY for recurring 5m markets
+        // (returns [] intermittently, verified in prod), while /events?slug=
+        // is reliable and embeds the same market object.
         try {
-          const gmk = await this.gamma.getMarketBySlug(marketSlug);
+          const event = await this.gamma.getEventBySlug(marketSlug);
+          const gmk = event?.markets?.[0];
           if (!gmk) { notResolved++; continue; }
-          const graw = gmk as unknown as Record<string, unknown>;
-          const gClosed = graw.closed === true;
-          const gPrices: number[] = (gmk.outcomePrices ?? []).map(Number);
-          const gOutcomes: string[] = (gmk.outcomes ?? []);
-          // Gamma prices [0.9995, 0.0005] or [1,0] both count as resolved
+          const gClosed = gmk.closed === true;
+          const gPrices: number[] = gmk.outcomePrices ?? [];
+          const gOutcomes: string[] = gmk.outcomes ?? [];
           const maxP = gPrices.length ? Math.max(...gPrices) : 0;
-          const minP = gPrices.length ? Math.min(...gPrices) : 1;
           if (!gClosed || maxP < 0.99) { notResolved++; continue; }
           const winnerIdx = gPrices.indexOf(maxP);
           const winningOutcome = gOutcomes[winnerIdx];
