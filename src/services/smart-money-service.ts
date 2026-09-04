@@ -700,6 +700,10 @@ export class SmartMoneyService {
 
   private smartMoneyCache: Map<string, SmartMoneyWallet> = new Map();
   private smartMoneySet: Set<string> = new Set();
+
+  // L7: tx-hash dedup (bounded) — prevents replayed activity entries
+  // from double-counting votes / double-copying.
+  private seenTxHashes: Set<string> = new Set();
   private cacheTimestamp: number = 0;
 
   private activeSubscription: { unsubscribe: () => void } | null = null;
@@ -859,6 +863,24 @@ export class SmartMoneyService {
     if (!rawAddress) return;
 
     const traderAddress = rawAddress.toLowerCase();
+
+    // L7: tx-level dedup (chaoleiyv/polymarket-whale-watcher pattern).
+    // The data-api activity feed can replay the same on-chain fill (poller
+    // overlap, reconnect backfill). One tx = one handler pass, ever.
+    if (trade.transactionHash) {
+      const txKey = trade.transactionHash.toLowerCase();
+      if (this.seenTxHashes.has(txKey)) return;
+      this.seenTxHashes.add(txKey);
+      // Bounded: keep the newest 20k tx hashes.
+      if (this.seenTxHashes.size > 20_000) {
+        const it = this.seenTxHashes.values();
+        for (let i = 0; i < 2_000; i++) {
+          const oldest = it.next().value;
+          if (oldest === undefined) break;
+          this.seenTxHashes.delete(oldest);
+        }
+      }
+    }
 
     // Address filter
     if (options.filterAddresses && options.filterAddresses.length > 0) {
