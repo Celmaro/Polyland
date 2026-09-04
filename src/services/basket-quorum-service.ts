@@ -911,7 +911,6 @@ export class BasketQuorumService {
     }
 
     // 8. Size & execute, reusing the repo's existing sizing/slippage logic.
-    this.stats.quorumFired++;
     try {
       // Shares to copy = TOTAL agreeing shares scaled by sizeScale.
       let copySize = signal.totalSize * this.config.sizeScale;
@@ -1027,6 +1026,7 @@ export class BasketQuorumService {
       }
 
       if (result.success) {
+        this.stats.quorumFired++;
         this.stats.executed++;
         this.basketSpend.set(
           basket.category,
