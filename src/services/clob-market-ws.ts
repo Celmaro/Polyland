@@ -244,6 +244,17 @@ export class ClobMarketWsService {
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
+          // L12: dead-feed detection (qualiaenjoyer/polymarket-apis pattern).
+          // TCP can stay open while the server stops streaming data (half-open
+          // proxy, stuck upstream). PONG replies are our liveness signal: if
+          // none seen for 3 consecutive ping intervals (30s), force-close so
+          // the normal reconnect ladder takes over.
+          if (this.pingPongSeenAt > 0 && Date.now() - this.pingPongSeenAt > 30_000) {
+            console.warn('[ClobMarketWs] no PONG for 30s — force-closing dead feed');
+            this.pingPongSeenAt = Date.now(); // reset so we only fire once per window
+            try { this.ws.close(4000, 'stale'); } catch { /* already closing */ }
+            return;
+          }
           this.ws.send('PING');
         }
       }, 10_000);
