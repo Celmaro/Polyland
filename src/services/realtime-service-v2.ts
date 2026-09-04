@@ -1051,6 +1051,19 @@ export class RealtimeServiceV2 extends EventEmitter {
   }
 
   private handleActivityMessage(type: string, payload: Record<string, unknown>, timestamp: number): void {
+    // PT6: skip neg-risk conversion events (leolopez007/polymarket-trade-tracker).
+    // 'orders_matched' events for neg-risk conversions are mechanical share
+    // conversions, not genuine directional entries — counting them inflates
+    // activity-based wallet metrics and can forge fake quorum votes.
+    if (type === 'orders_matched') {
+      const price = Number(payload.price) || 0;
+      const size = Number(payload.size) || 0;
+      // Heuristic (trade-tracker neg_risk.py): conversions print at exactly
+      // $0.50 on both sides with matched sizes across paired outcomes.
+      if (price === 0.5 && size > 0 && (payload.side === undefined || payload.side === '')) {
+        return; // mechanical conversion, not a trade
+      }
+    }
     const trade: ActivityTrade = {
       asset: payload.asset as string || '',
       conditionId: payload.conditionId as string || '',
