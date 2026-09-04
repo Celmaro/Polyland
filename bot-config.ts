@@ -565,7 +565,9 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
 
   basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);
-  // L1: start the exit ladder (no-op in DRY-RUN — no real positions).
+  // L1: start the exit ladder. In DRY-RUN it runs in simulation mode —
+  // same triggers, no orders, exits logged to the audit trail so paper
+  // results measure the strategy we actually run (item 1).
   basketQuorum.startExitLadder();
   // Settled PnL -> BotState so the [risk] display line reflects reality.
   basketQuorum.onSettledTrade = (pnlUsd: number) => recordTrade(pnlUsd, 'smartMoney');

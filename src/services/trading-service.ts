@@ -663,6 +663,30 @@ export class TradingService {
     return this.initialized;
   }
 
+  /**
+   * Unauthenticated order-book fetch (public CLOB endpoint, no API key or
+   * wallet required). Used by the DRY-RUN exit simulation: the authenticated
+   * client cannot initialize without an API key, but price discovery for
+   * paper exits needs the live best bid.
+   */
+  async getPublicOrderBook(tokenId: string): Promise<{
+    bids: { price: string; size: string }[];
+    asks: { price: string; size: string }[];
+  } | null> {
+    try {
+      const url = `${CLOB_HOST}/book?token_id=${encodeURIComponent(tokenId)}`;
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const raw = (await res.json()) as { bids?: unknown[]; asks?: unknown[] };
+      return {
+        bids: (raw?.bids ?? []) as { price: string; size: string }[],
+        asks: (raw?.asks ?? []) as { price: string; size: string }[],
+      };
+    } catch {
+      return null;
+    }
+  }
+
   getClobClient(): ClobClient | null {
     return this.clobClient;
   }

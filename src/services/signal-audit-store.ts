@@ -42,6 +42,9 @@ export interface FiredSignal {
   settledAt?: number;   // unix ms, set on settlement
   realizedEdge?: number; // actual payout − price − fee (computed on settlement)
   resolved?: number;     // 0 or 1, Polymarket resolution
+  exitedAt?: number;     // unix ms — position closed early by the exit ladder
+  exitPrice?: number;    // best bid at exit
+  exitReason?: string;   // EDGE_TP | LATE_TP | EMERGENCY | REVERSE_QUORUM | MIRROR_EXIT | KILL_SWITCH
   cluster: string;       // = conditionId for clustering
 }
 
@@ -98,7 +101,7 @@ export class SignalAuditStore {
     SignalAuditStore.jsonlPath = path;
   }
 
-  private appendJsonl(event: string, data: Record<string, unknown>): void {
+  appendJsonl(event: string, data: Record<string, unknown>): void {
     const path = SignalAuditStore.jsonlPath;
     if (!path) return;
     try {
@@ -240,6 +243,44 @@ export class SignalAuditStore {
       realizedEdge: s.realizedEdge,
       basket: s.basket,
     });
+  }
+
+  /**
+   * Mark the signal(s) behind an early exit (exit ladder / reverse-quorum /
+   * kill-switch force-close). The signal is settled AT the exit price — not
+   * at resolution — so realized edge and P&L reflect the exit decision and
+   * the market's later resolution does NOT double-count it (settledAt set).
+   *
+   * realized_edge = (exitPrice − pricePaid − fee) * size for BUY exits.
+   */
+  markExited(
+    conditionId: string, exitPrice: number, reason: string, outcome?: string,
+  ): void {
+    const ids = this.byConditionId.get(conditionId) ?? [];
+    for (const id of ids) {
+      const s = this.signals[id];
+      if (!s || s.settledAt) continue;             // already settled by resolution
+      if (outcome && s.outcome !== outcome) continue; // only the exited side
+      const perShare = s.side === 'BUY'
+        ? exitPrice - s.pricePaid - s.feePerShare
+        : s.pricePaid - exitPrice - s.feePerShare;
+      s.realizedEdge = perShare * s.size;
+      s.resolved = exitPrice >= 0.5 ? 1 : 0;       // bookkeeping only
+      s.settledAt = Date.now();
+      s.exitedAt = Date.now();
+      s.exitPrice = exitPrice;
+      s.exitReason = reason;
+      this.appendJsonl('exit_settled', {
+        id: s.id,
+        conditionId: s.conditionId,
+        marketSlug: s.marketSlug,
+        outcome: s.outcome,
+        exitPrice,
+        reason,
+        realizedEdge: s.realizedEdge,
+        basket: s.basket,
+      });
+    }
   }
 
   // --------------------------------------------------------------------------

@@ -730,23 +730,26 @@ export class BasketQuorumService {
   //     Exits run on a 15s interval over openPositions (tokenId -> cost).
   // ==========================================================================
 
-  /** Open copy positions: tokenId -> { usdc, size, price, slug, outcome, ts } */
+  /** Open copy positions: tokenId -> entry state + quorum linkage. */
   private openPositions: Map<string, {
     usdc: number; size: number; entryPrice: number;
     marketSlug: string; outcome: string; firedAt: number;
+    conditionId: string; basketName: string; basketCategory: MarketCategory;
+    signalId?: string; quorumWallets?: string[];
   }> = new Map();
 
   private exitTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Start the exit ladder loop (15s). Idempotent. */
   startExitLadder(): void {
-    if (this.exitTimer || this.config.dryRun) return; // DRY-RUN: no real orders
+    if (this.exitTimer) return;
+    // Items 1–4: one unified pass handles both live and DRY-RUN exits.
     this.exitTimer = setInterval(() => {
       this.runExitPass().catch((err) => {
         console.warn('[BasketQuorum][exit] pass error:', err instanceof Error ? err.message : err);
       });
     }, 15_000);
-    console.log('[BasketQuorum][exit] ladder started (15s interval)');
+    console.log(`[BasketQuorum][exit] ladder started (15s interval${this.config.dryRun ? ', DRY-RUN simulation' : ''})`);
   }
 
   stopExitLadder(): void {
@@ -760,60 +763,148 @@ export class BasketQuorumService {
   private trackOpenPosition(
     tokenId: string, usdc: number, size: number, entryPrice: number,
     marketSlug: string, outcome: string,
+    conditionId: string, basketName: string, basketCategory: MarketCategory,
+    signalId?: string, quorumWallets?: string[],
   ): void {
-    this.openPositions.set(tokenId, { usdc, size, entryPrice, marketSlug, outcome, firedAt: Date.now() });
+    this.openPositions.set(tokenId, {
+      usdc, size, entryPrice, marketSlug, outcome, firedAt: Date.now(),
+      conditionId, basketName, basketCategory, signalId, quorumWallets,
+    });
   }
 
+  /**
+   * Unified exit pass — items 1–5 of the exit rework.
+   *
+   * Trigger precedence (first match wins):
+   *   5. KILL_SWITCH    — basket suspended by PT4: force-exit at market
+   *   2. REVERSE_QUORUM — ≥ N quorum wallets flipped to the opposite outcome
+   *   3. EDGE_TP        — bestBid ≥ basket.winRate − feeBuffer (converged to
+   *                       our own probability estimate; primary TP)
+   *   4. LATE_TP        — bestBid ≥ 0.96 (sanity clamp; catches stale winRate)
+   *   6. EMERGENCY      — < 30s to expiry: force-sell at best bid
+   *
+   * LIVE: places a FAK SELL at best bid, records PnL, marks the audit signal
+   * exited (so resolution doesn't double-count).
+   * DRY-RUN: identical triggers/decisions, no order — logs `exit_simulated`
+   * to the JSONL trail so paper measures the strategy we actually run.
+   */
   private async runExitPass(): Promise<void> {
     if (this.openPositions.size === 0) return;
-    const LATE_TP_PRICE = 0.96;   // sell when the market has converged
+    const LATE_TP_PRICE = 0.96;
+    const EDGE_TP_FEE_BUFFER = 0.01;   // winRate − 1c ≈ fee + a little
+    const REVERSE_QUORUM_MIN = 2;      // ≥2 of the entry quorum flipped
     const EMERGENCY_WINDOW_MS = 30_000;
 
     for (const [tokenId, pos] of [...this.openPositions]) {
       try {
         const endMs = this._inferMarketEndMs(pos.marketSlug);
         const msToEnd = endMs ? endMs - Date.now() : Number.POSITIVE_INFINITY;
-
-        // Emergency exit: expiry < 30s — sell at best bid regardless of price.
         const emergency = msToEnd < EMERGENCY_WINDOW_MS;
 
-        // Current price from the order book (best bid for our SELL side).
-        const book = await this.tradingService.getOrderBook(tokenId);
+        const basket = this.baskets.get(pos.basketCategory);
+        const killed = this.riskManager?.isBasketKilled(pos.basketName) ?? false;
+
+        // Book fetch: public endpoint in DRY-RUN (no auth needed),
+        // authenticated client otherwise.
+        const book = this.config.dryRun
+          ? await this.tradingService.getPublicOrderBook(tokenId)
+          : await this.tradingService.getOrderBook(tokenId);
         if (!book) continue;
         const bestBid = book.bids.length > 0 ? parseFloat(book.bids[0].price) : 0;
         if (bestBid <= 0) continue;
 
-        if (!emergency && bestBid < LATE_TP_PRICE) continue;
+        // --- trigger evaluation -------------------------------------------------
+        let reason: string | null = null;
+
+        if (killed) {
+          reason = 'KILL_SWITCH';
+        } else if (emergency) {
+          reason = 'EMERGENCY';
+        } else if (
+          pos.quorumWallets && pos.quorumWallets.length > 0 &&
+          this._countReverseQuorum(pos) >= REVERSE_QUORUM_MIN
+        ) {
+          reason = 'REVERSE_QUORUM';
+        } else if (basket && bestBid >= basket.winRate - EDGE_TP_FEE_BUFFER) {
+          reason = 'EDGE_TP';
+        } else if (bestBid >= LATE_TP_PRICE) {
+          reason = 'LATE_TP';
+        }
+        if (!reason) continue;
+        // ------------------------------------------------------------------------
 
         const sellSize = pos.size;
         if (sellSize <= 0) { this.openPositions.delete(tokenId); continue; }
 
-        console.log(
-          `[BasketQuorum][exit] ${emergency ? 'EMERGENCY' : 'TP'} sell ${pos.marketSlug} ` +
-          `${pos.outcome}: entry=${pos.entryPrice.toFixed(3)} bid=${bestBid.toFixed(3)} ` +
-          `size=${sellSize.toFixed(1)}`
-        );
+        const pnl = (bestBid - pos.entryPrice) * sellSize;
 
-        const result = await this.tradingService.createMarketOrder({
-          tokenId,
-          side: 'SELL',
-          amount: sellSize,                 // SELL: amount = shares
-          price: bestBid,                   // FAK at best bid (worst-price clamp: alpha-bot pattern)
-          orderType: 'FAK',
-        });
-
-        if (result.success) {
-          const pnl = (bestBid - pos.entryPrice) * sellSize;
-          this.recordSettledTrade(pnl, Date.now(), 'SELL');
-          this.openPositions.delete(tokenId);
-          console.log(`[BasketQuorum][exit] sold ${pos.marketSlug} pnl=$${pnl.toFixed(2)}`);
+        if (this.config.dryRun) {
+          console.log(
+            `[BasketQuorum][exit] DRY RUN ${reason} sell ${pos.marketSlug} ` +
+            `${pos.outcome}: entry=${pos.entryPrice.toFixed(3)} bid=${bestBid.toFixed(3)} ` +
+            `size=${sellSize.toFixed(1)} pnl=$${pnl.toFixed(2)}`
+          );
+          signalAuditStore.appendJsonl('exit_simulated', {
+            tokenId,
+            conditionId: pos.conditionId,
+            marketSlug: pos.marketSlug,
+            outcome: pos.outcome,
+            entryPrice: pos.entryPrice,
+            exitPrice: bestBid,
+            size: sellSize,
+            pnl,
+            reason,
+            firedAt: pos.firedAt,
+          });
         } else {
-          console.warn(`[BasketQuorum][exit] sell failed: ${result.errorMsg}`);
+          console.log(
+            `[BasketQuorum][exit] ${reason} sell ${pos.marketSlug} ` +
+            `${pos.outcome}: entry=${pos.entryPrice.toFixed(3)} bid=${bestBid.toFixed(3)} ` +
+            `size=${sellSize.toFixed(1)}`
+          );
+          const result = await this.tradingService.createMarketOrder({
+            tokenId,
+            side: 'SELL',
+            amount: sellSize,                 // SELL: amount = shares
+            price: bestBid,                   // FAK at best bid (worst-price clamp)
+            orderType: 'FAK',
+          });
+          if (!result.success) {
+            console.warn(`[BasketQuorum][exit] sell failed: ${result.errorMsg}`);
+            continue;
+          }
         }
+
+        // Shared post-exit bookkeeping (both modes).
+        this.recordSettledTrade(pnl, Date.now(), 'SELL');
+        signalAuditStore.markExited(pos.conditionId, bestBid, reason, pos.outcome);
+        this.openPositions.delete(tokenId);
+        // Release the cost basis back to the basket slice (same as resolution).
+        const spent = this.basketSpend.get(pos.basketCategory) ?? 0;
+        this.basketSpend.set(pos.basketCategory, Math.max(0, spent - pos.usdc));
       } catch (err) {
         console.warn('[BasketQuorum][exit] position error:', err instanceof Error ? err.message : err);
       }
     }
+  }
+
+  /**
+   * Item 2: count how many of the position's original quorum wallets have
+   * since voted BUY on the OPPOSITE outcome of the same market, or SELLed
+   * the same outcome (mirror signal, deduped per wallet).
+   */
+  private _countReverseQuorum(pos: { conditionId: string; outcome: string; quorumWallets?: string[] }): number {
+    if (!pos.quorumWallets || pos.quorumWallets.length === 0) return 0;
+    const flipped = new Set<string>();
+    for (const wallet of pos.quorumWallets) {
+      // Opposite-outcome BUY votes (recorded in the other outcome's vote map).
+      for (const [outcomeName, byWallet] of this.votes.get(pos.conditionId) ?? []) {
+        if (outcomeName === pos.outcome) continue;
+        const vote = byWallet.get(wallet);
+        if (vote && vote.side === 'BUY') flipped.add(wallet);
+      }
+    }
+    return flipped.size;
   }
 
   private getVoteMap(
@@ -1200,6 +1291,11 @@ export class BasketQuorumService {
             signal.consensusPrice,
             signal.marketSlug,
             signal.outcome,
+            signal.conditionId,
+            signal.basketName,
+            signal.category,
+            signal.signalId,
+            signal.wallets,
           );
         }
         // Persist dedup so we skip this market+outcome on restart.
