@@ -319,7 +319,7 @@ export class RiskManager {
     const sigma = this.config.basketKillSigma ?? 2.0;
     if (!this.killedBaskets.has(basketName) && list.length >= minN) {
       const n = list.length;
-      const mean = list.reduce((a, b) => a + b, 0) / n;
+      const mean = list.reduce((a: number, b) => a + b, 0 as number) / n;
       // Binomial std-dev of the win-rate estimator under the fair-coin null
       // (p=0.5): sigma = sqrt(0.25/n). Divergence >= sigma * sigmaThresh
       // below 0.5 means the basket is significantly WORSE than a coin flip.
