@@ -34,6 +34,7 @@ interface ClobMarketResponse {
   active: boolean;
   accepting_orders: boolean;
   end_date_iso?: string;
+  market_slug?: string;
   tokens?: ClobMarketToken[];
 }
 
@@ -144,13 +145,43 @@ export class GammaResolutionPoller {
         continue;
       }
       const market = result.value;
+      const marketSlug = market.market_slug ?? '';
 
-      // Check if market is resolved: CLOB uses closed field
-      const isClosed = market.closed === true;
+      // Settlement detection — two sources, because their `closed` semantics lag
+      // differently:
+      //   1. CLOB /markets/{cid}.closed — flips when the market fully stops
+      //      accepting orders. This can LAG Gamma by several minutes after
+      //      expiry while the UMA resolution finalizes (verified in prod:
+      //      xrp-updown-5m-1788501900 resolved on Gamma at prices [1,0] while
+      //      CLOB still reported closed=False).
+      //   2. Gamma /events?slug={slug}.markets[0] — `closed=true` with
+      //      outcomePrices ["1","0"] or ["0","1"] is the earlier resolution
+      //      signal. We only use it when CLOB says open but past expiry.
+      const clobClosed = market.closed === true;
 
-      if (!isClosed) {
-        notResolved++;
-        continue;
+      if (!clobClosed) {
+        // Fallback: ask Gamma for the event-market state.
+        try {
+          const gmk = await this.gamma.getMarketBySlug(marketSlug);
+          if (!gmk) { notResolved++; continue; }
+          const graw = gmk as unknown as Record<string, unknown>;
+          const gClosed = graw.closed === true;
+          const gPrices: number[] = (gmk.outcomePrices ?? []).map(Number);
+          const gOutcomes: string[] = (gmk.outcomes ?? []);
+          // Gamma prices [0.9995, 0.0005] or [1,0] both count as resolved
+          const maxP = gPrices.length ? Math.max(...gPrices) : 0;
+          const minP = gPrices.length ? Math.min(...gPrices) : 1;
+          if (!gClosed || maxP < 0.99) { notResolved++; continue; }
+          const winnerIdx = gPrices.indexOf(maxP);
+          const winningOutcome = gOutcomes[winnerIdx];
+          this.quorum.handleMarketResolved(conditionIds[i], winningOutcome, gPrices);
+          settled++;
+          continue;
+        } catch (gErr) {
+          console.warn(`[ResolutionPoller] gamma fallback failed for ${conditionIds[i].slice(0, 10)}: ${gErr instanceof Error ? gErr.message : gErr}`);
+          notResolved++;
+          continue;
+        }
       }
 
       // Determine winning outcome from tokens (authoritative winner flag)
