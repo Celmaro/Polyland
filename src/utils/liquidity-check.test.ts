@@ -100,15 +100,16 @@ describe('buildOrderBookSummary', () => {
           { price: '0.60', size: '200' }, // $120
         ],
       });
-      // Need 200 shares * 0.50 = $100, * 2 = $200
-      // Available: 50 + 100 + 200 = 350 shares, $25 + $55 + $120 = $200
+      // The actual 200-share fill crosses levels: $25 + $55 + $30 = $110;
+      // the 2x requirement is $220, while the complete book has $200.
+      // The price-aware check must reject this thin book.
       const result = summary.hasSufficientLiquidity({
         side: 'BUY',
         shares: 200,
         price: 0.5,
         multiplier: 2,
       });
-      expect(result.ok).toBe(true);
+      expect(result.ok).toBe(false);
       expect(result.unfilledShares).toBe(0);
     });
 

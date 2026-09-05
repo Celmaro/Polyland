@@ -108,6 +108,9 @@ export class VoteStateStore {
       for (const [key, ts] of Object.entries(parsed.lastProcessedFire ?? {})) {
         this._lastProcessedFire.set(key, ts);
       }
+      // Drop stale persisted votes and old dedup entries before exposing state.
+      this.pruneStale(2 * 60 * 60 * 1000);
+      this.pruneLastProcessedFire(7 * 24 * 60 * 60 * 1000);
     } catch (err) {
       console.warn(
         `[VoteStateStore] load failed:`,
@@ -118,6 +121,8 @@ export class VoteStateStore {
 
   /** Save to disk atomically (write tmp, rename). */
   async save(): Promise<void> {
+    this.pruneStale(2 * 60 * 60 * 1000);
+    this.pruneLastProcessedFire(7 * 24 * 60 * 60 * 1000);
     const dir = dirname(this.filePath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });

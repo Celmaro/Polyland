@@ -215,6 +215,9 @@ export class BasketQuorumService {
   /** conditionId:outcome -> last fired timestamp (cooldown/one-shot) */
   private lastFired = new Map<string, number>();
 
+  /** tokenId -> freshest live mid observation {price, ts} fed via observeMid(). */
+  private liveMid = new Map<string, { price: number; ts: number }>();
+
   /** conditionId:outcome -> last near-miss diagnostic log timestamp */
   private nearMissLogAt = new Map<string, number>();
 
@@ -261,6 +264,12 @@ export class BasketQuorumService {
   private tickSizeCache: Map<string, number> = new Map();
   /** Per-conditionId last TWAP evaluation result (debug + audit). */
   private lastTwapEval: Map<string, TwapSignalEvaluation> = new Map();
+  /** Parallel write timestamps for fee/tick/TWAP caches (1h prune TTLs). */
+  private feeRateCacheTs = new Map<string, number>();
+  private tickSizeCacheTs = new Map<string, number>();
+  private lastTwapEvalTs = new Map<string, number>();
+  /** Trade counter driving the amortized pruneStaleState() cadence. */
+  private _pruneTradeCount = 0;
   /**
    * Per-category specialization thresholds used by seed() to decide which
    * basket(s) a wallet joins. Mirrors WalletScreeningConfig so both gates
@@ -347,6 +356,10 @@ export class BasketQuorumService {
    */
   observeMid(tokenId: string, mid: number): void {
     this.antiSniper?.observe(tokenId, mid);
+    // Keep a live mid snapshot with timestamp for the drift check, so a
+    // market that moved between votes is caught even if the vote fill
+    // prices look flat (fix: drift used the last vote's fill price).
+    this.liveMid.set(tokenId, { price: mid, ts: Date.now() });
   }
 
   /**
@@ -540,6 +553,12 @@ export class BasketQuorumService {
     }
 
     // Rebuild baskets Map using existing config defaults.
+    // FIRST seed only: baskets were empty before, so there is no prior state
+    // to preserve — drop votes/dedup/cooldown/spend. On REFRESH seeds (the
+    // periodic wallet re-screen) baskets already exist: swap the wallet lists
+    // WITHOUT touching _lastProcessedFire/lastFired, or an already-executed
+    // market would re-fire after every 6h refresh (double-execution bug).
+    const firstSeed = this.baskets.size === 0;
     this.baskets.clear();
     for (const [category, wallets] of byCategory) {
       this.baskets.set(category, {
@@ -553,14 +572,16 @@ export class BasketQuorumService {
       });
     }
 
-    // Drop any prior vote state — baskets changed.
+    // Drop prior vote state ONLY on the first seed (see firstSeed above).
     // (walletTierMap was already cleared at the top of seed(); do NOT clear
     // it here or the tiers populated above are wiped — the PRIMARY=0 bug.)
-    this.votes.clear();
-    this.lastFired.clear();
-    this.nearMissLogAt.clear();
-    this._lastProcessedFire.clear();
-    this.basketSpend.clear();
+    if (firstSeed) {
+      this.votes.clear();
+      this.lastFired.clear();
+      this.nearMissLogAt.clear();
+      this._lastProcessedFire.clear();
+      this.basketSpend.clear();
+    }
     this._schedulePersist();
     const summary = [...byCategory.entries()]
       .map(([c, ws]) => c + '=' + ws.length)
@@ -596,6 +617,23 @@ export class BasketQuorumService {
     const outcome = trade.outcome;
     if (!conditionId || !marketSlug || !outcome) return;
 
+    // A SELL from a tracked wallet is a vote for the opposite binary outcome.
+    // Normalize it before recording so reverse-quorum logic can see flips.
+    let voteOutcome = outcome;
+    let votePrice = trade.price;
+    let voteSide: 'BUY' | 'SELL' = trade.side;
+    if (trade.side === 'SELL') {
+      const lower = outcome.toLowerCase();
+      if (lower === 'yes') voteOutcome = 'No';
+      else if (lower === 'no') voteOutcome = 'Yes';
+      else return; // Do not guess the opposite of a non-binary label.
+      votePrice = 1 - trade.price;
+      voteSide = 'BUY';
+    }
+
+    this._pruneTradeCount++;
+    if (this._pruneTradeCount % 100 === 0) this.pruneStaleState();
+
     // L10: bounded staleness gate (qualiaenjoyer/polymarket-apis pattern).
     // A backpressured handler queue must not turn old fills into fresh
     // signals — a vote older than 2× the basket window is dropped, not
@@ -621,12 +659,12 @@ export class BasketQuorumService {
 
     // 3. Only BUY votes contribute to a buy-consensus we act on. (SELL votes
     //    are recorded but not counted toward firing, so we can see counter-flow.)
-    if (trade.side !== 'BUY') return;
+    // SELL votes were normalized above; unsupported labels returned early.
 
     const now = Date.now();
 
     // 4. Prune stale votes in THIS market/outcome (rolling window).
-    const outcomeVotes = this.getVoteMap(conditionId, outcome);
+    const outcomeVotes = this.getVoteMap(conditionId, voteOutcome);
     for (const [wallet, vote] of outcomeVotes) {
       if (now - vote.timestamp > this.windowMs(category)) {
         outcomeVotes.delete(wallet);
@@ -652,8 +690,8 @@ export class BasketQuorumService {
     const walletTier = this.walletTierMap.get(traderKey) ?? 'SATELLITE';
     outcomeVotes.set(traderKey, {
       wallet: traderKey,
-      side: trade.side,
-      price: trade.price,
+      side: voteSide,
+      price: votePrice,
       size: trade.size,
       timestamp: now,
       tier: walletTier,
@@ -664,7 +702,7 @@ export class BasketQuorumService {
     this._schedulePersist();
 
     // 7. Evaluate quorum.
-    this.tryFire({ ...trade, conditionId, marketSlug, outcome }, basket, outcomeVotes);
+    this.tryFire({ ...trade, conditionId, marketSlug, outcome: voteOutcome, side: voteSide, price: votePrice }, basket, outcomeVotes);
   }
 
   /**
@@ -693,6 +731,11 @@ export class BasketQuorumService {
     // Look for "on-<month>-<day>-<year>" pattern in the slug, which is how
     // Polymarket titles resolved markets (e.g. "highest-temperature-in-nyc-on-march-15-2026").
     const m = haystack.match(/on-([a-z]+)-(\d{1,2})-(\d{4})/);
+    const epoch = haystack.match(/-(\d{10,})$/);
+    if (!m && epoch) {
+      const expiry = Number(epoch[1]) * (epoch[1].length >= 13 ? 1 : 1000);
+      return Number.isFinite(expiry) && expiry < Date.now();
+    }
     if (!m) return false;
     const monthNames = [
       'january', 'february', 'march', 'april', 'may', 'june',
@@ -907,6 +950,27 @@ export class BasketQuorumService {
     return flipped.size;
   }
 
+  /** Amortized cleanup for long-running deployments. */
+  private pruneStaleState(): void {
+    const now = Date.now();
+    const maxWindow = Math.max(this.config.defaultWindowMs, ...[...this.baskets.values()].map(b => b.windowMs));
+    for (const [conditionId, byOutcome] of this.votes) {
+      for (const [outcome, byWallet] of byOutcome) {
+        for (const [wallet, vote] of byWallet) {
+          if (now - vote.timestamp > maxWindow * 2) byWallet.delete(wallet);
+        }
+        if (byWallet.size === 0) byOutcome.delete(outcome);
+      }
+      if (byOutcome.size === 0) this.votes.delete(conditionId);
+    }
+    const ttl = Math.max(this.config.fireCooldownMs * 6, 60 * 60 * 1000);
+    for (const [key, ts] of this.lastFired) if (now - ts > ttl) this.lastFired.delete(key);
+    for (const [key, ts] of this.nearMissLogAt) if (now - ts > ttl) this.nearMissLogAt.delete(key);
+    for (const [key, ts] of this.feeRateCacheTs) if (now - ts > ttl) { this.feeRateCacheTs.delete(key); this.feeRateCache.delete(key); }
+    for (const [key, ts] of this.tickSizeCacheTs) if (now - ts > ttl) { this.tickSizeCacheTs.delete(key); this.tickSizeCache.delete(key); }
+    for (const [key, ts] of this.lastTwapEvalTs) if (now - ts > ttl) { this.lastTwapEvalTs.delete(key); this.lastTwapEval.delete(key); }
+  }
+
   private getVoteMap(
     conditionId: string,
     outcome: string
@@ -933,7 +997,10 @@ export class BasketQuorumService {
     const conditionId = trade.conditionId!;
     const marketSlug = trade.marketSlug!;
     const outcome = trade.outcome!;
-    const key = `${conditionId}:${outcome}`;
+    const rawKey = `${conditionId}:${outcome}`;
+    // Scope restart dedup by execution mode: paper fires must never suppress
+    // the first live fire after a DRY_RUN -> LIVE switch.
+    const key = `${this.config.dryRun ? 'paper' : 'live'}:${rawKey}`;
 
     // Cooldown: one-shot per market+outcome in the window.
     const last = this.lastFired.get(key) ?? 0;
@@ -961,7 +1028,14 @@ export class BasketQuorumService {
           primaryCount >= 2 ||
           (primaryCount >= 1 && satelliteCount >= 2) ||
           satelliteCount >= 5;  // crowd consensus escape hatch
-        if (!tieredFires) {
+        const distinctVoters = new Set(
+          [...outcomeVotes.values()]
+            .filter((v) => v.side === 'BUY')
+            .map((v) => v.wallet),
+        ).size;
+        const effectiveQuorum = Math.max(1, this.quorumFor(basket.category));
+        const quorumReached = tieredFires && distinctVoters >= effectiveQuorum;
+        if (!quorumReached) {
           // Diagnostic: log NEAR-MISSES so we can see if consensus is *almost* there.
           // Rate-limited: one line per market+outcome per nearMissLogIntervalMs.
           // Only logs the "waiting" state the operator cares about: 2+ wallets
@@ -1008,7 +1082,6 @@ export class BasketQuorumService {
     // Schedule 1h and 24h follow-up price checks (whalewatch-style validation loop)
     this._scheduleFollowup(signal);
 
-    this.lastFired.set(key, now);
     this._schedulePersist();
 
     // 7a. Risk halt — if RiskManager says no, don't even check drift.
@@ -1099,9 +1172,16 @@ export class BasketQuorumService {
   ): Promise<void> {
     // In production, fetch the current market price here via
     //   this.tradingService.getMarketPrice?.(signal.conditionId)
-    // and compare to signal.consensusPrice. For v1 we use the most recent
-    // vote price as the proxy, so drift defaults to 0 (no fake edge).
-    const currentPrice = trade.price;
+    // Prefer a fresh CLOB mid. The last vote fill is only a fallback when no
+    // live observation exists; it is not a valid proxy for market drift.
+    const maxMidStalenessMs = Number(process.env.BASKET_MID_MAX_STALENESS_MS ?? 30_000);
+    const observedMid = trade.tokenId ? this.liveMid.get(trade.tokenId) : undefined;
+    const currentPrice = observedMid && now - observedMid.ts <= maxMidStalenessMs
+      ? observedMid.price
+      : trade.price;
+    if (!observedMid || now - observedMid.ts > maxMidStalenessMs) {
+      console.warn(`[BasketQuorum] drift fallback: no fresh live mid for ${trade.tokenId ?? signal.conditionId}`);
+    }
     const drift = Math.abs(currentPrice - signal.consensusPrice) /
       (signal.consensusPrice || 1);
     if (drift > this.config.maxPriceDrift) {
@@ -1239,6 +1319,10 @@ export class BasketQuorumService {
           )
         : slippagePrice;
 
+      // All synchronous gates have passed; record the attempt now. A failed
+      // anti-sniper/TWAP/drift gate above must remain retryable.
+      this.lastFired.set(key, Date.now());
+      this._schedulePersist();
       let result: OrderResult;
       if (this.config.dryRun) {
         result = { success: true, orderId: `dry_run_${Date.now()}` };
@@ -1283,6 +1367,7 @@ export class BasketQuorumService {
           winRate: basket.winRate ?? 0.6,
           basket: basket.name,
           wallets: signal.wallets,
+          feePerShare: feePerShareVal,
         });
         // L1: track the position so the exit ladder can manage it.
         if (trade.tokenId) {

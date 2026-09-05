@@ -121,7 +121,14 @@ export interface TradeInfo {
   side: Side;
   price: number;
   size: number;
+  /**
+   * Estimated taker fee paid in USDC, using Polymarket's formula:
+   * (feeRateBps / 10000) * price * (1 - price) * size.
+   * 0 when price or size are unknown (no fee can be estimated).
+   */
   fee: number;
+  /** Raw taker fee rate in basis points as reported by the CLOB. */
+  feeRateBps?: number;
   timestamp: number;
 }
 
@@ -162,6 +169,8 @@ export class TradingService {
   private chainId: Chain;
   private credentials: ApiCredentials | null = null;
   private initialized = false;
+  /** In-flight initialize() promise — makes initialize() re-entrancy-safe. */
+  private _initPromise: Promise<void> | null = null;
   private tickSizeCache: Map<string, string> = new Map();
   private negRiskCache: Map<string, boolean> = new Map();
 
@@ -182,34 +191,47 @@ export class TradingService {
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
-    // Create CLOB client with L1 auth (wallet)
-    this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
+    // Re-entrancy guard: concurrent first calls share one in-flight
+    // initialization promise instead of racing to derive/create API keys.
+    if (this._initPromise) return this._initPromise;
 
-    // Get or create API credentials
-    // We use derive-first strategy (opposite of official createOrDeriveApiKey)
-    // because most users already have a key, avoiding unnecessary 400 error logs.
-    if (!this.credentials) {
-      const creds = await this.deriveOrCreateApiKey();
-      this.credentials = {
-        key: creds.key,
-        secret: creds.secret,
-        passphrase: creds.passphrase,
-      };
-    }
+    this._initPromise = (async () => {
+      // Create CLOB client with L1 auth (wallet)
+      this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
 
-    // Re-initialize with L2 auth (credentials)
-    this.clobClient = new ClobClient(
-      CLOB_HOST,
-      this.chainId,
-      this.wallet,
-      {
-        key: this.credentials.key,
-        secret: this.credentials.secret,
-        passphrase: this.credentials.passphrase,
+      // Get or create API credentials
+      // We use derive-first strategy (opposite of official createOrDeriveApiKey)
+      // because most users already have a key, avoiding unnecessary 400 error logs.
+      if (!this.credentials) {
+        const creds = await this.deriveOrCreateApiKey();
+        this.credentials = {
+          key: creds.key,
+          secret: creds.secret,
+          passphrase: creds.passphrase,
+        };
       }
-    );
 
-    this.initialized = true;
+      // Re-initialize with L2 auth (credentials)
+      this.clobClient = new ClobClient(
+        CLOB_HOST,
+        this.chainId,
+        this.wallet,
+        {
+          key: this.credentials.key,
+          secret: this.credentials.secret,
+          passphrase: this.credentials.passphrase,
+        }
+      );
+
+      this.initialized = true;
+    })();
+
+    try {
+      await this._initPromise;
+    } finally {
+      // Clear after settle so a failed init can be retried by the next caller.
+      this._initPromise = null;
+    }
   }
 
   /**
@@ -357,7 +379,10 @@ export class TradingService {
    * Market orders below this limit will be rejected by the API.
    */
   async createMarketOrder(params: MarketOrderParams): Promise<OrderResult> {
-    // Validate minimum order value before sending to API
+    // Validate minimum order value and optional market price before sending.
+    if (params.price !== undefined && (!Number.isFinite(params.price) || params.price <= 0 || params.price >= 1)) {
+      return { success: false, errorMsg: `Invalid market-order price: ${params.price}` };
+    }
     if (params.amount < MIN_ORDER_VALUE_USDC) {
       return {
         success: false,
@@ -376,13 +401,14 @@ export class TradingService {
 
         const orderType = params.orderType === 'FAK' ? ClobOrderType.FAK : ClobOrderType.FOK;
 
+        const orderPayload = {
+          tokenID: params.tokenId,
+          side: params.side === 'BUY' ? ClobSide.BUY : ClobSide.SELL,
+          amount: params.amount,
+          ...(params.price === undefined ? {} : { price: params.price }),
+        };
         const result = await client.createAndPostMarketOrder(
-          {
-            tokenID: params.tokenId,
-            side: params.side === 'BUY' ? ClobSide.BUY : ClobSide.SELL,
-            amount: params.amount,
-            price: params.price,
-          },
+          orderPayload,
           { tickSize, negRisk },
           orderType
         );
@@ -494,10 +520,11 @@ export class TradingService {
       return trades.map((t: ClobTrade) => ({
         id: t.id,
         tokenId: t.asset_id,
-        side: t.side as Side,
+        side: String(t.side).toUpperCase() as Side,
         price: Number(t.price) || 0,
         size: Number(t.size) || 0,
-        fee: Number(t.fee_rate_bps) || 0,
+        fee: (Number(t.fee_rate_bps) || 0) / 10_000 * (Number(t.price) || 0) * (1 - (Number(t.price) || 0)) * (Number(t.size) || 0),
+        feeRateBps: Number(t.fee_rate_bps) || 0,
         timestamp: Number(t.match_time) || Date.now(),
       }));
     });
@@ -563,7 +590,8 @@ export class TradingService {
           market?.feeRateBps ??
           market?.fee_rate ??
           200;
-        return typeof bps === 'string' ? Number(bps) : bps;
+        const value = typeof bps === 'string' ? Number(bps) : Number(bps);
+        return Number.isFinite(value) ? (value > 0 && value <= 1 ? value * 10_000 : value) : 200;
       } catch {
         return 200; // default 2% taker
       }
@@ -675,7 +703,7 @@ export class TradingService {
   } | null> {
     try {
       const url = `${CLOB_HOST}/book?token_id=${encodeURIComponent(tokenId)}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
       if (!res.ok) return null;
       const raw = (await res.json()) as { bids?: unknown[]; asks?: unknown[] };
       return {

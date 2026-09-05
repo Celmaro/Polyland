@@ -562,6 +562,9 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   risk.loadPersistedState();
   // L11: JSONL audit trail — every fire/settlement persisted to disk.
   SignalAuditStore.enableJsonl('./data/signal-audit.jsonl');
+  // Rebuild 30-day edge stats from the trail so a redeploy doesn't wipe the
+  // significance gate's history (previously signals reset to {} every boot).
+  signalAuditStore.replayJsonl('./data/signal-audit.jsonl');
 
   basketQuorum = new BasketQuorumService(sdk.tradingService, BASKET_QUORUM_CONFIG);
   basketQuorum.setRiskManager(risk);

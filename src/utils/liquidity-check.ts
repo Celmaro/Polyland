@@ -143,7 +143,17 @@ function checkLiquidity(
   const side = params.side;
   const levels = side === 'BUY' ? asks : bids;
   const desiredNotional = params.shares * params.price;
-  const requiredNotional = desiredNotional * (params.multiplier ?? 2);
+  // Required notional is based on the actual levels crossed, not the target
+  // price, which can understate cost when the spread is wide.
+  let targetRemaining = params.shares;
+  let targetNotional = 0;
+  for (const level of levels) {
+    if (targetRemaining <= 0) break;
+    const take = Math.min(level.size, targetRemaining);
+    targetNotional += take * level.price;
+    targetRemaining -= take;
+  }
+  const requiredNotional = (targetRemaining > 0 ? desiredNotional : targetNotional) * (params.multiplier ?? 2);
 
   if (levels.length === 0) {
     return {

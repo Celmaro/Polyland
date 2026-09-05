@@ -85,7 +85,7 @@ export function inferMakerTaker(
   // Maker orders get a small rebate (typically 25-50% of fee) — so cashPnl
   // would be higher than realizedPnl.
   // Taker orders pay the full fee — realizedPnl reflects the deduction.
-  const feeExpected = (pos.totalBought * pos.avgPrice * feeRateBps) / 10_000;
+  const feeExpected = (pos.totalBought * pos.avgPrice * (1 - pos.avgPrice) * feeRateBps) / 10_000;
   const cashVsRealized = pos.cashPnl - pos.realizedPnl;
   // If cashPnl exceeds realizedPnl by more than half the expected fee, the
   // order was a maker (rebate > fee paid).

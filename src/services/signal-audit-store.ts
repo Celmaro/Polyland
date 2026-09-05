@@ -14,9 +14,12 @@
  *   3. Market clustering — multiple signals on same market share one结算 outcome;
  *                          clustered interval is used for significance testing
  *
- * Bonferroni correction: α=0.05 / N groups tested.  N is incremented each
- * time a new filter dimension is added, keeping false-positive rate in check.
+ * Bonferroni correction: α=0.05 / N groups tested.  N = number of active
+ * baskets (set once at boot via setBonferroniGroups) — hypotheses tested,
+ * NOT the rolling sample size.
  */
+
+import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 
 // ============================================================================
 // Types
@@ -71,11 +74,26 @@ interface SignalMap {
 // Constants
 // ============================================================================
 
-/** Rough Polymarket taker fee per share (probability points). Updated from fe schedule. */
-export const TAKER_FEE_PER_SHARE = 0.003; // ~0.3%
+/**
+ * Taker fee per share is now computed dynamically via fee-math.ts
+ * (takerFeePerShare(price, feeRateBps)) so the audit trail agrees with the
+ * execution edge gate. The flat constant below is kept only as a legacy
+ * fallback reference and is no longer used by recordFire().
+ * @deprecated use takerFeePerShare(price, DEFAULT_FEE_RATE_BPS) from fee-math.ts
+ */
+export const TAKER_FEE_PER_SHARE = 0.003; // ~0.3% legacy flat rate
 
 /** Rolling window for edge stats (ms). 30 days. */
 const EDGE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Minimum settled signals before the significance gate may fire. */
+const MIN_SIGNIFICANT_SAMPLES = 8;
+
+/** Monotonic counter — makes fire ids unique even for same-ms fires. */
+let fireSeq = 0;
+function nextFireSeq(): number {
+  return ++fireSeq;
+}
 
 /** Bonferroni groups — increment when adding new filter dimensions. */
 let BONFERRONI_GROUPS = 3; // crypto, politics, other (3 baskets = 3 groups)
@@ -133,10 +151,13 @@ export class SignalAuditStore {
     winRate: number;        // basket rolling win rate at fire time
     basket: string;
     wallets: string[];
+    feePerShare?: number;   // optional: the taker fee the execution gate used
   }): string {
-    const id = `${params.conditionId}-${params.outcome}-${Date.now()}`;
+    const id = `${params.conditionId}-${params.outcome}-${Date.now()}-${nextFireSeq()}`;
     const impliedProb = params.side === 'BUY' ? params.pricePaid : (1 - params.pricePaid);
-    const fee = TAKER_FEE_PER_SHARE;
+    // Dynamic Polymarket fee (feeRateBps × p × (1-p)) so audited edge matches
+    // the execution gate — unless the caller passes the fee it actually used.
+    const fee = params.feePerShare ?? takerFeePerShare(params.pricePaid, DEFAULT_FEE_RATE_BPS);
     const expectedEdge = params.winRate - impliedProb - fee;
 
     const signal: FiredSignal = {
@@ -156,6 +177,7 @@ export class SignalAuditStore {
       cluster: params.conditionId,
     };
 
+    this.pruneOldSignals();
     this.signals[id] = signal;
     const list = this.byConditionId.get(params.conditionId) ?? [];
     list.push(id);
@@ -168,6 +190,7 @@ export class SignalAuditStore {
       side: params.side,
       pricePaid: params.pricePaid,
       size: params.size,
+      feePerShare: fee,
       winRate: params.winRate,
       expectedEdge,
       basket: params.basket,
@@ -180,12 +203,16 @@ export class SignalAuditStore {
    * Record settlement for a condition.  All signals on this conditionId share
    * the same resolution — apply it to every signal and compute realized_edge.
    *
-   * realized_edge = payout − pricePaid − fee
-   *   BUY  → payout = size * (1 − pricePaid)   if resolved=1, else 0
-   *   SELL → payout = size * pricePaid          if resolved=0, else 0
+   * Position model (value at settlement − cost − fee):
+   *   BUY  = long YES at pricePaid → value 1 if resolved=1, else 0
+   *   SELL = long NO  at pricePaid → value 1 if resolved=0, else 0
    *
-   * (Binary, winner-take-all: if your side wins you get 1 − price per share;
-   *  if you lose you get 0.)
+   *   realized_edge = (valuePerShare − pricePaid − feePerShare) × size
+   *
+   * (Binary, winner-take-all: a winning share pays $1 at resolution, a losing
+   *  share pays $0. The old code computed "payout − pricePaid" where payout
+   *  already excluded the cost basis, double-subtracting it and booking every
+   *  winning BUY above ~49.85¢ as a loss.)
    */
   recordSettlement(conditionId: string, resolved: 0 | 1): void {
     const ids = this.byConditionId.get(conditionId) ?? [];
@@ -197,15 +224,7 @@ export class SignalAuditStore {
 
       s.resolved = resolved;
       s.settledAt = settledAt;
-
-      // payout logic: binary winner-take-all
-      const payoutPerShare = resolved === 1
-        ? (s.side === 'BUY' ? 1 - s.pricePaid : s.pricePaid)
-        : (s.side === 'BUY' ? 0 : s.pricePaid);
-
-      const grossPayout = s.size * payoutPerShare;
-      const netPayout = grossPayout - (s.size * s.feePerShare);
-      s.realizedEdge = netPayout - s.pricePaid * s.size; // net profit per share − cost
+      s.realizedEdge = SignalAuditStore.realizedEdgeFor(s, resolved);
       this.appendJsonl('settlement', {
         id: s.id,
         conditionId: s.conditionId,
@@ -225,12 +244,7 @@ export class SignalAuditStore {
   recordBacktestSettlement(id: string, resolved: 0 | 1): void {
     const s = this.signals[id];
     if (!s || s.settledAt) return;
-    const payoutPerShare = resolved === 1
-      ? (s.side === 'BUY' ? 1 - s.pricePaid : s.pricePaid)
-      : (s.side === 'BUY' ? 0 : s.pricePaid);
-    const grossPayout = s.size * payoutPerShare;
-    const netPayout = grossPayout - (s.size * s.feePerShare);
-    s.realizedEdge = netPayout - s.pricePaid * s.size;
+    s.realizedEdge = SignalAuditStore.realizedEdgeFor(s, resolved);
     s.resolved = resolved;
     s.settledAt = Date.now();
     this.appendJsonl('settlement', {
@@ -261,9 +275,10 @@ export class SignalAuditStore {
       const s = this.signals[id];
       if (!s || s.settledAt) continue;             // already settled by resolution
       if (outcome && s.outcome !== outcome) continue; // only the exited side
-      const perShare = s.side === 'BUY'
-        ? exitPrice - s.pricePaid - s.feePerShare
-        : s.pricePaid - exitPrice - s.feePerShare;
+      // Same value model as settlement: the position is sold at exitPrice,
+      // so P&L = (exitPrice − pricePaid − fee) × size for BOTH sides. The old
+      // SELL branch (pricePaid − exitPrice) inverted the sign of NO exits.
+      const perShare = exitPrice - s.pricePaid - s.feePerShare;
       s.realizedEdge = perShare * s.size;
       s.resolved = exitPrice >= 0.5 ? 1 : 0;       // bookkeeping only
       s.settledAt = Date.now();
@@ -288,6 +303,7 @@ export class SignalAuditStore {
   // --------------------------------------------------------------------------
 
   getStats(winRateOverride?: (basket: string) => number): EdgeStats {
+    this.pruneOldSignals();
     const cutoff = Date.now() - EDGE_WINDOW_MS;
     const settled = Object.values(this.signals).filter(
       s => s.settledAt !== undefined && s.settledAt > cutoff,
@@ -323,14 +339,22 @@ export class SignalAuditStore {
     // t-stat for one-sample t-test: does realizedEdge differ from expectedEdge?
     const diffs = settled.map((s, i) => (s.realizedEdge ?? 0) - s.expectedEdge);
     const tStat = arrTStat(diffs);
-    const bonferroniAlpha = 0.05 / BONFERRONI_GROUPS;
 
-    // Distinct markets (clusters) in the settled window — for Bonferroni denom
+    // Distinct markets (clusters) in the settled window (for reporting only —
+    // the Bonferroni denominator is the number of BASKETS/groups tested, set
+    // once at boot, NOT the sample size).
     const clusters = new Set(settled.map(s => s.cluster));
-    BONFERRONI_GROUPS = Math.max(BONFERRONI_GROUPS, clusters.size);
 
-    // Significance: positive alpha AND |tStat| exceeds critical value (~2 for N>30)
-    const isSignificant = edgeAlpha > 0 && Math.abs(tStat) > 2.0;
+    // Bonferroni-corrected significance: edgeAlpha > 0 AND the two-sided
+    // p-value of the t-statistic is below 0.05/groups. Also require a minimum
+    // sample — a handful of signals shouldn't trip significance regardless of
+    // t. (The old code hardcoded |t|>2.0, ignored bonferroniAlpha entirely,
+    // and mutated BONFERRONI_GROUPS — making the threshold stricter as the
+    // sample grew, which is backwards.)
+    const pValue = twoSidedPValue(tStat);
+    const bonferroniAlpha = 0.05 / Math.max(1, BONFERRONI_GROUPS);
+    const isSignificant =
+      edgeAlpha > 0 && settled.length >= MIN_SIGNIFICANT_SAMPLES && pValue < bonferroniAlpha;
 
     // PT2 (CloddsBot): Brier score over settled signals. p̂ = implied prob of
     // OUR side = pricePaid for BUY, 1-pricePaid for SELL. outcome = resolved.
@@ -377,17 +401,148 @@ export class SignalAuditStore {
   /**
    * All conditionIds that have been fired but not yet settled.
    * Used by GammaResolutionPoller to batch-check resolutions.
+   * Deduplicated — one entry per conditionId (previously one per signal,
+   * which made the poller issue duplicate fetches and duplicate
+   * handleMarketResolved calls).
    */
   getUnsettledConditionIds(): string[] {
-    return Object.values(this.signals)
-      .filter((s) => s.settledAt === undefined)
-      .map((s) => s.cluster);
-  }
-}
+      const unsettled = new Set<string>();
+      for (const s of Object.values(this.signals)) {
+        if (s.settledAt === undefined) unsettled.add(s.cluster);
+      }
+      return [...unsettled];
+    }
 
-// ============================================================================
-// Math helpers
-// ============================================================================
+    /**
+     * Realized P&L for a settled signal.
+     *   BUY  = long YES at pricePaid → value 1 if resolved=1, else 0
+     *   SELL = long NO  at pricePaid → value 1 if resolved=0, else 0
+     *   realized_edge = (valuePerShare − pricePaid − feePerShare) × size
+     */
+    static realizedEdgeFor(s: FiredSignal, resolved: 0 | 1): number {
+      const valuePerShare = s.side === 'BUY'
+        ? (resolved === 1 ? 1 : 0)
+        : (resolved === 0 ? 1 : 0);
+      return (valuePerShare - s.pricePaid - s.feePerShare) * s.size;
+    }
+
+  // --------------------------------------------------------------------------
+  // Memory bounds + restart survival
+  // --------------------------------------------------------------------------
+
+  /**
+   * Drop signals older than the stats window (plus a 1h margin) from both the
+   * id map and the condition index — bounds memory on long-running sessions
+   * (previously signals{} and byConditionId grew forever).
+   */
+  private pruneOldSignals(): void {
+    const cutoff = Date.now() - EDGE_WINDOW_MS - 60 * 60 * 1000;
+    let pruned = 0;
+    for (const id of Object.keys(this.signals)) {
+      if (this.signals[id].firedAt < cutoff) {
+        delete this.signals[id];
+        pruned++;
+      }
+    }
+    if (pruned === 0) return;
+    // Rebuild the condition index from survivors.
+    this.byConditionId.clear();
+    for (const s of Object.values(this.signals)) {
+      const list = this.byConditionId.get(s.conditionId) ?? [];
+      list.push(s.id);
+      this.byConditionId.set(s.conditionId, list);
+    }
+  }
+
+  /**
+   * Rebuild in-memory state from the JSONL audit trail. Call once at boot
+   * (after enableJsonl) so 30-day edge stats and the significance gate survive
+   * redeploys instead of silently resetting to zero. Idempotent — the same
+   * guards used by the live paths (settledAt, dedupe) apply.
+   */
+  replayJsonl(path: string): void {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('node:fs') as typeof import('node:fs');
+    if (!fs.existsSync(path)) return;
+    let lines: string[];
+    try {
+      lines = fs.readFileSync(path, 'utf8').split('\n').filter(Boolean);
+    } catch {
+      return;
+    }
+    for (const line of lines) {
+      let evt: { event?: string; ts?: number; [k: string]: unknown };
+      try {
+        evt = JSON.parse(line);
+      } catch {
+        continue; // malformed line — skip, never crash boot
+      }
+      try {
+        if (evt.event === 'fire' && typeof evt.id === 'string') {
+          this._replayFire(evt as any);
+        } else if (evt.event === 'settlement' && typeof evt.id === 'string') {
+          this._replaySettlement(evt as any);
+        } else if (evt.event === 'exit_settled' && typeof evt.id === 'string') {
+          this._replayExit(evt as any);
+        }
+      } catch {
+        // keep going — a single bad record must not block the trail replay
+      }
+    }
+  }
+
+  private _replayFire(evt: {
+    id: string; conditionId: string; marketSlug: string; outcome: string;
+    side: SignalSide; pricePaid: number; size: number; feePerShare?: number;
+    winRate: number; expectedEdge: number; basket: string; wallets: string[]; ts?: number;
+  }): void {
+    if (this.signals[evt.id]) return; // already present
+    const fee = evt.feePerShare ?? takerFeePerShare(evt.pricePaid, DEFAULT_FEE_RATE_BPS);
+    const signal: FiredSignal = {
+      id: evt.id,
+      conditionId: evt.conditionId,
+      marketSlug: evt.marketSlug,
+      outcome: evt.outcome,
+      side: evt.side,
+      pricePaid: evt.pricePaid,
+      size: evt.size,
+      feePerShare: fee,
+      expectedEdge: evt.expectedEdge,
+      winRate: evt.winRate,
+      basket: evt.basket,
+      wallets: evt.wallets ?? [],
+      firedAt: evt.ts ?? Date.now(),
+      cluster: evt.conditionId,
+    };
+    this.signals[evt.id] = signal;
+    const list = this.byConditionId.get(evt.conditionId) ?? [];
+    list.push(evt.id);
+    this.byConditionId.set(evt.conditionId, list);
+  }
+
+  private _replaySettlement(evt: { id: string; resolved: 0 | 1; ts?: number }): void {
+    const s = this.signals[evt.id];
+    if (!s || s.settledAt !== undefined) return;
+    s.resolved = evt.resolved;
+    s.settledAt = evt.ts ?? Date.now();
+    s.realizedEdge = SignalAuditStore.realizedEdgeFor(s, evt.resolved); // fixed math
+  }
+
+  private _replayExit(evt: { id: string; exitPrice: number; reason: string; ts?: number }): void {
+    const s = this.signals[evt.id];
+    if (!s || s.settledAt !== undefined) return;
+    s.realizedEdge = (evt.exitPrice - s.pricePaid - s.feePerShare) * s.size;
+    s.resolved = evt.exitPrice >= 0.5 ? 1 : 0;
+    s.settledAt = evt.ts ?? Date.now();
+    s.exitedAt = evt.ts ?? Date.now();
+    s.exitPrice = evt.exitPrice;
+    s.exitReason = evt.reason;
+  }
+  }
+
+  // ============================================================================
+  // Math helpers
+  // ============================================================================
 
 function arrMean(arr: number[]): number {
   if (arr.length === 0) return 0;
@@ -401,6 +556,26 @@ function arrTStat(arr: number[]): number {
   const stddev = Math.sqrt(variance);
   if (stddev === 0) return 0;
   return mean / (stddev / Math.sqrt(arr.length));
+}
+
+/**
+ * Standard normal CDF via Abramowitz-Stegun 7.1.26 (error < 7.5e-8).
+ */
+function normCdf(z: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const d = 0.3989422804014327 * Math.exp(-z * z / 2);
+  const p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return z >= 0 ? 1 - p : p;
+}
+
+/**
+ * Two-sided p-value from a t-statistic, using the normal approximation.
+ * Adequate for n >= 8 (the MIN_SIGNIFICANT_SAMPLES floor); for smaller n the
+ * test is intentionally conservative because significance is gated on n first.
+ */
+function twoSidedPValue(tStat: number): number {
+  if (!Number.isFinite(tStat)) return 1;
+  return 2 * (1 - normCdf(Math.abs(tStat)));
 }
 
 // Singleton export — shared across BacktestRunner and BasketQuorumService

@@ -56,7 +56,7 @@ export interface RiskConfig {
   winSizingIncrease: number;      // 0.10
 
   // PT4 (sstklen/trump-code circuit breaker): basket kill switch — a basket
-  // whose recent settled win rate diverges from its rolling baseline by
+  // whose recent settled win rate diverges from its OWN rolling baseline by
   // basketKillSigma std-devs over basketKillWindow settlements is suspended.
   basketKillSigma: number;
   basketKillWindow: number;
@@ -80,7 +80,7 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   winSizingIncrease: 0.10,
   basePositionPct: 0.02,
   // PT4 (sstklen/trump-code circuit breaker): basket kill switch fires when
-  // a basket's recent settled win rate diverges from its rolling baseline
+  // a basket's recent settled win rate diverges from its OWN rolling baseline
   // by `basketKillSigma` std-devs over `basketKillWindow` settlements.
   basketKillSigma: 2.0,
   basketKillWindow: 20,
@@ -145,11 +145,19 @@ export interface RiskSnapshot {
 export class RiskManager {
   private config: RiskConfig;
   private startingCapital: number;
+  /** Trade history (bounded: age-evicted to windows, hard-capped at 20k). */
   private trades: TradeRecord[] = [];
 
-  // Cached rollups — recomputed on every recordTrade, read on every canTrade.
+  // Windowed P&L — maintained INCREMENTALLY (O(1) amortized per trade) via
+  // sliding pointers instead of rescanning the whole array every trade (was
+  // O(n²) over a session).
   private _dailyPnl = 0;
   private _monthlyPnl = 0;
+  /** Index into trades[] of the first trade inside the trailing 24h window. */
+  private _dailyStart = 0;
+  /** Index into trades[] of the first trade inside the trailing 30d window. */
+  private _monthlyStart = 0;
+
   private _realizedPnl = 0;
   private _peakCapital: number;
   private _consecutiveLosses = 0;
@@ -170,9 +178,10 @@ export class RiskManager {
 
   /**
    * Enable cross-restart persistence. Call once at boot BEFORE any trading.
-   * Loads prior state (realizedPnl, peak, streaks, halt) if present, then
-   * re-checks halts: if the previous session already breached a limit, the
-   * bot stays halted after the restart.
+   * Loads prior state (realizedPnl, peak, streaks, halt, TRADE HISTORY and
+   * basket kill-switch stats) if present, then re-checks halts: if the
+   * previous session already breached a limit, the bot stays halted after
+   * the restart.
    */
   static enablePersistence(path: string): void {
     RiskManager.persistPath = path;
@@ -205,6 +214,13 @@ export class RiskManager {
         this._consecutiveLosses = 0;
         this._sizeMultiplier = 1.0;
         this._haltedUntilMs = null;
+        this.trades = [];
+        this._dailyPnl = 0;
+        this._monthlyPnl = 0;
+        this._dailyStart = 0;
+        this._monthlyStart = 0;
+        this.basketOutcomes.clear();
+        this.killedBaskets.clear();
         this.persistState();
         return;
       }
@@ -212,9 +228,37 @@ export class RiskManager {
       this._consecutiveWins = 0;
       this._sizeMultiplier = typeof raw.sizeMultiplier === 'number' ? raw.sizeMultiplier : 1.0;
       this._haltedUntilMs = typeof raw.haltedUntilMs === 'number' ? raw.haltedUntilMs : null;
+
+      // Restore trade history so trailing 24h/30d windows survive a redeploy
+      // (was: trades[] omitted → daily/monthly halts silently reset to 0).
+      if (Array.isArray(raw.trades)) {
+        this.trades = (raw.trades as TradeRecord[]).filter(
+          (t) => t && typeof t.pnlUsd === 'number' && typeof t.ts === 'number' && isFinite(t.pnlUsd)
+        ).sort((a, b) => a.ts - b.ts).slice(-20_000);
+      } else {
+        this.trades = [];
+      }
+      this._rebuildWindowedPnl();
+
+      // Restore basket kill-switch state (a killed basket must stay killed).
+      if (Array.isArray(raw.basketOutcomes)) {
+        for (const [name, outcomes] of raw.basketOutcomes as [string, (0 | 1)[]][]) {
+          if (typeof name === 'string' && Array.isArray(outcomes)) {
+            this.basketOutcomes.set(name, outcomes.filter((v) => v === 0 || v === 1).slice(-500));
+          }
+        }
+      }
+      if (Array.isArray(raw.killedBaskets)) {
+        for (const name of raw.killedBaskets as string[]) {
+          if (typeof name === 'string') this.killedBaskets.add(name);
+        }
+      }
+
       console.log(
         `[RiskManager] restored session state: realizedPnl=${this._realizedPnl.toFixed(2)} ` +
-        `peak=${this._peakCapital.toFixed(2)} consecLosses=${this._consecutiveLosses}` +
+        `peak=${this._peakCapital.toFixed(2)} consecLosses=${this._consecutiveLosses} ` +
+        `trades=${this.trades.length} dailyPnl=${this._dailyPnl.toFixed(2)} ` +
+        `monthlyPnl=${this._monthlyPnl.toFixed(2)}` +
         (this.checkHalt() ? ` HALTED (${this.checkHalt()})` : '')
       );
     } catch (err) {
@@ -234,6 +278,11 @@ export class RiskManager {
         consecutiveLosses: this._consecutiveLosses,
         sizeMultiplier: this._sizeMultiplier,
         haltedUntilMs: this._haltedUntilMs,
+        // Trade history — the DAILY/MONTHLY halt windows depend on it.
+        trades: this.trades.slice(-20_000),
+        // Basket kill-switch state — a kill must survive restart.
+        basketOutcomes: [...this.basketOutcomes.entries()].map(([k, v]) => [k, v.slice(-500)]),
+        killedBaskets: [...this.killedBaskets],
       });
       const tmp = path + '.tmp';
       fs.writeFileSync(tmp, payload, 'utf8');
@@ -278,6 +327,15 @@ export class RiskManager {
    */
   recordTrade(t: TradeRecord): void {
     this.trades.push(t);
+    // Hard cap on history regardless of windows (defense in depth).
+    if (this.trades.length > 20_000) {
+      this.trades.splice(0, this.trades.length - 20_000);
+      // The sliding pointers are now stale relative to a compacted prefix —
+      // rebuild from scratch (only happens beyond 20k trades).
+      this._dailyStart = 0;
+      this._monthlyStart = 0;
+      this._rebuildWindowedPnl();
+    }
     this._realizedPnl += t.pnlUsd;
     const current = this.currentCapital();
     if (current > this._peakCapital) this._peakCapital = current;
@@ -293,8 +351,12 @@ export class RiskManager {
       // scratch trade: doesn't break streaks but doesn't grow them either
     }
 
-    // Recompute windowed P&L
-    this._recomputeWindowedPnl();
+    // Incremental windowed P&L (O(1) amortized; no full rescans).
+    // Add the new trade before eviction so an out-of-window trade cannot be
+    // added after the eviction pass and accidentally remain in the sums.
+    this._dailyPnl += t.pnlUsd;
+    this._monthlyPnl += t.pnlUsd;
+    this._evictExpired();
 
     // Apply dynamic sizing update
     if (this.config.enableDynamicSizing) {
@@ -319,38 +381,61 @@ export class RiskManager {
   // PT4: basket kill switch (sstklen/trump-code circuit-breaker pattern)
   // ==========================================================================
 
-  /** Per-basket settled outcome history (1=win, 0=loss), newest last. */
+  /** Per-basket settled outcome history (1=win, 0=loss), newest last, capped. */
   private basketOutcomes: Map<string, (0 | 1)[]> = new Map();
   /** Baskets currently suspended by the kill switch. */
   private killedBaskets: Set<string> = new Set();
 
-  /** Record a settled outcome for a named basket and re-evaluate its breaker. */
+  /**
+   * Record a settled outcome for a named basket and re-evaluate its breaker.
+   *
+   * Kill rule (fixed): a basket is suspended when its RECENT window win rate
+   * is `basketKillSigma` std-devs BELOW ITS OWN long-run baseline (the
+   * history mean), floored at a fair coin (p=0.5). The old code compared
+   * against the fair coin only, so a basket that drifted from its baseline
+   * but stayed above 50% was never killed.
+   */
   recordBasketOutcome(basketName: string, won: boolean): void {
     const window = this.config.basketKillWindow ?? 20;
     const list = this.basketOutcomes.get(basketName) ?? [];
     list.push(won ? 1 : 0);
-    while (list.length > window) list.shift();
+    // Bound full history (baseline reference) — 500 settles is plenty.
+    while (list.length > 500) list.shift();
     this.basketOutcomes.set(basketName, list);
 
-    // Kill: recent performance statistically indistinguishable from a coin
-    // flip biased the wrong way, or N-consecutive-loss divergence vs baseline.
     const minN = this.config.basketKillMinSamples ?? 8;
-    const sigma = this.config.basketKillSigma ?? 2.0;
-    if (!this.killedBaskets.has(basketName) && list.length >= minN) {
-      const n = list.length;
-      const mean = list.reduce((a: number, b) => a + b, 0 as number) / n;
-      // Binomial std-dev of the win-rate estimator under the fair-coin null
-      // (p=0.5): sigma = sqrt(0.25/n). Divergence >= sigma * sigmaThresh
-      // below 0.5 means the basket is significantly WORSE than a coin flip.
-      const fairSigma = Math.sqrt(0.25 / n);
-      if (mean < 0.5 - sigma * fairSigma) {
-        this.killedBaskets.add(basketName);
-        console.error(
-          `[RiskManager] BASKET KILL SWITCH: '${basketName}' suspended — ` +
-          `winRate ${mean.toFixed(3)} over ${n} settled is >= ${sigma}σ below fair coin ` +
-          `(requires operator review to re-enable)`
-        );
-      }
+    const sigmaThresh = this.config.basketKillSigma ?? 2.0;
+    if (this.killedBaskets.has(basketName)) return;
+
+    const recent = list.slice(-Math.min(window, list.length));
+    if (recent.length < minN) return;
+    const n = recent.length;
+    const recentMean = recent.reduce<number>((a, b) => a + b, 0) / n;
+    // Baseline is the basket's OWN prior history, excluding the current
+    // comparison window. Excluding the recent window prevents a bad tail from
+    // diluting its own baseline and prevents a perfect early history from
+    // generating false kills after one or two observations.
+    const prior = list.length > n ? list.slice(0, -n) : [];
+    // Establish a meaningful baseline before comparing a recent window. This
+    // avoids treating the first few observations as a statistically certain
+    // baseline of 1.0 or 0.0.
+    if (prior.length < minN) return;
+    const baseline = prior.length > 0
+      ? Math.max(0.5, prior.reduce<number>((a, b) => a + b, 0) / prior.length)
+      : 0.5;
+    // Use a conservative variance floor for near-perfect histories. Without
+    // it, baseline=1 gives sigma=0 and one ordinary loss immediately kills the
+    // basket, which is not a meaningful 2σ test.
+    const variance = Math.max(baseline * (1 - baseline), 0.25);
+    const sigma = Math.sqrt(variance / n);
+    if (recentMean < baseline - sigmaThresh * sigma) {
+      this.killedBaskets.add(basketName);
+      this.persistState();
+      console.error(
+        `[RiskManager] BASKET KILL SWITCH: '${basketName}' suspended — ` +
+        `winRate ${recentMean.toFixed(3)} over last ${n} settled is >= ${sigmaThresh}σ below its ` +
+        `own baseline ${baseline.toFixed(3)} (requires operator review to re-enable)`
+      );
     }
   }
 
@@ -363,16 +448,35 @@ export class RiskManager {
   reviveBasket(basketName: string): void {
     this.killedBaskets.delete(basketName);
     this.basketOutcomes.delete(basketName);
+    this.persistState();
     console.log(`[RiskManager] basket '${basketName}' revived — history reset`);
   }
 
   /**
    * Compute the current halt state. Returns null if trading is allowed.
+   *
+   * Ordering (fixed): the 4 capital halts are evaluated FIRST, then the
+   * consecutive-loss pause. The old order masked a daily/drawdown breach
+   * whenever a 60-min pause was active — a 5% daily loss hidden behind a
+   * pause is the exact failure the halts exist to catch.
    */
   checkHalt(): HaltReason {
     const now = Date.now();
 
-    // Consecutive-loss pause (timed)
+    // Capital halts first (most severe → least).
+    const totalPct = -this._realizedPnl / this.startingCapital;
+    if (totalPct >= this.config.totalMaxLossPct) return 'total_loss';
+
+    const monthlyPct = -this._monthlyPnl / this.startingCapital;
+    if (monthlyPct >= this.config.monthlyMaxLossPct) return 'monthly_loss';
+
+    const dailyPct = -this._dailyPnl / this.startingCapital;
+    if (dailyPct >= this.config.dailyMaxLossPct) return 'daily_loss';
+
+    const drawdown = this.drawdownFromPeakPct();
+    if (drawdown >= this.config.maxDrawdownFromPeak) return 'drawdown_from_peak';
+
+    // Consecutive-loss pause (timed) — last now.
     if (this._haltedUntilMs !== null) {
       if (now < this._haltedUntilMs) return 'consecutive_losses';
       // Pause elapsed — clear it
@@ -383,22 +487,6 @@ export class RiskManager {
       this._haltedUntilMs = now + this.config.pauseOnBreachMinutes * 60_000;
       return 'consecutive_losses';
     }
-
-    // Total loss — terminal
-    const totalPct = -this._realizedPnl / this.startingCapital;
-    if (totalPct >= this.config.totalMaxLossPct) return 'total_loss';
-
-    // Monthly
-    const monthlyPct = -this._monthlyPnl / this.startingCapital;
-    if (monthlyPct >= this.config.monthlyMaxLossPct) return 'monthly_loss';
-
-    // Daily
-    const dailyPct = -this._dailyPnl / this.startingCapital;
-    if (dailyPct >= this.config.dailyMaxLossPct) return 'daily_loss';
-
-    // Drawdown from peak
-    const drawdown = this.drawdownFromPeakPct();
-    if (drawdown >= this.config.maxDrawdownFromPeak) return 'drawdown_from_peak';
 
     return null;
   }
@@ -443,18 +531,56 @@ export class RiskManager {
   // Internals
   // ------------------------------------------------------------------------
 
-  private _recomputeWindowedPnl(): void {
+  /** Rebuild daily/monthly sums and reset the sliding pointers. Used on load. */
+  private _rebuildWindowedPnl(): void {
     const now = Date.now();
     const oneDay = 24 * 60 * 60_000;
     const oneMonth = 30 * oneDay;
     let daily = 0;
     let monthly = 0;
-    for (const t of this.trades) {
-      const age = now - t.ts;
-      if (age <= oneMonth) monthly += t.pnlUsd;
-      if (age <= oneDay) daily += t.pnlUsd;
+    let dailyStart = 0;
+    let monthlyStart = 0;
+    // trades[] is ts-sorted at load time.
+    for (let i = 0; i < this.trades.length; i++) {
+      const age = now - this.trades[i].ts;
+      if (age > oneMonth) { monthlyStart = i + 1; dailyStart = i + 1; continue; }
+      monthly += this.trades[i].pnlUsd;
+      if (age <= oneDay) daily += this.trades[i].pnlUsd;
+      else dailyStart = i + 1;
     }
     this._dailyPnl = daily;
     this._monthlyPnl = monthly;
+    this._dailyStart = dailyStart;
+    this._monthlyStart = monthlyStart;
+  }
+
+  /**
+   * Drop trades that fell out of the trailing windows, maintaining the sums
+   * incrementally. Amortized O(1) per trade.
+   */
+  private _evictExpired(): void {
+    const now = Date.now();
+    const oneDay = 24 * 60 * 60_000;
+    const oneMonth = 30 * oneDay;
+    const n = this.trades.length;
+    // Advance the daily pointer past trades older than 24h (they may still be
+    // inside the monthly window, so only subtract from the daily sum).
+    while (this._dailyStart < n && now - this.trades[this._dailyStart].ts > oneDay) {
+      this._dailyPnl -= this.trades[this._dailyStart].pnlUsd;
+      this._dailyStart++;
+    }
+    // Advance the monthly pointer past trades older than 30d.
+    let advanced = false;
+    while (this._monthlyStart < n && now - this.trades[this._monthlyStart].ts > oneMonth) {
+      this._monthlyPnl -= this.trades[this._monthlyStart].pnlUsd;
+      this._monthlyStart++;
+      advanced = true;
+    }
+    // Compact the prefix once past the monthly window (bounds memory).
+    if (this._monthlyStart > 0 && (advanced || this._monthlyStart > 1024)) {
+      this.trades.splice(0, this._monthlyStart);
+      this._dailyStart = Math.max(0, this._dailyStart - this._monthlyStart);
+      this._monthlyStart = 0;
+    }
   }
 }

@@ -105,6 +105,8 @@ export class ClobMarketWsService {
 
   /** Book mid price per asset (best bid + best ask) / 2 */
   private bookMids = new Map<string, number>();
+  /** Cumulative book levels; book_update messages may contain deltas, not full books. */
+  private bookLevels = new Map<string, { bids: Map<number, number>; asks: Map<number, number> }>();
 
   // ---------------------------------------------------------------------------
   // Public API
@@ -419,10 +421,22 @@ export class ClobMarketWsService {
 
   private handleBookUpdate(b: ClobBookUpdate): void {
     const { asset_id, bids, asks } = b;
-    if (!bids?.length || !asks?.length) return;
-    const bestBid = parseFloat(bids[0][0]);
-    const bestAsk = parseFloat(asks[0][0]);
-    if (isNaN(bestBid) || isNaN(bestAsk)) return;
+    const levels = this.bookLevels.get(asset_id) ?? { bids: new Map<number, number>(), asks: new Map<number, number>() };
+    this.bookLevels.set(asset_id, levels);
+    for (const [priceText, sizeText] of bids ?? []) {
+      const price = Number(priceText); const size = Number(sizeText);
+      if (!Number.isFinite(price) || price <= 0) continue;
+      if (!Number.isFinite(size) || size <= 0) levels.bids.delete(price); else levels.bids.set(price, size);
+    }
+    for (const [priceText, sizeText] of asks ?? []) {
+      const price = Number(priceText); const size = Number(sizeText);
+      if (!Number.isFinite(price) || price <= 0) continue;
+      if (!Number.isFinite(size) || size <= 0) levels.asks.delete(price); else levels.asks.set(price, size);
+    }
+    const bestBid = Math.max(...levels.bids.keys());
+    const askPrices = [...levels.asks.keys()];
+    const bestAsk = askPrices.length ? Math.min(...askPrices) : NaN;
+    if (!Number.isFinite(bestBid) || !Number.isFinite(bestAsk)) return;
     const mid = (bestBid + bestAsk) / 2;
     this.bookMids.set(asset_id, mid);
     this.emitMid({ assetId: asset_id, price: mid, timestamp: Date.now() });

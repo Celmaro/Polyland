@@ -148,6 +148,7 @@ export function calculateSharesForAmount(
   amount: number,
   price: number
 ): number {
+  if (!Number.isFinite(amount) || !Number.isFinite(price) || price <= 0) return 0;
   return roundSize(amount / price);
 }
 
