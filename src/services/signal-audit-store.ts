@@ -20,6 +20,7 @@
  */
 
 import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
+import * as fs from 'node:fs';
 
 // ============================================================================
 // Types
@@ -123,9 +124,6 @@ export class SignalAuditStore {
     const path = SignalAuditStore.jsonlPath;
     if (!path) return;
     try {
-      // Lazy import keeps this file usable in browser/test contexts
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const fs = require('node:fs') as typeof import('node:fs');
       const line = JSON.stringify({ ts: Date.now(), event, ...data }) + '\n';
       fs.appendFileSync(path, line, 'utf8');
     } catch {
@@ -461,8 +459,6 @@ export class SignalAuditStore {
    * guards used by the live paths (settledAt, dedupe) apply.
    */
   replayJsonl(path: string): void {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const fs = require('node:fs') as typeof import('node:fs');
     if (!fs.existsSync(path)) return;
     let lines: string[];
     try {
