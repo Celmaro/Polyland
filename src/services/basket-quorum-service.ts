@@ -55,6 +55,8 @@ import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fe
 import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from '../utils/anti-sniper.js';
 import { buildOrderBookSummary } from '../utils/liquidity-check.js';
 import { ChainlinkTwapOracle, type CryptoSymbol, type TwapSignalEvaluation } from './chainlink-twap-oracle.js';
+import { BankrollReservationLedger } from './bankroll-reservation.js';
+import { quantizeBuyPrice, roundAmount, roundSize, tickSizeToEnum } from '../utils/price-utils.js';
 
 /** Symbol → question-key heuristic mapping (lowercased). For markets
  *  where the title contains 'btc', 'eth', 'sol', 'xrp', 'doge', 'hype' we
@@ -261,6 +263,7 @@ export class BasketQuorumService {
   private stateStore: VoteStateStore | null = null;
   /** Per-basket spend tracker (USDC spent on this basket) */
   private basketSpend: Map<MarketCategory, number> = new Map();
+  private reservationLedger: BankrollReservationLedger<MarketCategory> | null = null;
   /** Debounce timer for state persistence */
   private _persistTimer: ReturnType<typeof setTimeout> | null = null;
   /** Gamma client for 1h/24h follow-up price checks (optional) */
@@ -1218,31 +1221,60 @@ export class BasketQuorumService {
     }
 
     // 8. Size & execute, reusing the repo's existing sizing/slippage logic.
-    try {
-      // Shares to copy = TOTAL agreeing shares scaled by sizeScale.
-      let copySize = signal.totalSize * this.config.sizeScale;
-      let copyValue = copySize * signal.consensusPrice;
+        // `releaseReservation` is captured by the finally below so EVERY early
+        // return after reservation releases it (no leaked reservations).
+        let releaseReservation: (() => void) | null = null;
+        try {
+          // Shares to copy = TOTAL agreeing shares scaled by sizeScale.
+          let copySize = signal.totalSize * this.config.sizeScale;
+          let copyValue = copySize * signal.consensusPrice;
 
-      // Enforce per-trade USDC cap (mirrors startAutoCopyTrading).
-      if (copyValue > this.config.maxSizePerTrade) {
-        copySize = this.config.maxSizePerTrade / signal.consensusPrice;
-        copyValue = this.config.maxSizePerTrade;
-      }
+          // Enforce per-trade USDC cap (mirrors startAutoCopyTrading).
+          if (copyValue > this.config.maxSizePerTrade) {
+            copySize = this.config.maxSizePerTrade / signal.consensusPrice;
+            copyValue = this.config.maxSizePerTrade;
+          }
 
-      // RiskManager dynamic sizing — shrink/grow based on consecutive outcomes.
-      if (this.riskManager) {
-        copyValue = this.riskManager.sizeOrder(copyValue);
-      }
+          // RiskManager dynamic sizing — shrink/grow based on consecutive outcomes.
+          if (this.riskManager) {
+            copyValue = this.riskManager.sizeOrder(copyValue);
+          }
 
-      // Re-check bankroll after dynamic sizing.
-      const bankroll = this.bankrollFor(basket.category);
-      const spent = this.basketSpend.get(basket.category) ?? 0;
-      if (spent + copyValue > bankroll) {
-        copyValue = Math.max(0, bankroll - spent);
-      }
+          // Re-check bankroll after dynamic sizing. The reservation ledger is the
+          // concurrency guard for this basket's slice: reserve BEFORE the async
+          // order call so two concurrent feeds cannot both allocate the same
+          // bankroll. The bankrollFor() limits are dynamic (RiskManager capital
+          // changes with P&L), hence the provider-function constructor.
+          const bankroll = this.bankrollFor(basket.category);
+          const spent = this.basketSpend.get(basket.category) ?? 0;
+          if (!this.reservationLedger) {
+            this.reservationLedger = new BankrollReservationLedger(
+              (category: MarketCategory) => this.bankrollFor(category),
+            );
+          }
+          releaseReservation = this.reservationLedger.reserve(basket.category, copyValue, spent);
+          if (!releaseReservation) {
+            this.stats.quorumSkippedBankroll++;
+            return;
+          }
+          if (spent + copyValue > bankroll) {
+            copyValue = Math.max(0, bankroll - spent);
+          }
 
-      const usdcAmount = copyValue;
-      if (usdcAmount < this.config.minTradeSize || usdcAmount < 1) {
+          // Final order-boundary quantization: floor the BUY price to the market
+          // tick so we never cross our budget (anti-sniper clamp still applies
+          // when enabled), round size to 2 decimals and the amount to cents.
+          const tickSize = this.tickSizeCache.get(signal.conditionId) ?? 0.01;
+          const rawSlippage = signal.consensusPrice * (1 + this.config.maxSlippage);
+          const clampedPrice =
+            this.antiSniper && trade.tokenId
+              ? this.antiSniper.clampReprice(trade.tokenId, rawSlippage, tickSize)
+              : rawSlippage;
+          const finalPrice = quantizeBuyPrice(clampedPrice, tickSizeToEnum(tickSize));
+          copySize = roundSize(copySize);
+          const usdcAmount = Math.min(copyValue, roundAmount(copySize * finalPrice));
+
+          if (usdcAmount < this.config.minTradeSize || usdcAmount < 1) {
         // Silent-drop counter: these fires passed every quality gate but the
         // scaled size (sizeScale × whale size, then RiskManager shrink) fell
         // below the $20 floor. Previously invisible in the funnel.
@@ -1326,25 +1358,13 @@ export class BasketQuorumService {
             }
           }
         } catch {
-          // Book fetch failed — non-fatal; continue without the check.
-        }
-      }
+                  // Book fetch failed — non-fatal; continue without the check.
+                }
+              }
 
-      const slippagePrice =
-        signal.consensusPrice * (1 + this.config.maxSlippage);
-
-      // Clamp reprice via anti-sniper (maxRepriceTicks cap).
-      const finalPrice = this.antiSniper && trade.tokenId
-        ? this.antiSniper.clampReprice(
-            trade.tokenId,
-            slippagePrice,
-            this.tickSizeCache.get(signal.conditionId) ?? 0.01,
-          )
-        : slippagePrice;
-
-      // All synchronous gates have passed; record the attempt now. A failed
-      // anti-sniper/TWAP/drift gate above must remain retryable.
-      this.lastFired.set(key, Date.now());
+              // All synchronous gates have passed; record the attempt now. A failed
+              // anti-sniper/TWAP/drift gate above must remain retryable.
+              this.lastFired.set(key, Date.now());
       this._schedulePersist();
       let result: OrderResult;
       if (this.config.dryRun) {
@@ -1421,6 +1441,11 @@ export class BasketQuorumService {
     } catch (error) {
       this.stats.failed++;
       console.error('[BasketQuorum] execute error:', error);
+    } finally {
+      // In-flight reservations never outlive the attempt: on success the spend
+      // is captured permanently by basketSpend, and every other path returns
+      // the reservation so the basket slice is not blocked.
+      releaseReservation?.();
     }
   }
 

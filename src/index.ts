@@ -555,6 +555,8 @@ export { RiskManager } from './services/risk-manager.js';
 export type { RiskConfig, RiskSnapshot } from './services/risk-manager.js';
 
 export { VoteStateStore } from './services/vote-state-store.js';
+export { BankrollReservationLedger } from './services/bankroll-reservation.js';
+export { SqliteStateStore, createStateStore } from './services/sqlite-state-store.js';
 export { JsonStateStore } from './services/state-store.js';
 export type { StateStore, PolylandState } from './services/state-store.js';
 export type { RejectReason, PipelineDecision, WalletAction, ConsensusSignal, ExecutionDecision } from './services/pipeline-types.js';

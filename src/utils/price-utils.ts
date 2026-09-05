@@ -76,6 +76,20 @@ export function quantizeBuyPrice(price: number, tickSize: TickSize): number {
   return quantizeToTick(price, tickSize, 'floor');
 }
 
+/** Map a numeric tick size to the SDK's TickSize enum for quantizer use. */
+export function tickSizeToEnum(tick: number): TickSize {
+  if (!Number.isFinite(tick) || tick <= 0) return '0.01';
+  if (tick >= 0.1) return '0.1';
+  if (tick >= 0.01) return '0.01';
+  if (tick >= 0.001) return '0.001';
+  return '0.0001';
+}
+
+/** Round a USDC amount to cents (the CLOB amount precision). */
+export function roundAmount(amount: number): number {
+  return Math.round(amount * 100) / 100;
+}
+
 export function roundSize(size: number): number {
   return Math.round(size * 100) / 100;
 }

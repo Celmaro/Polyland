@@ -18,4 +18,13 @@ describe('BankrollReservationLedger', () => {
     release(); release();
     expect(ledger.getReserved('x')).toBe(0);
   });
+
+  it('supports a dynamic limit provider that tracks capital', () => {
+    let capital = 100;
+    const ledger = new BankrollReservationLedger(() => capital);
+    expect(ledger.reserve('crypto', 80)).not.toBeNull();
+    expect(ledger.reserve('crypto', 21)).toBeNull();
+    capital = 200; // capital grows after a win
+    expect(ledger.reserve('crypto', 120)).not.toBeNull();
+  });
 });

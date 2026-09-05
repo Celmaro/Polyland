@@ -21,6 +21,7 @@ import {
   type BasketQuorumConfig,
 } from './src/index.js';
 import { signalAuditStore, SignalAuditStore, setBonferroniGroups } from './src/services/signal-audit-store.js';
+import { createStateStore } from './src/services/sqlite-state-store.js';
 import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from './src/utils/anti-sniper.js';
 import { ChainlinkTwapOracle } from './src/services/chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './src/services/clob-market-ws.js';
@@ -340,10 +341,13 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   };
   const screening = new WalletScreeningService(sdk.wallets, screeningConfig);
   const stateStore = new VoteStateStore('./data/quorum-state.json');
-  // Single namespaced state abstraction for new runtime state. Existing vote,
-  // risk, and audit stores remain compatible during the migration.
-  const runtimeState = new JsonStateStore('./data/polyland-state.json');
-  await runtimeState.load();
+  // Single namespaced state abstraction. SQLite is preferred on modern Node;
+  // JSON remains the compatibility fallback on older runtimes.
+  const { store: runtimeState, backend: stateBackend } = await createStateStore(
+    './data/polyland-state.sqlite',
+    './data/polyland-state.json',
+  );
+  log('INFO', `State backend: ${stateBackend}`);
   stateStore.setStateStore(runtimeState);
   const risk = new RiskManager(
     {
