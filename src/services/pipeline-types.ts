@@ -23,6 +23,10 @@ export interface WalletAction {
 }
 
 export interface ConsensusSignal {
+  signalId: string;
+  basketName: string;
+  side: 'BUY' | 'SELL';
+  walletCount: number;
   conditionId: string;
   marketSlug: string;
   outcome: string;

@@ -313,10 +313,21 @@ export {
   checkArbitrage,
   getEffectivePrices,
   ROUNDING_CONFIG,
+  quantizeToTick,
+  quantizeBuyPrice,
+  tickSizeToEnum,
+  roundAmount,
+  computeExactSharesAndCost,
 } from './utils/price-utils.js';
 export type { TickSize } from './utils/price-utils.js';
 
-// NOTE: MCP tools have been moved to @catalyst-team/poly-mcp package
+// Typed pipeline runtime boundaries
+export { ExecutionEngine } from './services/execution-engine.js';
+export type { ExecutionEngineConfig, ExecutionEngineDeps } from './services/execution-engine.js';
+
+export { PolylandRuntime } from './services/polyland-runtime.js';
+export type { PolylandRuntimeConfig, RuntimeStateSnapshot } from './services/polyland-runtime.js';
+
 // See packages/poly-mcp/
 
 // ===== Main SDK Class =====

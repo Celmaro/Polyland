@@ -90,6 +90,35 @@ export function roundAmount(amount: number): number {
   return Math.round(amount * 100) / 100;
 }
 
+const USDC_SCALE = 1_000_000n; // USDC micro-units
+const SHARE_SCALE = 1_000_000n; // share micro-units
+
+/**
+ * Exact order-boundary sizing: convert a USDC budget into the largest whole
+ * number of shares affordable at `price`, using integer micro-unit arithmetic
+ * so IEEE-754 trailing digits cannot produce an over-budget order
+ * (e.g. budget at $0.99 outcomes). Price is first floored to the market tick.
+ * Returns shares (rounded to 2dp) and the exact cost in cents.
+ */
+export function computeExactSharesAndCost(
+  budgetUsd: number,
+  price: number,
+  tickSize: TickSize,
+): { shares: number; costUsd: number } {
+  if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) return { shares: 0, costUsd: 0 };
+  const qPrice = quantizeBuyPrice(price, tickSize);
+  if (qPrice <= 0 || qPrice >= 1) return { shares: 0, costUsd: 0 };
+  const budgetMicros = BigInt(Math.floor(budgetUsd * Number(USDC_SCALE)));
+  const priceMicros = BigInt(Math.floor(qPrice * Number(USDC_SCALE)));
+  if (budgetMicros <= 0n || priceMicros <= 0n) return { shares: 0, costUsd: 0 };
+  // shares = floor(budget / price) in micro-units, exact integer math.
+  const sharesMicros = (budgetMicros * SHARE_SCALE) / priceMicros;
+  const shares = Number(sharesMicros) / Number(SHARE_SCALE);
+  const roundedShares = Math.floor(shares * 100) / 100;
+  const costUsd = roundAmount(roundedShares * qPrice);
+  return { shares: roundedShares, costUsd };
+}
+
 export function roundSize(size: number): number {
   return Math.round(size * 100) / 100;
 }

@@ -5,14 +5,14 @@
  * of whether it came from the MANUAL or AUTO ingestion source.
  *
  * Scoring methodology is adapted from Poly Syncer / Polycopy research:
- *   score = 0.45·sharpe_normalized
- *         + 0.20·edge_adjusted_winrate
+ *   score = 0.45·smart_score_normalized
+ *         + 0.20·recency/shrinkage_adjusted_edge
  *         + 0.15·log_roi_normalized
  *         + 0.10·drawdown_resilience
  *         + 0.10·rank_stability
  *
- * Each component is bounded 0–1.  Weights are constant across categories
- * (regime-specific weights are easy to overfit and hard to communicate).
+ * Each component is bounded 0–1. SmartScore is quantified once, as the 45%
+ * risk-adjusted-performance component; it is not reused as slippage.
  *
  * CopyScore is 0–100 (score × 100, capped 0–100).
  *
@@ -114,6 +114,10 @@ export interface WalletScreeningConfig {
   minCategoryTrades: number;
   /** Wallets inactive longer than this (days) are skipped — edge decays */
   maxInactiveDays: number;
+  /** Number of days used for timestamped closed-position win rate. */
+  winRateWindowDays: number;
+  /** Equivalent 50% prior trades used to shrink observed win rate. */
+  winRatePriorTrades: number;
   /**
    * Minimum CopyScore (0–100) for PRIMARY tier.
    * PRIMARY: elite wallets with score >= primaryCopyScoreThreshold.
@@ -143,6 +147,11 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   minCategoryTrades: 3,
   // Edge decays — a wallet idle 60+ days is not a live signal source.
   maxInactiveDays: 60,
+  // Win-rate recency window (days) over timestamped closed positions; a
+  // lifetime 50%-prior shrinkage equivalent of 20 trades; below that many
+  // window trades the window rate is blended toward lifetime rate.
+  winRateWindowDays: 14,
+  winRatePriorTrades: 20,
   // CopyScore thresholds (0–100 composite — Poly Syncer/Polycopy methodology).
   // PRIMARY: top-tier elite wallets (score >= 65).
   // SATELLITE: above-median contributors (score >= 45).
@@ -160,10 +169,10 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
  */
 export interface WalletScoringComponents {
   /**
-   * Sharpe-normalized (0–1): risk-adjusted return on log-PnL vs cohort median.
-   * We use profile.smartScore / 100 as a proxy (it encodes execution quality
-   * and risk-adjusted performance). Denominator = cohort 95th-percentile Sharpe
-   * (we approximate as smartScore 95/100 for normalization).
+   * Sharpe-normalized (0–1): risk-adjusted performance component.
+   * Computed as profile.smartScore / 100 — SmartScore (0-100) already encodes
+   * execution quality and risk-adjusted performance. This is the ONLY place
+   * SmartScore enters the composite (no second reuse as a slippage proxy).
    */
   sharpeNormalized: number;
   /**
@@ -173,6 +182,13 @@ export interface WalletScoringComponents {
    *
    * Approximated from: winRate − (1 − winRate) = 2·winRate − 1
    * which equals zero at 50% and 1.0 at 100%.
+   *
+   * The win rate feeding this component is:
+   *   1. the timestamped 14-day window rate when the closed-position series
+   *      has enough window trades, blended toward lifetime when it does not,
+   *   2. otherwise lifetime win rate — shrunk toward 50% with a beta prior of
+   *      `winRatePriorTrades` equivalent trades.
+   * This is the ONLY place win rate enters the composite.
    */
   edgeAdjustedWinRate: number;
   /**
@@ -197,6 +213,16 @@ export interface WalletScoringComponents {
    * small-sample shrinkage toward the cohort median in computeCopyScore().
    */
   sampleSize: number;
+  /**
+   * Win-rate (0–1) actually used by the edge component after recency-window
+   * selection and Bayesian shrinkage — exposed for transparency/tests.
+   */
+  adjustedWinRate: number;
+  /**
+   * Trades behind the (pre-shrinkage) win rate actually used by the edge
+   * component: window trades when a window exists, lifetime trades otherwise.
+   */
+  effectiveSampleSize: number;
 }
 
 // ============================================================================
@@ -476,6 +502,47 @@ export class WalletScreeningService {
   ): WalletScoringComponents {
     const n = positions.length;
 
+    // ---- Win rate: recency window first, lifetime fallback, then shrinkage.
+    // The timestamped closed-position series carries real settle times
+    // (ClosedPosition.timestamp), so when it exists we compute the win rate
+    // over the recency window (default 14 days) per the demand made on the
+    // formula: a wallet whose wins are all old should not be rewarded today.
+    // LIMITATION: WalletProfile (wallet-service.ts) carries NO per-trade
+    // timestamps — when the caller passes no positions (empty series), we
+    // cannot build a window and fall back to the lifetime win rate, applying
+    // the same Bayesian shrinkage. We do not invent window data.
+    const windowDays = this.config.winRateWindowDays;
+    const windowStart = Date.now() - windowDays * 86_400_000;
+    let windowWins = 0;
+    let windowTrades = 0;
+    for (const pos of positions) {
+      if ((pos.timestamp ?? 0) >= windowStart) {
+        windowTrades++;
+        if ((pos.realizedPnl ?? 0) > 0) windowWins++;
+      }
+    }
+
+    // Recency discount: with fewer than winRatePriorTrades window trades the
+    // window rate is noisy, so blend it toward the lifetime rate in proportion
+    // to the shortfall (weight = windowTrades / max(windowTrades, prior)).
+    const lifetimeWins = positions.reduce((s, p) => s + ((p.realizedPnl ?? 0) > 0 ? 1 : 0), 0);
+    const lifetimeWinRate = n > 0 ? lifetimeWins / n : profile.winRate;
+    const rawWinRate = n > 0
+      ? windowWins / Math.max(windowTrades, 1)
+        * Math.min(1, windowTrades / this.config.winRatePriorTrades)
+        + lifetimeWinRate * (1 - Math.min(1, windowTrades / this.config.winRatePriorTrades))
+      : profile.winRate;
+    const effectiveN = n > 0 ? windowTrades : 0;
+    // Bayesian shrinkage toward a 50% prior: winRateAdj = (wins+p) / (n+2p),
+    // where p = winRatePriorTrades/2 ≈ 10 wins + 10 losses. A 1-trade 100%
+    // sample shrinks to ~0.524 and cannot approach PRIMARY; a 100-trade 60%
+    // sample keeps its edge (0.583).
+    const priorHalf = Math.max(1, this.config.winRatePriorTrades / 2);
+    const adjustedWinRate =
+      ((rawWinRate * effectiveN) + priorHalf) /
+      (effectiveN + 2 * priorHalf);
+    const realizedWinRate = adjustedWinRate;
+
     // Per-position stats: cost basis (capital deployed), realized PnL, return.
     // For a settled binary, entry price avgPrice IS the break-even probability
     // (buying YES at $0.40 implies the market priced it 40% likely).
@@ -507,19 +574,12 @@ export class WalletScreeningService {
       if (dd < maxDrawdown) maxDrawdown = dd; // negative
     }
 
-    const realizedWinRate = n > 0 ? wins / n : 0;
 
-    // 1. Sharpe-normalized (0.45) — mean/std of per-trade returns.
-    // Denominator is cohort 95th-percentile; approximated as a benchmark Sharpe
-    // of 2.0 (a wallet at or above it scores 1.0, matching the reference cap).
-    let sharpe = 0;
-    if (returns.length >= 5) {
-      const mean = returns.reduce((s, r) => s + r, 0) / returns.length;
-      const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
-      const sd = Math.sqrt(variance);
-      sharpe = sd > 0 ? mean / sd : 0;
-    }
-    const sharpeNormalized = Math.max(0, Math.min(1, sharpe / 2.0));
+    // 1. Sharpe-normalized (0.45) — profile.smartScore / 100. SmartScore is the
+    // wallet's risk-adjusted execution-quality score (0-100) from the profile,
+    // normalized to 0-1. This is the SINGLE place SmartScore enters the
+    // composite; it is deliberately not reused under another component name.
+    const sharpeNormalized = Math.max(0, Math.min(1, profile.smartScore / 100));
 
     // 2. Edge-adjusted win-rate (0.20) — realized winRate minus trade-weighted
     // mean entry price (break-even). Buying at 40¢ and winning is real edge;
@@ -560,6 +620,8 @@ export class WalletScreeningService {
       drawdownResilience,
       rankStability,
       sampleSize: n,
+      adjustedWinRate,
+      effectiveSampleSize: effectiveN,
     };
   }
 
@@ -567,9 +629,10 @@ export class WalletScreeningService {
    * Composite CopyScore (0–100) using fixed-weight linear combination.
    * Mirrors Poly Syncer: Sharpe 0.45 | Edge-wr 0.20 | Log-ROI 0.15 | Drawdown 0.10 | Rank 0.10
    *
-   * Small-sample shrinkage: wallets with < 100 settled trades are pulled toward
-   * the cohort median (score 50), scaling linearly to zero shrinkage at 100.
-   * This is the reference methodology's defense against sample-size collapse.
+   * Confidence shrinkage: the raw composite is multiplied by
+   * sampleSize / (sampleSize + winRatePriorTrades). The same 20-trade prior
+   * used for win-rate shrinkage caps a one-trade wallet at ~5% of its raw
+   * score, so a lucky single trade can never approach SATELLITE/PRIMARY.
    */
   computeCopyScore(components: WalletScoringComponents): number {
     const raw =
@@ -578,12 +641,14 @@ export class WalletScreeningService {
       0.15 * components.logRoiNormalized +
       0.10 * components.drawdownResilience +
       0.10 * components.rankStability;
-    const scored = Math.round(Math.max(0, Math.min(1, raw)) * 100);
+    const boundedRaw = Math.max(0, Math.min(1, raw));
 
-    // Small-sample shrinkage toward 50 (cohort median). Applied AFTER the
-    // composite so thin wallets score near neutral rather than overconfident.
-    const shrinkage = Math.min(1, components.sampleSize / 100);
-    return Math.round(50 + (scored - 50) * shrinkage);
+    // Confidence shrinkage uses the same 20-trade prior as win rate. Unlike
+    // pulling a tiny score toward 50, this prevents an n=1 wallet from
+    // appearing investable solely because every component is optimistic.
+    const confidence = components.sampleSize /
+      (components.sampleSize + this.config.winRatePriorTrades);
+    return Math.round(boundedRaw * confidence * 100);
   }
 
   // --------------------------------------------------------------------------
@@ -604,7 +669,10 @@ export class WalletScreeningService {
     const perTrade = profile.realizedPnL / Math.max(profile.tradeCount, 1);
     const profitability = Math.max(0, Math.min(100, 50 + 50 * Math.tanh(perTrade / 50)));
     const timing = Math.max(0, Math.min(100, profile.avgPercentPnL * 100));
-    const slippage = Math.max(0, Math.min(100, profile.smartScore));
+    // No fill-quality/slippage field is available in WalletProfile. Keep this
+    // dashboard-only dimension neutral; SmartScore is already quantified once
+    // as the 45% sharpeNormalized component of CopyScore.
+    const slippage = 50;
     const consistency = Math.max(0, Math.min(100, profile.winRate * 100));
     const focus = profile.positionCount / Math.max(profile.tradeCount, 1);
     const marketSelection = Math.max(0, Math.min(100, 100 * (1 - focus)));
@@ -864,7 +932,7 @@ export class WalletScreeningService {
       scoringComponents: {
         sharpeNormalized: 1, edgeAdjustedWinRate: 1,
         logRoiNormalized: 1, drawdownResilience: 1, rankStability: 1,
-        sampleSize: 100,
+        sampleSize: 100, adjustedWinRate: 1, effectiveSampleSize: 100,
       },
       consistency: 100,
       winRate: 1,
