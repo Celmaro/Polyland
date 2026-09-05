@@ -60,6 +60,22 @@ export function roundPrice(
 /**
  * Round a size to valid decimals (always 2 decimal places)
  */
+
+/** Quantize a finite decimal using integer tick units at the order boundary. */
+export function quantizeToTick(value: number, tickSize: TickSize, direction: 'floor' | 'ceil' | 'round' = 'round'): number {
+  if (!Number.isFinite(value) || value < 0) return 0;
+  const decimals = ROUNDING_CONFIG[tickSize].price;
+  const scale = 10 ** decimals;
+  const units = value * scale;
+  const rounded = direction === 'floor' ? Math.floor(units) : direction === 'ceil' ? Math.ceil(units) : Math.round(units);
+  return rounded / scale;
+}
+
+/** Quantize a buy price downward so the final order never exceeds its budget. */
+export function quantizeBuyPrice(price: number, tickSize: TickSize): number {
+  return quantizeToTick(price, tickSize, 'floor');
+}
+
 export function roundSize(size: number): number {
   return Math.round(size * 100) / 100;
 }
