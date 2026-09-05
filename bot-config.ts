@@ -14,6 +14,7 @@ import {
   BasketQuorumService,
   WalletIngestionService,
   WalletScreeningService,
+  JsonStateStore,
   VoteStateStore,
   RiskManager,
   type SmartMoneyTrade,
@@ -339,6 +340,10 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   };
   const screening = new WalletScreeningService(sdk.wallets, screeningConfig);
   const stateStore = new VoteStateStore('./data/quorum-state.json');
+  // Single namespaced state abstraction for new runtime state. Existing vote,
+  // risk, and audit stores remain compatible during the migration.
+  const runtimeState = new JsonStateStore('./data/polyland-state.json');
+  await runtimeState.load();
   const risk = new RiskManager(
     {
       dailyMaxLossPct: 0.05,
@@ -517,10 +522,12 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
       try {
         await fs.mkdir('./data', { recursive: true });
         await fs.writeFile(screeningCachePath, JSON.stringify({ savedAt: Date.now(), cacheKey, screened }), 'utf8');
+        await runtimeState.save({ screening: { savedAt: Date.now(), cacheKey, screened } });
       } catch (err) {
         log('WARN', `Could not persist wallet screening cache: ${err instanceof Error ? err.message : err}`);
       }
     }
+    await runtimeState.save({ walletUniverse: screened });
     const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
     const nPrimary = screened.filter((w) => w.tier === 'PRIMARY').length;
     const nSatellite = screened.filter((w) => w.tier === 'SATELLITE').length;
