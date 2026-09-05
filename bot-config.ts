@@ -394,9 +394,16 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     maxRepriceTicks: parseInt(process.env.ANTI_SNIPER_MAX_REPRICE_TICKS ?? '2', 10),
     midJumpLookbackMs: parseInt(process.env.ANTI_SNIPER_LOOKBACK_MS ?? '3000', 10),
   };
-  const antiSniper = new AntiSniperGuard(null, antiSniperConfig);
-  basketQuorum.setAntiSniper(antiSniper);
-  log('QUORUM', `Anti-sniper guard: ${JSON.stringify(antiSniperConfig)}`);
+  // Disabled by default: the production sample showed 58 blocks (57 mid_unstable)
+  // and zero fires, so this gate currently starves consensus. Keep it opt-in for
+  // controlled paper A/B testing via ANTI_SNIPER_ENABLED=true.
+  if (process.env.ANTI_SNIPER_ENABLED === 'true') {
+    const antiSniper = new AntiSniperGuard(null, antiSniperConfig);
+    basketQuorum.setAntiSniper(antiSniper);
+    log('QUORUM', `Anti-sniper guard enabled: ${JSON.stringify(antiSniperConfig)}`);
+  } else {
+    log('QUORUM', 'Anti-sniper guard disabled by default; enable for paper A/B testing');
+  }
 
   // Wire Chainlink TWAP oracle (KingSparta69/MattheusFeittosa pattern) for
   // crypto Up/Down markets. Connects to wss://ws-live-data.polymarket.com
@@ -407,7 +414,10 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     pingIntervalMs: 5_000,
     maxStalenessMs: parseInt(process.env.TWAP_MAX_STALENESS_MS ?? '30000', 10),
   });
-  if (process.env.TWAP_ENABLED !== 'false') {
+  // Disabled by default: the observed production funnel recorded TWAP 0/0,
+  // providing no measurable protection. Keep it opt-in for crypto-market A/B
+  // testing via TWAP_ENABLED=true.
+  if (process.env.TWAP_ENABLED === 'true') {
     basketQuorum.setTwapOracle(twapOracle);
     twapOracle.connect().catch((err) => {
       log('WARN', `TWAP oracle connect failed: ${err instanceof Error ? err.message : err}`);
@@ -498,6 +508,7 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     // candidate universe and screening config are unchanged. The cache is a
     // JSON file, not a database; on Zeabur it survives only if /data is backed
     // by a persistent volume. A cache miss safely falls back to full screening.
+    const screeningStartedAt = Date.now();
     log('QUORUM', 'Screening wallets...');
     const screeningCachePath = './data/wallet-screening.json';
     const screeningCacheTtlMs = 6 * 60 * 60 * 1000;
@@ -534,7 +545,7 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
     const nPrimary = screened.filter((w) => w.tier === 'PRIMARY').length;
     const nSatellite = screened.filter((w) => w.tier === 'SATELLITE').length;
-    log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE (${nPrimary}P/${nSatellite}S)`);
+    log('QUORUM', `Screened: ${screened.length} total, ${primaries.length} PRIMARY/SATELLITE (${nPrimary}P/${nSatellite}S), duration=${Date.now() - screeningStartedAt}ms`);
     if (nPrimary === 0) {
       log('WARN', 'ZERO PRIMARY wallets — tiered quorum needs 2xPRIMARY or 1P+2S; only the 5xSATELLITE escape hatch can fire');
     }
