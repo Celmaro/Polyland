@@ -14,6 +14,7 @@ export interface PolylandState {
   risk?: unknown;
   positions?: unknown;
   screening?: unknown;
+  audit?: unknown;
 }
 
 export interface StateStore {

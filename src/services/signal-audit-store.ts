@@ -21,6 +21,7 @@
 
 import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 import * as fs from 'node:fs';
+import type { StateStore } from './state-store.js';
 
 // ============================================================================
 // Types
@@ -114,10 +115,16 @@ export class SignalAuditStore {
   // L11: JSONL audit trail — every fire/settlement appends one line to disk
   // so the full decision log survives restarts (OctagonAI/kalshi-bot pattern).
   private static jsonlPath: string | null = null;
+  private stateStore: StateStore | null = null;
 
   /** Enable JSONL audit logging. Call once at boot. */
   static enableJsonl(path: string): void {
     SignalAuditStore.jsonlPath = path;
+  }
+
+  /** Attach the shared state boundary; JSONL remains the audit source of truth. */
+  setStateStore(store: StateStore): void {
+    this.stateStore = store;
   }
 
   appendJsonl(event: string, data: Record<string, unknown>): void {
@@ -485,6 +492,7 @@ export class SignalAuditStore {
         // keep going — a single bad record must not block the trail replay
       }
     }
+    void this.stateStore?.save({ audit: { signals: Object.keys(this.signals).length, unsettled: this.getUnsettledConditionIds().length } });
   }
 
   private _replayFire(evt: {

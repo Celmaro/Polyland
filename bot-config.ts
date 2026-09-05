@@ -344,6 +344,7 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   // risk, and audit stores remain compatible during the migration.
   const runtimeState = new JsonStateStore('./data/polyland-state.json');
   await runtimeState.load();
+  stateStore.setStateStore(runtimeState);
   const risk = new RiskManager(
     {
       dailyMaxLossPct: 0.05,
@@ -356,11 +357,13 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     },
     CONFIG.capital.totalUsd,
   );
+  risk.setStateStore(runtimeState);
   // P6: survive restarts — a redeploy must not wipe a breached halt.
   RiskManager.enablePersistence('./data/risk-state.json');
   risk.loadPersistedState();
   // L11: JSONL audit trail — every fire/settlement persisted to disk.
   SignalAuditStore.enableJsonl('./data/signal-audit.jsonl');
+  signalAuditStore.setStateStore(runtimeState);
   // Rebuild 30-day edge stats from the trail so a redeploy doesn't wipe the
   // significance gate's history (previously signals reset to {} every boot).
   signalAuditStore.replayJsonl('./data/signal-audit.jsonl');

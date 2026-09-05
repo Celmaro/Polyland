@@ -22,6 +22,7 @@
 
 import { existsSync, mkdirSync, renameSync, promises as fsp } from 'node:fs';
 import { dirname } from 'node:path';
+import type { StateStore } from './state-store.js';
 
 // ============================================================================
 // Shape (kept in sync with BasketQuorumService internals)
@@ -59,6 +60,7 @@ const STATE_VERSION = 1;
 
 export class VoteStateStore {
   private filePath: string;
+  private stateStore: StateStore | null = null;
   private _votes: Map<string, Map<string, Map<string, PersistedVote>>> = new Map();
   private _lastFired: Map<string, number> = new Map();
   /**
@@ -71,6 +73,12 @@ export class VoteStateStore {
 
   constructor(filePath: string) {
     this.filePath = filePath;
+  }
+
+  /** Attach the shared state boundary; legacy file persistence remains the
+   * fallback until this store is fully migrated. */
+  setStateStore(store: StateStore): void {
+    this.stateStore = store;
   }
 
   /** Load from disk. Missing file = empty state. */
@@ -147,6 +155,7 @@ export class VoteStateStore {
     const tmp = this.filePath + '.tmp';
     await fsp.writeFile(tmp, JSON.stringify(state), 'utf8');
     renameSync(tmp, this.filePath);
+    if (this.stateStore) await this.stateStore.save({ quorum: state });
   }
 
   /**

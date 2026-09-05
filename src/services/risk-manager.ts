@@ -32,6 +32,7 @@
  */
 
 import * as fs from 'node:fs';
+import type { StateStore } from './state-store.js';
 
 // ============================================================================
 // Config
@@ -169,6 +170,7 @@ export class RiskManager {
   // daily-loss halt (KaustubhPatange/polymarket-trade-engine early-bird
   // pattern — refuse to trade into an already-blown session).
   private static persistPath: string | null = null;
+  private stateStore: StateStore | null = null;
 
   constructor(config: Partial<RiskConfig> = {}, startingCapital = 1000) {
     this.config = { ...DEFAULT_RISK_CONFIG, ...config };
@@ -185,6 +187,11 @@ export class RiskManager {
    */
   static enablePersistence(path: string): void {
     RiskManager.persistPath = path;
+  }
+
+  /** Attach the shared state boundary while retaining the legacy JSON file. */
+  setStateStore(store: StateStore): void {
+    this.stateStore = store;
   }
 
   /** Load persisted state into this instance (no-op if none/enabled=false). */
@@ -287,6 +294,7 @@ export class RiskManager {
       const tmp = path + '.tmp';
       fs.writeFileSync(tmp, payload, 'utf8');
       fs.renameSync(tmp, path);
+      void this.stateStore?.save({ risk: JSON.parse(payload) });
     } catch (err) {
       console.warn('[RiskManager] failed to persist state:', err instanceof Error ? err.message : err);
     }
