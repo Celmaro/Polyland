@@ -127,29 +127,6 @@ export type {
 
 // RealtimeService (legacy) has been removed - use RealtimeServiceV2 instead
 
-// ArbitrageService (Real-time arbitrage detection, execution, rebalancing, and settlement)
-export { ArbitrageService } from './services/arbitrage-service.js';
-export type {
-  ArbitrageMarketConfig,
-  ArbitrageServiceConfig,
-  ArbitrageOpportunity as ArbitrageServiceOpportunity,
-  ArbitrageExecutionResult,
-  ArbitrageServiceEvents,
-  OrderbookState,
-  BalanceState,
-  // Rebalancer types
-  RebalanceAction,
-  RebalanceResult,
-  // Settle types
-  SettleResult,
-  // Clear position types (smart settle)
-  ClearPositionResult,
-  ClearAction,
-  // Scanning types
-  ScanCriteria,
-  ScanResult,
-} from './services/arbitrage-service.js';
-
 // SmartMoneyService - Smart Money detection and Copy Trading
 export {
   SmartMoneyService,
@@ -196,40 +173,6 @@ export type {
   LifecycleReportOptions,
   TextReport,
 } from './services/smart-money-service.js';
-
-// DipArbService - Dip Arbitrage for 15m/5m UP/DOWN markets
-export { DipArbService } from './services/dip-arb-service.js';
-export type {
-  DipArbServiceConfig,
-  DipArbMarketConfig,
-  DipArbRoundState,
-  DipArbStats,
-  DipArbSignal,
-  DipArbLeg1Signal,
-  DipArbLeg2Signal,
-  DipArbExecutionResult,
-  DipArbRoundResult,
-  DipArbNewRoundEvent,
-  DipArbPriceUpdateEvent,
-  DipArbScanOptions,
-  DipArbFindAndStartOptions,
-  DipArbAutoRotateConfig,
-  DipArbSettleResult,
-  DipArbRotateEvent,
-  DipArbSide,
-  DipArbUnderlying,
-  DipArbPhase,
-  DipArbLegInfo,
-} from './services/dip-arb-types.js';
-
-// BinanceService - BTC/ETH/SOL K-line data from Binance
-export { BinanceService } from './services/binance-service.js';
-export type {
-  BinanceKLine,
-  BinanceSymbol,
-  BinanceInterval,
-  BinanceKLineOptions,
-} from './services/binance-service.js';
 
 // TradingService - Unified trading and market data
 export {
@@ -387,9 +330,7 @@ import { MarketService } from './services/market-service.js';
 import { TradingService } from './services/trading-service.js';
 import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
-import { BinanceService } from './services/binance-service.js';
-import { DipArbService } from './services/dip-arb-service.js';
-import type { UnifiedMarket, ProcessedOrderbook, ArbitrageOpportunity, KLineInterval, KLineCandle, DualKLineData, PolySDKOptions } from './core/types.js';
+import type { UnifiedMarket, ProcessedOrderbook, PolySDKOptions } from './core/types.js';
 import { createUnifiedCache, type UnifiedCache } from './core/unified-cache.js';
 
 // Re-export for backward compatibility
@@ -411,8 +352,6 @@ export class PolymarketSDK {
   public readonly markets: MarketService;
   public readonly realtime: RealtimeServiceV2;
   public readonly smartMoney: SmartMoneyService;
-  public readonly binance: BinanceService;
-  public readonly dipArb: DipArbService;
 
   // Initialization state
   private _initialized = false;
@@ -440,8 +379,7 @@ export class PolymarketSDK {
 
     // Initialize services
     this.wallets = new WalletService(this.dataApi, this.subgraph, this.cache);
-    this.binance = new BinanceService(this.rateLimiter, this.cache);
-    this.markets = new MarketService(this.gammaApi, this.dataApi, this.rateLimiter, this.cache, undefined, this.binance);
+    this.markets = new MarketService(this.gammaApi, this.dataApi, this.rateLimiter, this.cache);
     this.realtime = new RealtimeServiceV2();
     this.smartMoney = new SmartMoneyService(
       this.wallets,
@@ -451,14 +389,6 @@ export class PolymarketSDK {
       this.dataApi  // pass dataApi for report generation
     );
 
-    // Initialize DipArbService
-    this.dipArb = new DipArbService(
-      this.realtime,
-      this.tradingService,
-      this.markets,
-      config.privateKey,
-      config.chainId
-    );
   }
 
   // ===== Static Factory Methods =====
@@ -546,7 +476,6 @@ export class PolymarketSDK {
    * Stop SDK - disconnect all services and clean up
    */
   stop(): void {
-    this.dipArb.stop();
     this.smartMoney.disconnect();
     this.realtime.disconnect();
   }
@@ -576,40 +505,6 @@ export class PolymarketSDK {
    */
   async getOrderbook(conditionId: string): Promise<ProcessedOrderbook> {
     return this.markets.getProcessedOrderbook(conditionId);
-  }
-
-  /**
-   * Detect arbitrage opportunity
-   *
-   * 使用有效价格计算套利机会（正确考虑镜像订单）
-   * 详细文档见: docs/01-polymarket-orderbook-arbitrage.md
-   */
-  async detectArbitrage(
-    conditionId: string,
-    threshold = 0.005
-  ): Promise<ArbitrageOpportunity | null> {
-    const orderbook = await this.getOrderbook(conditionId);
-    const { effectivePrices, longArbProfit, shortArbProfit } = orderbook.summary;
-
-    if (longArbProfit > threshold) {
-      return {
-        type: 'long',
-        profit: longArbProfit,
-        action: `Buy YES @ ${effectivePrices.effectiveBuyYes.toFixed(4)} + Buy NO @ ${effectivePrices.effectiveBuyNo.toFixed(4)}, merge for 1 USDC`,
-        expectedProfit: longArbProfit,
-      };
-    }
-
-    if (shortArbProfit > threshold) {
-      return {
-        type: 'short',
-        profit: shortArbProfit,
-        action: `Split 1 USDC, Sell YES @ ${effectivePrices.effectiveSellYes.toFixed(4)} + Sell NO @ ${effectivePrices.effectiveSellNo.toFixed(4)}`,
-        expectedProfit: shortArbProfit,
-      };
-    }
-
-    return null;
   }
 
   // ===== Cache Management =====

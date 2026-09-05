@@ -135,7 +135,7 @@ TOTAL_MAX_LOSS_PCT=0.40      # حد خسارة إجمالي 40% = إيقاف ن�
 ## 4. تشغيل البوت
 
 ```bash
-npx tsx bot-with-dashboard.ts
+npm start
 ```
 
 ### ماذا سيحدث؟

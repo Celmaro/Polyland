@@ -18,6 +18,6 @@
     "allowSyntheticDefaultImports": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*", "scripts/dip-arb/**/*", "bot-config.ts"],
+  "include": ["src/**/*", "bot-config.ts"],
   "exclude": ["node_modules", "dist", "poly-sdk"]
 }

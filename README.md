@@ -1,5 +1,7 @@
 # 🤖 Polymarket Trading Bot v3.1 - Enhanced Risk Management
 
+> **Polyland production runtime:** `npm start` runs `dist/bot-config.js`. It uses basket-quorum copy trading only. The legacy dashboard runner and standalone arbitrage/DipArb examples are not part of production.
+
 **The Ultimate Open-Source Automated Trading Bot for Polymarket**
 
 [![English](https://img.shields.io/badge/Language-English-blue)](README.md)
@@ -152,7 +154,7 @@ Now the fun part! Let's start the bot with the visual dashboard.
 Run this command:
 
 ```bash
-npx tsx bot-with-dashboard.ts
+npm start
 ```
 
 ### What happens next?
@@ -232,14 +234,14 @@ The bot now **adapts position sizes** based on performance:
 
 The bot comes with 4 powerful strategies. You can toggle them ON/OFF in the dashboard.
 
-### 1. ⚖️ Arbitrage
+### Legacy strategy reference: Arbitrage (not part of Polyland production)
 - **Concept**: Finds markets where `YES Price + NO Price < $1.00`.
 - **Action**: Buys both sides immediately.
 - **Profit**: Guaranteed math-based profit when the market resolves to $1.00.
 - **🆕 v3.1**: Higher profit threshold (1%) to cover gas fees
 - **Risk**: Extremely Low.
 
-### 2. 📉 DipArb (Dip Arbitrage)
+### Legacy strategy reference: DipArb (not part of Polyland production)
 - **Concept**: Watches for panic selling in 15-minute crypto markets (BTC, ETH).
 - **Trigger**: If price crashes >15% in 3 seconds.
 - **Action**: Buys the dip (Leg 1) and hedges with the opposite side (Leg 2).
@@ -257,7 +259,7 @@ The bot comes with 4 powerful strategies. You can toggle them ON/OFF in the dash
 - **Action**: Copies their trades automatically.
 - **Risk**: Medium (depends on trader quality).
 
-### 4. ⚡ Direct Trading
+### Legacy strategy reference: Direct Trading (not part of Polyland production)
 - **Concept**: Tools for manual trading with super-powers.
 - **Features**:
   - **FOK (Fill or Kill)**: Ensures your whole order fills or cancels.

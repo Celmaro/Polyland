@@ -4,8 +4,7 @@
  * The ONLY active strategy is basket-quorum copy trading: watch a screened
  * set of expert wallets, fire only when K distinct wallets in a category
  * basket agree on the same outcome within a rolling window, then copy with
- * risk-managed sizing. All other strategies (arbitrage, dip-arb, direct,
- * on-chain, bridge, binance) are disabled.
+ * risk-managed sizing.
  */
 
 import 'dotenv/config';
@@ -36,12 +35,6 @@ const CONFIG = {
     maxPerMarketPct: 0.10,
     maxTotalExposurePct: 0.30,
     minOrderUsd: 5,
-    strategyAllocation: {
-      smartMoney: 0.60,
-      arbitrage: 0.20,
-      dipArb: 0.10,
-      directTrades: 0.10,
-    },
   },
 
   risk: {
@@ -90,56 +83,6 @@ const CONFIG = {
       ] as string[],
     },
 
-  arbitrage: {
-    enabled: false,
-    // 🔴 FIXED: Higher profit threshold to account for gas fees
-    profitThreshold: 0.01,  // Up from 0.5% to 1%
-    minTradeSize: 20,  // Up from 5 to reduce gas impact
-    maxTradeSize: 100,  // Up from 50
-    minVolume24h: 5000,
-    autoExecute: true,
-    enableRebalancer: true,
-
-    // 🔴 NEW: Gas fee accounting
-    estimatedGasCostUSD: 0.10,  // Estimated gas per arb cycle
-    minNetProfit: 0.50,  // Minimum $0.50 profit after gas
-  },
-
-  dipArb: {
-    enabled: false,
-    coins: ['BTC', 'ETH', 'SOL'] as const,
-    shares: 10,
-    sumTarget: 0.92,
-    autoRotate: true,
-    // 🔴 NEW: Minimum trade value enforcement
-    minTradeValueUSD: 1.5,  // $1.50 minimum (buffer above $1)
-  },
-
-  onchain: {
-    enabled: false,
-    autoApprove: true,
-    minMatic: 0.5,
-  },
-
-  binance: {
-    enabled: false,
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'] as const,
-    interval: '15m' as const,
-    trendThreshold: 2,
-  },
-
-  directTrading: {
-    enabled: false,
-    trendFollowing: true,
-    minTrendStrength: 0.02,
-    // 🔴 NEW: Stop-loss and take-profit
-    stopLossPct: 0.15,  // 15% stop loss
-    takeProfitPct: 0.25,  // 25% take profit
-    trailingStopPct: 0.10,  // 10% trailing stop
-    maxHoldDays: 7,  // Exit after 7 days
-    minRiskReward: 1.5,  // Minimum 1.5:1 risk/reward ratio
-  },
-
   dryRun: process.env.DRY_RUN !== 'false',
 };
 
@@ -166,33 +109,11 @@ interface BotState {
   permanentlyHalted: boolean;  // When total loss limit hit
   lastDailyReset: number;
 
-  // Strategy stats
-  smartMoneyTrades: number;
-  arbTrades: number;
-  dipArbTrades: number;
-  directTrades: number;
-  arbProfit: number;
-
-  // Tracked data
-  followedWallets: string[];
-  activeArbMarket: string | null;
-  activeDipArbMarket: string | null;
-
-  // On-chain stats
-  splits: number;
-  merges: number;
-  redeems: number;
-  swaps: number;
-
   // Balances
   usdcBalance: number;
   usdcEBalance: number;
   maticBalance: number;
 
-  // Analysis
-  btcTrend: 'up' | 'down' | 'neutral';
-  ethTrend: 'up' | 'down' | 'neutral';
-  solTrend: 'up' | 'down' | 'neutral';
 }
 
 const state: BotState = {
@@ -214,24 +135,9 @@ const state: BotState = {
   permanentlyHalted: false,
   lastDailyReset: Date.now(),
 
-  smartMoneyTrades: 0,
-  arbTrades: 0,
-  dipArbTrades: 0,
-  directTrades: 0,
-  arbProfit: 0,
-  followedWallets: [],
-  activeArbMarket: null,
-  activeDipArbMarket: null,
-  splits: 0,
-  merges: 0,
-  redeems: 0,
-  swaps: 0,
   usdcBalance: 0,
   usdcEBalance: 0,
   maticBalance: 0,
-  btcTrend: 'neutral',
-  ethTrend: 'neutral',
-  solTrend: 'neutral',
 };
 
 // ============================================================================
@@ -242,95 +148,14 @@ function log(level: string, message: string, data?: unknown) {
   const timestamp = new Date().toISOString();
   const icons: Record<string, string> = {
     INFO: '📋', WARN: '⚠️', ERROR: '❌', TRADE: '💰', SIGNAL: '🎯',
-    ARB: '🔄', WALLET: '👛', CHAIN: '⛓️', SWAP: '💱', BRIDGE: '🌉',
-    KLINE: '📊', TREND: '📈',
+    WALLET: '👛',
   };
   console.log(`[${timestamp}] ${icons[level] || '•'} ${message}`);
   if (data) console.log(JSON.stringify(data, null, 2));
 }
 
-// 🔴 FIXED: Comprehensive risk management with multiple layers
-function canTrade(): boolean {
-  // Check if permanently halted
-  if (state.permanentlyHalted) {
-    log('ERROR', '🛑 Trading permanently halted - total loss limit reached');
-    return false;
-  }
-
-  // Reset daily PnL if new day
-  const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
-  if (daysSinceReset >= 1) {
-    log('INFO', `Daily PnL reset. Previous day: $${state.dailyPnL.toFixed(2)}`);
-    state.dailyPnL = 0;
-    state.lastDailyReset = Date.now();
-  }
-
-  // Reset monthly PnL if new month
-  const daysSinceMonthStart = (Date.now() - state.monthStartTime) / (1000 * 60 * 60 * 24);
-  if (daysSinceMonthStart >= 30) {
-    log('INFO', `Monthly PnL reset. Previous month: $${state.monthlyPnL.toFixed(2)}`);
-    state.monthlyPnL = 0;
-    state.monthStartTime = Date.now();
-  }
-
-  // Update current capital and drawdown
-  state.currentCapital = CONFIG.capital.totalUsd + state.totalPnL;
-  if (state.currentCapital > state.peakCapital) {
-    state.peakCapital = state.currentCapital;
-  }
-  state.currentDrawdown = (state.peakCapital - state.currentCapital) / state.peakCapital;
-
-  // Check temporary pause
-  if (state.isPaused && Date.now() < state.pauseUntil) return false;
-  if (state.isPaused && Date.now() >= state.pauseUntil) {
-    state.isPaused = false;
-    log('INFO', 'Bot resumed after cooldown');
-  }
-
-  // 🔴 Layer 1: Daily loss limit
-  const dailyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.dailyMaxLossPct;
-  if (state.dailyPnL <= -dailyLossLimit) {
-    state.isPaused = true;
-    state.pauseUntil = Date.now() + CONFIG.risk.pauseOnBreachMinutes * 60 * 1000;
-    log('WARN', `Daily loss limit breached: -$${Math.abs(state.dailyPnL).toFixed(2)} (limit: $${dailyLossLimit.toFixed(2)})`);
-    log('WARN', `Bot paused for ${CONFIG.risk.pauseOnBreachMinutes} minutes`);
-    return false;
-  }
-
-  // 🔴 Layer 2: Monthly loss limit (NEW)
-  const monthlyLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.monthlyMaxLossPct;
-  if (state.monthlyPnL <= -monthlyLossLimit) {
-    log('ERROR', `🛑 Monthly loss limit breached: -$${Math.abs(state.monthlyPnL).toFixed(2)} (limit: $${monthlyLossLimit.toFixed(2)})`);
-    log('ERROR', 'Trading paused until next month');
-    state.isPaused = true;
-    state.pauseUntil = Date.now() + (30 * 24 * 60 * 60 * 1000);  // Pause for 30 days
-    return false;
-  }
-
-  // 🔴 Layer 3: Drawdown from peak (NEW)
-  if (state.currentDrawdown >= CONFIG.risk.maxDrawdownFromPeak) {
-    log('ERROR', `🛑 Maximum drawdown reached: ${(state.currentDrawdown * 100).toFixed(1)}% (limit: ${(CONFIG.risk.maxDrawdownFromPeak * 100).toFixed(1)}%)`);
-    log('ERROR', `Peak: $${state.peakCapital.toFixed(2)} → Current: $${state.currentCapital.toFixed(2)}`);
-    state.isPaused = true;
-    state.pauseUntil = Date.now() + (7 * 24 * 60 * 60 * 1000);  // Pause for 7 days
-    return false;
-  }
-
-  // 🔴 Layer 4: Total loss limit - PERMANENT HALT (NEW)
-  const totalLossLimit = CONFIG.capital.totalUsd * CONFIG.risk.totalMaxLossPct;
-  if (state.totalPnL <= -totalLossLimit) {
-    state.permanentlyHalted = true;
-    log('ERROR', '💀 TOTAL LOSS LIMIT REACHED - TRADING PERMANENTLY HALTED');
-    log('ERROR', `Total loss: -$${Math.abs(state.totalPnL).toFixed(2)} (limit: $${totalLossLimit.toFixed(2)})`);
-    log('ERROR', 'Please review strategy before restarting with new capital');
-    return false;
-  }
-
-  return true;
-}
-
 // 🔴 FIXED: Enhanced trade recording with win tracking
-function recordTrade(profit: number, strategy: string) {
+function recordTrade(profit: number) {
   state.tradesExecuted++;
   state.dailyPnL += profit;
   state.monthlyPnL += profit;  // NEW
@@ -352,38 +177,6 @@ function recordTrade(profit: number, strategy: string) {
     ? (state.peakCapital - state.currentCapital) / state.peakCapital
     : 0;
 
-  if (strategy === 'smartMoney') state.smartMoneyTrades++;
-  else if (strategy === 'arbitrage') state.arbTrades++;
-  else if (strategy === 'dipArb') state.dipArbTrades++;
-  else if (strategy === 'direct') state.directTrades++;
-}
-
-// 🔴 NEW: Dynamic position sizing based on performance
-function calculatePositionSize(baseSize: number): number {
-  if (!CONFIG.risk.enableDynamicSizing) return baseSize;
-
-  let size = baseSize;
-
-  // Reduce during losing streaks
-  if (state.consecutiveLosses > 2) {
-    const reduction = Math.pow(1 - CONFIG.risk.lossSizingReduction, state.consecutiveLosses - 2);
-    size *= reduction;
-    if (CONFIG.risk.minPositionPct && size < CONFIG.risk.minPositionPct) {
-      log('WARN', `Position size reduced to minimum ${(CONFIG.risk.minPositionPct * 100).toFixed(1)}% due to ${state.consecutiveLosses} consecutive losses`);
-    }
-  }
-
-  // Increase slightly during winning streaks (capped)
-  if (state.consecutiveWins > 3) {
-    const increase = 1 + (Math.min(state.consecutiveWins - 3, 5) * CONFIG.risk.winSizingIncrease);
-    size *= increase;
-  }
-
-  // Apply floor and ceiling
-  size = Math.max(CONFIG.risk.minPositionPct || 0.01, size);
-  size = Math.min(CONFIG.risk.maxPositionPct || 0.05, size);
-
-  return size;
 }
 
 // ============================================================================
@@ -573,7 +366,7 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
   // results measure the strategy we actually run (item 1).
   basketQuorum.startExitLadder();
   // Settled PnL -> BotState so the [risk] display line reflects reality.
-  basketQuorum.onSettledTrade = (pnlUsd: number) => recordTrade(pnlUsd, 'smartMoney');
+  basketQuorum.onSettledTrade = (pnlUsd: number) => recordTrade(pnlUsd);
   basketQuorum.setStateStore(stateStore);
   basketQuorum.setGammaApi(sdk.gammaApi);
   basketQuorum.setSpecializationThresholds(
@@ -837,14 +630,7 @@ async function main() {
   log('INFO', 'Configuration', {
     capital: `$${CONFIG.capital.totalUsd}`,
     dryRun: CONFIG.dryRun,
-    strategies: {
-      smartMoney: CONFIG.smartMoney.enabled,
-      arbitrage: CONFIG.arbitrage.enabled,
-      dipArb: CONFIG.dipArb.enabled,
-      directTrading: CONFIG.directTrading.enabled,
-    },
-    onchain: CONFIG.onchain.enabled,
-    binance: CONFIG.binance.enabled,
+    strategy: 'basket-quorum',
   });
 
   const sdk = await PolymarketSDK.create({
@@ -853,15 +639,7 @@ async function main() {
 
   log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
 
-  // Setup all services
-  // Only basket-quorum copy trading runs.
-  // Non-quorum services disabled: setupSwap, setupOnchain, setupBridge,
-  // setupBinanceAnalysis, analyzeTopWallets, queryOnchainData.
   await setupBasketQuorum(sdk);
-  // setupSmartMoney(sdk); // disabled — only basket quorum copy trading runs
-  // setupArbitrage(sdk);  // disabled — arbitrage not used
-  // setupDipArb(sdk);     // disabled — dipArb not used
-  // await setupDirectTrading(sdk);  // disabled — directTrading not used
 
   displayStatus();
   setInterval(displayStatus, 60000);

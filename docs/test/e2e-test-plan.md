@@ -919,7 +919,7 @@ pnpm tsx examples/08-trading-orders.ts
 pnpm tsx examples/07-realtime-websocket.ts
 
 # Test ArbitrageService
-pnpm tsx examples/13-arbitrage-service.ts
+pnpm tsx historical arbitrage example (removed from Polyland)
 ```
 
 ---

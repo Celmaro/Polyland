@@ -65,10 +65,10 @@ npx tsx scripts/approvals/approve-neg-risk.ts
 
 ```bash
 # Check deposit address and status
-npx tsx scripts/deposit/deposit-native-usdc.ts check
+npx tsx historical deposit script (removed from Polyland) check
 
 # Deposit $50 via Bridge
-npx tsx scripts/deposit/deposit-native-usdc.ts deposit 50
+npx tsx historical deposit script (removed from Polyland) deposit 50
 ```
 
 **Important:** USDC.e is required for Polymarket CTF operations. Native USDC must be swapped or bridged first.

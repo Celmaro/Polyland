@@ -137,7 +137,7 @@ Track liquidity provider rewards using `TradingService`.
 On-chain token operations (requires private key + USDC.e).
 
 ```bash
-POLY_PRIVKEY=0x... npx tsx examples/10-ctf-operations.ts
+(removed from the Polyland production repository)
 ```
 
 **Critical:** Uses USDC.e (not native USDC):
@@ -172,7 +172,7 @@ Continuous monitoring of trending markets.
 Full arbitrage workflow using `ArbitrageService` (requires private key).
 
 ```bash
-POLYMARKET_PRIVATE_KEY=0x... npx tsx examples/13-arbitrage-service.ts
+(removed from the Polyland production repository)
 ```
 
 - **ArbitrageService**: High-level API for arbitrage detection and execution

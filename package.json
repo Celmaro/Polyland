@@ -23,16 +23,11 @@
     "example:basic": "tsx examples/01-basic-usage.ts",
     "example:smart-money": "tsx examples/02-smart-money.ts",
     "example:market-analysis": "tsx examples/03-market-analysis.ts",
-    "example:kline": "tsx examples/04-kline-aggregation.ts",
     "example:follow-wallet": "tsx examples/05-follow-wallet-strategy.ts",
     "example:services": "tsx examples/06-services-demo.ts",
     "example:realtime": "tsx examples/07-realtime-websocket.ts",
     "example:trading": "tsx examples/08-trading-orders.ts",
     "example:rewards": "tsx examples/09-rewards-tracking.ts",
-    "example:ctf": "tsx examples/10-ctf-operations.ts",
-    "example:live-arb": "tsx examples/11-live-arbitrage-scan.ts",
-    "example:trending-arb": "tsx examples/12-trending-arb-monitor.ts",
-    "example:arb-service": "tsx examples/13-arbitrage-service.ts",
     "start": "node dist/bot-config.js"
   },
   "keywords": [
