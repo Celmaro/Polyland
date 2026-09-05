@@ -27,3 +27,20 @@ Baseline reconciliation.
 | Error | Attempt | Resolution |
 |---|---|---|
 | last30days requires Python 3.12+; host has 3.11.9 | direct run | external research completed with Tavily/Firecrawl/web_extract; no install during implementation |
+
+
+## Replacement task: trade detection, copy, and exit
+
+Implement the replacement specified in `trade-execution-design.md` rather than tuning the current Activity-only/BUY-only/heuristic path.
+
+1. `trade-detector`: candidate intake, durable identity key, dedup claim, overlap reconciliation contract, aggregation, explicit rejection reasons.
+2. `copy-planner`: executable VWAP/depth/fee/drift plan, bounded fractional-Kelly sizing, FAK/FOK policy, actual-fill accounting contract.
+3. `position-state-machine`: inventory-aware leader/value/risk/resolution exits, partial and unknown order states, no accidental reverse trades.
+4. Integration: wire detector before quorum, planner at execution boundary, state machine at open/exit/settlement; preserve existing safeguards.
+5. Verification: TDD module suites, full Vitest, tsc, build, ESM smoke; no live deployment or DRY_RUN change.
+
+## Replacement design status
+- Research: complete; Firecrawl search was rate-limited, so official direct extraction, Tavily, web extraction, GitHub, arXiv, and last30days outputs were used.
+- Design: complete in `trade-execution-design.md`.
+- Implementation: pending.
+- Publication: blocked until explicit approval; remote main remains unchanged.

@@ -13,6 +13,7 @@ import { ChainlinkTwapOracle } from './chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './clob-market-ws.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
+import { TradeDetector } from './trade-detector.js';
 import { DecisionLedger } from './decision-ledger.js';
 import { computeGoLiveReport, DEFAULT_GO_LIVE_CRITERIA, formatGoLiveReport, type GoLiveReport } from './go-live-gate.js';
 export interface PolylandRuntimeConfig {
@@ -32,6 +33,7 @@ export class PolylandRuntime {
   private risk: RiskManager | null = null;
   private stateStore: any = null;
   private tradeSub: { unsubscribe: () => void } | null = null;
+  private tradeDetector: TradeDetector | null = null;
   private gamma: GammaResolutionPoller | null = null;
   private clob: ClobMarketWsService | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -56,10 +58,19 @@ export class PolylandRuntime {
     this.ledger = new DecisionLedger();
     const ledgerRecords = await this.ledger.start();
     console.log(`[PolylandRuntime] decision ledger replayed ${ledgerRecords.length} records`);
+    this.tradeDetector = new TradeDetector({ claim: () => true, get: () => undefined });
     this.quorum = new BasketQuorumService(this.sdk.tradingService, this.quorumConfig); this.quorum.setRiskManager(this.risk); if (this.config.independence) this.quorum.setIndependenceSettings(this.config.independence); if (this.config.basketRisk) this.quorum.setBasketRiskConfig(this.config.basketRisk); this.quorum.setPaperExplorationMode(this.config.paperExploration ?? false); this.quorum.setGammaApi(this.sdk.gammaApi); this.quorum.setDecisionLedger(this.ledger); this.quorum.setSpecializationThresholds(Number(this.screeningConfig.minCategoryTrades ?? 3), Number(this.screeningConfig.minCategoryWinRate ?? 0.58)); this.quorum.startExitLadder(); this.quorum.onSettledTrade = p => { this.recordSettled(p); this.onSettledTrade?.(p); };
     if (process.env.ANTI_SNIPER_ENABLED === 'true') this.quorum.setAntiSniper(new AntiSniperGuard(null));
     if (process.env.TWAP_ENABLED === 'true') { const twap = new ChainlinkTwapOracle({ autoReconnect: true, reconnectDelayMs: 3000, pingIntervalMs: 5000, maxStalenessMs: 30000 }); this.quorum.setTwapOracle(twap); void twap.connect(); }
-    const buffer: SmartMoneyTrade[] = []; this.tradeSub = this.sdk.smartMoney.subscribeSmartMoneyTrades(t => { if (!this.quorum || this.quorum.getBasketCount() === 0) { if (buffer.length < 1000) buffer.push(t); } else this.quorum.onTrade(t); }, { filterAddresses: [], smartMoneyOnly: false });
+    const buffer: SmartMoneyTrade[] = []; this.tradeSub = this.sdk.smartMoney.subscribeSmartMoneyTrades(t => {
+      // Replacement detection layer: durable identity dedup + provenance gate.
+      const detected = this.tradeDetector?.detect({
+        wallet: t.traderAddress, conditionId: t.conditionId ?? '', marketSlug: t.marketSlug, tokenId: t.tokenId, outcome: t.outcome,
+        side: t.side, size: t.size, price: t.price, timestamp: t.timestamp, sourceRef: t.txHash,
+      });
+      if (!detected || detected.status !== 'CONFIRMED') return;
+      if (!this.quorum || this.quorum.getBasketCount() === 0) { if (buffer.length < 1000) buffer.push(t); } else this.quorum.onTrade(t);
+    }, { filterAddresses: [], smartMoneyOnly: false });
     this.gamma = new GammaResolutionPoller(this.sdk.gammaApi, this.quorum, 300000); this.gamma.start();
     this.clob = new ClobMarketWsService();
     this.clob.onMid(({ assetId, price }) => this.quorum?.observeMid(assetId, price));

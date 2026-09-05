@@ -19,8 +19,38 @@ import {
   formatUSDC,
   calculatePnL,
   ROUNDING_CONFIG,
+  computeExactSharesAndCost,
   type TickSize,
 } from './price-utils.js';
+
+describe('computeExactSharesAndCost', () => {
+  it('never exceeds budget at high prices (0.99 outcomes)', () => {
+    const r = computeExactSharesAndCost(15, 0.99, '0.01');
+    expect(r.shares).toBeGreaterThan(0);
+    expect(r.costUsd).toBeLessThanOrEqual(15);
+    // 15 / 0.99 = 15.15 shares -> floor to 15.15 -> cost 14.9985 -> 15.00
+    expect(r.costUsd).toBe(15);
+  });
+
+  it('floors price to tick so cost never crosses budget on rounding', () => {
+    const r = computeExactSharesAndCost(10, 0.999, '0.01');
+    expect(r.costUsd).toBeLessThanOrEqual(10);
+    expect(r.shares * 0.99).toBeLessThanOrEqual(10 + 1e-9);
+  });
+
+  it('returns zero for invalid budget or price', () => {
+    expect(computeExactSharesAndCost(0, 0.5, '0.01')).toEqual({ shares: 0, costUsd: 0 });
+    expect(computeExactSharesAndCost(-5, 0.5, '0.01')).toEqual({ shares: 0, costUsd: 0 });
+    expect(computeExactSharesAndCost(10, 1, '0.01')).toEqual({ shares: 0, costUsd: 0 });
+    expect(computeExactSharesAndCost(10, 0, '0.01')).toEqual({ shares: 0, costUsd: 0 });
+  });
+
+  it('is exact for a clean division', () => {
+    const r = computeExactSharesAndCost(10, 0.5, '0.01');
+    expect(r.shares).toBe(20);
+    expect(r.costUsd).toBe(10);
+  });
+});
 
 describe('Price Utilities', () => {
   describe('roundPrice', () => {

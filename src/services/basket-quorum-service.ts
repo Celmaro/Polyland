@@ -58,6 +58,8 @@ import { quantizeBuyPrice, roundAmount, roundSize, tickSizeToEnum } from '../uti
 import type { ConsensusSignal, WalletAction, PipelineDecision, LedgerRecord, RejectReason } from './pipeline-types.js';
 import { DecisionLedger } from './decision-ledger.js';
 import { ExecutionEngine } from './execution-engine.js';
+import { CopyPlanner, type CopyBook, type MarketMeta } from './copy-planner.js';
+import { PositionStateMachine, evaluateExit } from './position-state-machine.js';
 import { clusterOf, effectiveContributors, isDiverse, type WalletActionCategory } from './independence-metrics.js';
 import { checkExposure, type BasketRiskConfig } from './basket-risk.js';
 function consensusStrength(votes: Map<string, Vote>): number {
@@ -802,6 +804,8 @@ export class BasketQuorumService {
     signalId?: string; quorumWallets?: string[];
   }> = new Map();
   private exitTimer: ReturnType<typeof setInterval> | null = null;
+  /** Replacement exit layer: position lifecycle state machine. */
+  private readonly posMachine = new PositionStateMachine();
   /** Start the exit ladder loop (15s). Idempotent. */
   startExitLadder(): void {
     if (this.exitTimer) return;
@@ -830,6 +834,16 @@ export class BasketQuorumService {
       usdc, size, entryPrice, marketSlug, outcome, firedAt: Date.now(),
       conditionId, basketName, basketCategory, signalId, quorumWallets,
     });
+    // Replacement exit layer: register the position lifecycle.
+    try {
+      this.posMachine.open({
+        id: tokenId, conditionId, tokenId, outcome, side: 'BUY',
+        shares: 0, entryPrice, entryTime: Date.now(), state: 'PLANNED', basket: basketName,
+      });
+      this.posMachine.apply(tokenId, { type: 'FILL', shares: size, state: 'full' });
+    } catch (e) {
+      console.warn('[BasketQuorum][exit] posMachine open failed:', e instanceof Error ? e.message : e);
+    }
   }
   /**
    * Unified exit pass — items 1–5 of the exit rework.
@@ -849,8 +863,6 @@ export class BasketQuorumService {
    */
   private async runExitPass(): Promise<void> {
     if (this.openPositions.size === 0) return;
-    const LATE_TP_PRICE = 0.96;
-    const EDGE_TP_FEE_BUFFER = 0.01;   // winRate − 1c ≈ fee + a little
     const REVERSE_QUORUM_MIN = 2;      // ≥2 of the entry quorum flipped
     const EMERGENCY_WINDOW_MS = 30_000;
     for (const [tokenId, pos] of [...this.openPositions]) {
@@ -868,25 +880,27 @@ export class BasketQuorumService {
         if (!book) continue;
         const bestBid = book.bids.length > 0 ? parseFloat(book.bids[0].price) : 0;
         if (bestBid <= 0) continue;
-        // --- trigger evaluation -------------------------------------------------
-        let reason: string | null = null;
-        if (killed) {
-          reason = 'KILL_SWITCH';
-        } else if (emergency) {
-          reason = 'EMERGENCY';
-        } else if (
-          pos.quorumWallets && pos.quorumWallets.length > 0 &&
-          this._countReverseQuorum(pos) >= REVERSE_QUORUM_MIN
-        ) {
-          reason = 'REVERSE_QUORUM';
-        } else if (basket && bestBid >= basket.winRate - EDGE_TP_FEE_BUFFER) {
-          reason = 'EDGE_TP';
-        } else if (bestBid >= LATE_TP_PRICE) {
-          reason = 'LATE_TP';
-        }
-        if (!reason) continue;
+        // --- replacement trigger evaluation (position state machine) -----------
+        const feeRateBps = this.feeRateCache.get(tokenId) ?? this.feeRateCache.get(pos.conditionId) ?? 0;
+        const fairProb = basket?.winRate ?? pos.entryPrice;
+        const exitDecision = evaluateExit({
+          inventoryShares: pos.size,
+          executableBidVwap: bestBid,
+          sellFeePerShare: takerFeePerShare(bestBid, feeRateBps || DEFAULT_FEE_RATE_BPS),
+          impactBufferPerShare: 0.005,
+          // 2c holding buffer: sell when the executable bid nets above
+          // expected settlement value minus capital-lock/oracle risk.
+          holdingRiskBufferPerShare: 0.02,
+          fairProb,
+          leaderExit: pos.quorumWallets && pos.quorumWallets.length > 0 && this._countReverseQuorum(pos) >= REVERSE_QUORUM_MIN
+            ? { leaderShares: pos.size, confirmed: true }
+            : undefined,
+          riskHalt: killed || emergency,
+        });
+        if (exitDecision.action === 'HOLD' || exitDecision.action === 'NO_INVENTORY') continue;
+        const reason = (exitDecision.reason ?? 'EXIT').toUpperCase();
         // ------------------------------------------------------------------------
-        const sellSize = pos.size;
+        const sellSize = exitDecision.quantity;
         if (sellSize <= 0) { this.openPositions.delete(tokenId); continue; }
         const pnl = (bestBid - pos.entryPrice) * sellSize;
         if (this.config.dryRun) {
@@ -926,6 +940,12 @@ export class BasketQuorumService {
           }
         }
         // Shared post-exit bookkeeping (both modes).
+        try {
+          this.posMachine.apply(tokenId, { type: 'EXIT', shares: sellSize, reason: reason.toLowerCase(), time: Date.now() });
+          this.posMachine.apply(tokenId, { type: 'FILL', shares: sellSize, state: 'full' });
+        } catch (e) {
+          console.warn('[BasketQuorum][exit] posMachine exit failed:', e instanceof Error ? e.message : e);
+        }
         this.recordSettledTrade(pnl, Date.now(), 'SELL');
         signalAuditStore.markExited(pos.conditionId, bestBid, reason, pos.outcome);
         this.openPositions.delete(tokenId);
@@ -1235,6 +1255,67 @@ export class BasketQuorumService {
       else if (decision.reason === 'liquidity') this.stats.quorumSkippedThinLiquidity = (this.stats.quorumSkippedThinLiquidity ?? 0) + 1;
       this.planDecision(this.ledgerDecision(trade, 'execution', false, decision.reason));
       return;
+    }
+    // Replacement copy layer: executable-VWAP price gate against the live book.
+    // The leader's printed price is never the copy price; we adopt the
+    // executable ask VWAP when it is within drift and still carries edge.
+    try {
+      const planner = new CopyPlanner({
+        maxSlippagePct: this.config.maxSlippage,
+        maxBookAgeMs: 30_000,
+        fractionalKelly: 0.25,
+        capitalUsd: this.riskManager?.currentCapital() ?? this.bankrollFor(basket.category),
+        basketHeadroomUsd: Math.max(0, this.bankrollFor(basket.category) - (this.basketSpend.get(basket.category) ?? 0)),
+        maxSizeUsd: this.config.maxSizePerTrade,
+        reliabilityFloor: 0,
+        defaultOrderType: this.config.orderType,
+      });
+      const tokenId = trade.tokenId;
+      const rawBook = tokenId ? await this.tradingService.getOrderBook(tokenId) : null;
+      if (rawBook && Array.isArray((rawBook as { bids?: unknown }).bids) && Array.isArray((rawBook as { asks?: unknown }).asks)) {
+        const book: CopyBook = {
+          bids: (rawBook as { bids: { price: string | number; size: string | number }[] }).bids.map((l) => ({ price: parseFloat(String(l.price)), size: parseFloat(String(l.size)) })),
+          asks: (rawBook as { asks: { price: string | number; size: string | number }[] }).asks.map((l) => ({ price: parseFloat(String(l.price)), size: parseFloat(String(l.size)) })),
+          ageMs: 0,
+        };
+        const meta: MarketMeta = {
+          tickSize: this.tickSizeCache.get(signal.conditionId) ?? 0.01,
+          minNotional: 1,
+          takerFeeRateBps: this.feeRateCache.get(signal.conditionId) ?? 0,
+          acceptingOrders: true,
+        };
+        const s = signal.wallets[0] ?? (trade.traderAddress ?? '').toLowerCase();
+      const planDecision = planner.plan(
+        {
+          wallet: s,
+            conditionId: signal.conditionId,
+            tokenId: trade.tokenId ?? signal.conditionId,
+            side: 'BUY',
+            size: signal.totalSize,
+            price: signal.consensusPrice,
+            timestamp: now,
+            fairProb: signal.winRate,
+            reliability: 1,
+            executionConfidence: 1,
+            independenceAdjustment: 1,
+          },
+          book,
+          meta,
+        );
+        if (!planDecision.accepted) {
+          const r = planDecision.reason;
+          if (r === 'drift') { this.stats.quorumSkippedDrift++; this.planDecision(this.ledgerDecision(trade, 'execution', false, 'drift')); return; }
+          if (r === 'no_edge') { this.stats.quorumSkippedNegativeEdge = (this.stats.quorumSkippedNegativeEdge ?? 0) + 1; this.planDecision(this.ledgerDecision(trade, 'execution', false, 'edge')); return; }
+          if (r === 'below_min') { this.stats.quorumSkippedMinSize = (this.stats.quorumSkippedMinSize ?? 0) + 1; this.planDecision(this.ledgerDecision(trade, 'execution', false, 'min_size')); return; }
+          if (r === 'stale_book' || r === 'no_book') { this.planDecision(this.ledgerDecision(trade, 'execution', false, 'liquidity')); return; }
+          this.planDecision(this.ledgerDecision(trade, 'execution', false, r === 'market_closed' ? 'risk' : 'liquidity'));
+          return;
+        }
+        // Adopt the executable-VWAP price for the order (engine keeps sizing).
+        decision.value.price = planDecision.plan.price;
+      }
+    } catch (e) {
+      console.warn('[BasketQuorum][copy] planner gate error:', e instanceof Error ? e.message : e);
     }
     this.lastFired.set(key, Date.now());
     this._schedulePersist();
