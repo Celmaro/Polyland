@@ -51,8 +51,10 @@ interface ClobSubscribeMessage {
 
 interface ClobBookUpdate {
   asset_id: string;
-  bids: [string, string][];  // [price, size]
-  asks: [string, string][];
+  // The CLOB has emitted both tuple levels and object levels across message
+  // versions: [price, size] or { price, size }.
+  bids?: Array<[string, string] | { price: string; size: string }>;
+  asks?: Array<[string, string] | { price: string; size: string }>;
 }
 
 interface ClobPriceChange {
@@ -423,16 +425,21 @@ export class ClobMarketWsService {
     const { asset_id, bids, asks } = b;
     const levels = this.bookLevels.get(asset_id) ?? { bids: new Map<number, number>(), asks: new Map<number, number>() };
     this.bookLevels.set(asset_id, levels);
-    for (const [priceText, sizeText] of bids ?? []) {
-      const price = Number(priceText); const size = Number(sizeText);
-      if (!Number.isFinite(price) || price <= 0) continue;
-      if (!Number.isFinite(size) || size <= 0) levels.bids.delete(price); else levels.bids.set(price, size);
-    }
-    for (const [priceText, sizeText] of asks ?? []) {
-      const price = Number(priceText); const size = Number(sizeText);
-      if (!Number.isFinite(price) || price <= 0) continue;
-      if (!Number.isFinite(size) || size <= 0) levels.asks.delete(price); else levels.asks.set(price, size);
-    }
+    const applyLevels = (
+      incoming: Array<[string, string] | { price: string; size: string }> | undefined,
+      target: Map<number, number>,
+    ): void => {
+      if (!Array.isArray(incoming)) return;
+      for (const level of incoming) {
+        const priceText = Array.isArray(level) ? level[0] : level?.price;
+        const sizeText = Array.isArray(level) ? level[1] : level?.size;
+        const price = Number(priceText); const size = Number(sizeText);
+        if (!Number.isFinite(price) || price <= 0) continue;
+        if (!Number.isFinite(size) || size <= 0) target.delete(price); else target.set(price, size);
+      }
+    };
+    applyLevels(bids, levels.bids);
+    applyLevels(asks, levels.asks);
     const bestBid = Math.max(...levels.bids.keys());
     const askPrices = [...levels.asks.keys()];
     const bestAsk = askPrices.length ? Math.min(...askPrices) : NaN;
