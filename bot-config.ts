@@ -612,7 +612,8 @@ function displayStatus() {
     const thinLiq = f.quorumSkippedThinLiquidity ?? 0;
     const negEdge = f.quorumSkippedNegativeEdge ?? 0;
     lines.push(
-      `[quorum] received=${f.feedReceived} recorded=${f.votesRecorded} ` +
+      `[quorum] received=${f.feedReceived} ignored=${f.ignoredNoBasket + f.ignoredNotMember + f.ignoredUnsupportedSide + f.ignoredInvalidMarket} ` +
+      `recorded=${f.votesRecorded} ` +
       `filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket}` +
       `(thin=${f.quorumSkippedThinEdge},stale=${f.quorumSkippedStaleMarket}) fired=${f.quorumFired}` +
       ` risk=${f.quorumSkippedRiskHalt} bankroll=${f.quorumSkippedBankroll} drift=${f.quorumSkippedDrift}` +

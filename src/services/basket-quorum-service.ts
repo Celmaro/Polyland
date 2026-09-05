@@ -164,6 +164,11 @@ interface QuorumSignal {
 export interface QuorumStats {
   /** Raw trade events received by the quorum handler. */
   feedReceived: number;
+  /** Events discarded before basket membership/vote processing. */
+  ignoredNoBasket: number;
+  ignoredNotMember: number;
+  ignoredUnsupportedSide: number;
+  ignoredInvalidMarket: number;
   /** Votes that survived pre-vote filters and were recorded. */
   votesRecorded: number;
   voters: number;
@@ -232,6 +237,10 @@ export class BasketQuorumService {
 
   private stats: QuorumStats = {
     feedReceived: 0,
+    ignoredNoBasket: 0,
+    ignoredNotMember: 0,
+    ignoredUnsupportedSide: 0,
+    ignoredInvalidMarket: 0,
     votesRecorded: 0,
     voters: 0,
     quorumFired: 0,
@@ -619,7 +628,10 @@ export class BasketQuorumService {
     const conditionId = trade.conditionId;
     const marketSlug = trade.marketSlug;
     const outcome = trade.outcome;
-    if (!conditionId || !marketSlug || !outcome) return;
+    if (!conditionId || !marketSlug || !outcome) {
+      this.stats.ignoredInvalidMarket++;
+      return;
+    }
     this.stats.feedReceived++;
 
     // A SELL from a tracked wallet is a vote for the opposite binary outcome.
@@ -631,7 +643,10 @@ export class BasketQuorumService {
       const lower = outcome.toLowerCase();
       if (lower === 'yes') voteOutcome = 'No';
       else if (lower === 'no') voteOutcome = 'Yes';
-      else return; // Do not guess the opposite of a non-binary label.
+      else {
+        this.stats.ignoredUnsupportedSide++;
+        return; // Do not guess the opposite of a non-binary label.
+      }
       votePrice = 1 - trade.price;
       voteSide = 'BUY';
     }
@@ -654,13 +669,16 @@ export class BasketQuorumService {
     const category = categorizeMarket(marketSlug || outcome || '');
     const basket = this.baskets.get(category);
     if (!basket) {
-      // Market belongs to a category with no tracked basket — ignore.
+      this.stats.ignoredNoBasket++;
       return;
     }
 
     // 2. Only count wallets that are members of this basket.
     const traderKey = trade.traderAddress.toLowerCase();
-    if (!basket.wallets.includes(traderKey)) return;
+    if (!basket.wallets.includes(traderKey)) {
+      this.stats.ignoredNotMember++;
+      return;
+    }
 
     // 3. Only BUY votes contribute to a buy-consensus we act on. (SELL votes
     //    are recorded but not counted toward firing, so we can see counter-flow.)
@@ -1420,6 +1438,10 @@ export class BasketQuorumService {
    */
   logFunnel(label: string = ''): {
     feed_received: number;
+    ignored_no_basket: number;
+    ignored_not_member: number;
+    ignored_unsupported_side: number;
+    ignored_invalid_market: number;
     votes_recorded: number;
     filtered: number;
     filtered_thin: number;
@@ -1449,6 +1471,10 @@ export class BasketQuorumService {
     const conversion = s.quorumFired === 0 ? 0 : (s.executed / s.quorumFired) * 100;
     const funnel = {
       feed_received: s.feedReceived,
+      ignored_no_basket: s.ignoredNoBasket,
+      ignored_not_member: s.ignoredNotMember,
+      ignored_unsupported_side: s.ignoredUnsupportedSide,
+      ignored_invalid_market: s.ignoredInvalidMarket,
       votes_recorded: s.votesRecorded,
       filtered,
       filtered_thin: s.quorumSkippedThinEdge,
@@ -1476,7 +1502,8 @@ export class BasketQuorumService {
       .join('/');
     console.log(
       `[BasketQuorum${label ? ':' + label : ''}] funnel: ` +
-        `received=${funnel.feed_received} recorded=${funnel.votes_recorded} ` +
+        `received=${funnel.feed_received} ignored=${funnel.ignored_no_basket + funnel.ignored_not_member + funnel.ignored_unsupported_side + funnel.ignored_invalid_market} ` +
+        `recorded=${funnel.votes_recorded} ` +
         `filtered=${funnel.filtered}(thin=${funnel.filtered_thin},stale=${funnel.filtered_stale}) ` +
         `fired=${funnel.quorum_fired} ` +
         `risk=${funnel.skipped_risk} bankroll=${funnel.skipped_bankroll} ` +
@@ -1512,6 +1539,10 @@ export class BasketQuorumService {
     }
     this.stats = {
       feedReceived: 0,
+      ignoredNoBasket: 0,
+      ignoredNotMember: 0,
+      ignoredUnsupportedSide: 0,
+      ignoredInvalidMarket: 0,
       votesRecorded: 0,
       voters: 0,
       quorumFired: 0,
