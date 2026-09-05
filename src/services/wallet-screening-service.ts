@@ -337,7 +337,8 @@ export class WalletScreeningService {
         ? this.makeBypassed(c, resolved)
         : this.evaluate(c, profile, resolved, winRates, positions, gateCounts));
     }
-    // Log gate tally for this cycle (diagnostic).
+    // Candidate-level diagnostics are expensive/noisy in production. Keep the
+    // aggregate gate tally; enable DEBUG_SCREENING=true for per-wallet output.
     const entries = Object.entries(gateCounts).sort((a, b) => b[1] - a[1]);
     if (entries.length > 0) {
       console.log('[WalletScreening] gate tally: ' + entries.map(([k, v]) => `${k}=${v}`).join(' '));
@@ -676,8 +677,9 @@ export class WalletScreeningService {
     positions: ClosedPosition[] = [],
     gateCounts?: Record<string, number>,
   ): ScreenedWallet {
-    // DEBUG: log address when entering evaluate()
-    console.log(`[Eval] ${c.address.slice(0,8)} hintCat=${c.hintCategory ?? 'none'} resolved=${resolved?.category} copyScore-pending`);
+    if (process.env.DEBUG_SCREENING === 'true') {
+      console.log(`[Eval] ${c.address.slice(0,8)} hintCat=${c.hintCategory ?? 'none'} resolved=${resolved?.category} copyScore-pending`);
+    }
     // No profile — cannot score
     if (!profile) {
       if (gateCounts) gateCounts['no profile'] = (gateCounts['no profile'] ?? 0) + 1;

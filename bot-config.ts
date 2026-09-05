@@ -8,6 +8,7 @@
  */
 
 import 'dotenv/config';
+import * as fs from 'node:fs/promises';
 import {
   PolymarketSDK,
   BasketQuorumService,
@@ -484,9 +485,42 @@ async function setupBasketQuorum(sdk: PolymarketSDK) {
     };
     log('QUORUM', 'CLOB market WS ready (mid feed active)');
 
-    // Screen and score wallets
+    // Screen and score wallets. Screening is expensive (profile, activity,
+    // and closed-position API calls), so reuse a bounded 6h cache when the
+    // candidate universe and screening config are unchanged. The cache is a
+    // JSON file, not a database; on Zeabur it survives only if /data is backed
+    // by a persistent volume. A cache miss safely falls back to full screening.
     log('QUORUM', 'Screening wallets...');
-    const screened = await screening.score(candidates);
+    const screeningCachePath = './data/wallet-screening.json';
+    const screeningCacheTtlMs = 6 * 60 * 60 * 1000;
+    const cacheKey = JSON.stringify({
+      version: 1,
+      candidates: candidates.map((c) => ({ address: c.address, source: c.source, autoRank: c.autoRank })).sort((a, b) => a.address.localeCompare(b.address)),
+      config: screeningConfig,
+    });
+    let screened: Awaited<ReturnType<WalletScreeningService['score']>> | null = null;
+    try {
+      const cached = JSON.parse(await fs.readFile(screeningCachePath, 'utf8')) as {
+        savedAt?: number; cacheKey?: string; screened?: Awaited<ReturnType<WalletScreeningService['score']>>;
+      };
+      if (cached.cacheKey === cacheKey && cached.savedAt && Date.now() - cached.savedAt < screeningCacheTtlMs && Array.isArray(cached.screened)) {
+        screened = cached.screened;
+        log('QUORUM', `Loaded ${screened.length} wallets from screening cache (age=${Math.round((Date.now() - cached.savedAt) / 60000)}m)`);
+      } else {
+        log('QUORUM', 'Wallet screening cache miss or expired; refreshing profiles and scores');
+      }
+    } catch {
+      // First boot, missing volume, or corrupt cache: perform a fresh screen.
+    }
+    if (!screened) {
+      screened = await screening.score(candidates);
+      try {
+        await fs.mkdir('./data', { recursive: true });
+        await fs.writeFile(screeningCachePath, JSON.stringify({ savedAt: Date.now(), cacheKey, screened }), 'utf8');
+      } catch (err) {
+        log('WARN', `Could not persist wallet screening cache: ${err instanceof Error ? err.message : err}`);
+      }
+    }
     const primaries = screened.filter((w) => w.tier === 'PRIMARY' || w.tier === 'SATELLITE');
     const nPrimary = screened.filter((w) => w.tier === 'PRIMARY').length;
     const nSatellite = screened.filter((w) => w.tier === 'SATELLITE').length;
@@ -578,7 +612,8 @@ function displayStatus() {
     const thinLiq = f.quorumSkippedThinLiquidity ?? 0;
     const negEdge = f.quorumSkippedNegativeEdge ?? 0;
     lines.push(
-      `[quorum] observed=${f.votesObserved} filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket}` +
+      `[quorum] received=${f.feedReceived} recorded=${f.votesRecorded} ` +
+      `filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket}` +
       `(thin=${f.quorumSkippedThinEdge},stale=${f.quorumSkippedStaleMarket}) fired=${f.quorumFired}` +
       ` risk=${f.quorumSkippedRiskHalt} bankroll=${f.quorumSkippedBankroll} drift=${f.quorumSkippedDrift}` +
       ` antiSniper=${antiSniper} twap=${twapStale}/${twapMisaligned} liq=${thinLiq} negEdge=${negEdge}` +

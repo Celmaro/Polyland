@@ -162,7 +162,10 @@ interface QuorumSignal {
 }
 
 export interface QuorumStats {
-  votesObserved: number;
+  /** Raw trade events received by the quorum handler. */
+  feedReceived: number;
+  /** Votes that survived pre-vote filters and were recorded. */
+  votesRecorded: number;
   voters: number;
   quorumFired: number;
   quorumSkippedDrift: number;
@@ -228,7 +231,8 @@ export class BasketQuorumService {
   private _lastProcessedFire = new Map<string, number>();
 
   private stats: QuorumStats = {
-    votesObserved: 0,
+    feedReceived: 0,
+    votesRecorded: 0,
     voters: 0,
     quorumFired: 0,
     quorumSkippedDrift: 0,
@@ -616,6 +620,7 @@ export class BasketQuorumService {
     const marketSlug = trade.marketSlug;
     const outcome = trade.outcome;
     if (!conditionId || !marketSlug || !outcome) return;
+    this.stats.feedReceived++;
 
     // A SELL from a tracked wallet is a vote for the opposite binary outcome.
     // Normalize it before recording so reverse-quorum logic can see flips.
@@ -698,7 +703,7 @@ export class BasketQuorumService {
     });
 
     this.stats.voters = this.votes.size;
-    this.stats.votesObserved++;
+    this.stats.votesRecorded++
     this._schedulePersist();
 
     // 7. Evaluate quorum.
@@ -1414,7 +1419,8 @@ export class BasketQuorumService {
    * dashboard / log aggregator.
    */
   logFunnel(label: string = ''): {
-    observed: number;
+    feed_received: number;
+    votes_recorded: number;
     filtered: number;
     filtered_thin: number;
     filtered_stale: number;
@@ -1435,12 +1441,15 @@ export class BasketQuorumService {
   } {
     const s = this.stats;
     const filtered = s.quorumSkippedThinEdge + s.quorumSkippedStaleMarket;
+    // Stage counters intentionally use different denominators: filtered events
+    // are counted before vote recording, so filtered may exceed recorded votes.
     // Conversion = executions per quorum fire (the actionable rate).
     // The old metric divided by raw vote events (executed/votesObserved),
     // which always rounds to 0.0% and tells the operator nothing.
     const conversion = s.quorumFired === 0 ? 0 : (s.executed / s.quorumFired) * 100;
     const funnel = {
-      observed: s.votesObserved,
+      feed_received: s.feedReceived,
+      votes_recorded: s.votesRecorded,
       filtered,
       filtered_thin: s.quorumSkippedThinEdge,
       filtered_stale: s.quorumSkippedStaleMarket,
@@ -1467,7 +1476,7 @@ export class BasketQuorumService {
       .join('/');
     console.log(
       `[BasketQuorum${label ? ':' + label : ''}] funnel: ` +
-        `observed=${funnel.observed} ` +
+        `received=${funnel.feed_received} recorded=${funnel.votes_recorded} ` +
         `filtered=${funnel.filtered}(thin=${funnel.filtered_thin},stale=${funnel.filtered_stale}) ` +
         `fired=${funnel.quorum_fired} ` +
         `risk=${funnel.skipped_risk} bankroll=${funnel.skipped_bankroll} ` +
@@ -1502,7 +1511,8 @@ export class BasketQuorumService {
       this._persistTimer = null;
     }
     this.stats = {
-      votesObserved: 0,
+      feedReceived: 0,
+      votesRecorded: 0,
       voters: 0,
       quorumFired: 0,
       quorumSkippedDrift: 0,
