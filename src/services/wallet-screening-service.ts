@@ -142,6 +142,10 @@ export interface WalletScreeningConfig {
    * SATELLITE: above-median wallets scoring >= satelliteCopyScoreThreshold.
    */
   satelliteCopyScoreThreshold: number;
+  /** Minimum independent settled markets for SATELLITE tier (findings §2.8: >= 12). */
+  minSatelliteMarkets: number;
+  /** Minimum independent settled markets for PRIMARY tier (findings §2.8: >= 30). */
+  minPrimaryMarkets: number;
 }
 export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   // 100+ trades = full data marker in the industry rubric; CopyScore's
@@ -170,6 +174,11 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   // SATELLITE: above-median contributors (score >= 45).
   primaryCopyScoreThreshold: 65,
   satelliteCopyScoreThreshold: 45,
+  // Sample-size floors: a tiny-sample wallet with winRate=1.0 is noise, not
+  // skill. findings.md §2.8 requires >= 12 independent markets for SATELLITE
+  // and >= 30 for PRIMARY, so one-trade wallets cannot seed a basket.
+  minSatelliteMarkets: 12,
+  minPrimaryMarkets: 30,
 };
 // ============================================================================
 // Scoring components
@@ -720,7 +729,16 @@ export class WalletScreeningService {
     }
     // Tier assignment — driven ONLY by CopyScore (consistency is one of its
     // components: rankStability/steadiness). No separate consistency XOR gate.
+    const nMarkets = components?.nMarkets ?? 0;
     if (copyScore >= this.config.primaryCopyScoreThreshold && profile.winRate >= this.config.minWinRate) {
+      if (nMarkets < this.config.minPrimaryMarkets) {
+        if (gateCounts) gateCounts['primary sample floor'] = (gateCounts['primary sample floor'] ?? 0) + 1;
+        return this.buildResult(
+          c, profile, 'WATCHLIST',
+          `PRIMARY score but only ${nMarkets} independent markets (min ${this.config.minPrimaryMarkets})`,
+          false, resolved, catWinRates, components,
+        );
+      }
       return this.buildResult(
         c, profile, 'PRIMARY',
         `copyScore ${copyScore}`,
@@ -729,6 +747,14 @@ export class WalletScreeningService {
       );
     }
     if (copyScore >= this.config.satelliteCopyScoreThreshold) {
+      if (nMarkets < this.config.minSatelliteMarkets) {
+        if (gateCounts) gateCounts['satellite sample floor'] = (gateCounts['satellite sample floor'] ?? 0) + 1;
+        return this.buildResult(
+          c, profile, 'WATCHLIST',
+          `SATELLITE score but only ${nMarkets} independent markets (min ${this.config.minSatelliteMarkets})`,
+          false, resolved, catWinRates, components,
+        );
+      }
       return this.buildResult(
         c, profile, 'SATELLITE',
         `copyScore ${copyScore}`,

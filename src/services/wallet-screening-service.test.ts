@@ -62,4 +62,32 @@ describe('WalletScreeningService CopyScore confidence and recency', () => {
     const recentWins = Array.from({ length: 100 }, () => position(1, now));
     expect(score(service, profile(100, 1), recentWins)).toBeGreaterThan(score(service, profile(100, 1), oldWins));
   });
+  it('demotes high-CopyScore wallets with a tiny market sample to WATCHLIST', () => {
+    // Audit scenario: a 3-market wallet scoring in the PRIMARY band must NOT
+    // seed a basket — sample floor (SATELLITE >= 12, PRIMARY >= 30) wins over
+    // raw CopyScore. The tier logic is the private evaluate(); exercise it
+    // through the public gate-count path by calling evaluate directly.
+    const s = service as any;
+    const candidate = { address: '0x' + '1'.repeat(40), source: 'auto' as const, autoRank: 1 };
+    const small = Array.from({ length: 3 }, (_, i) => position(i % 2 === 0 ? 0.2 : -0.1, now, `condition-small-${i}`));
+    const winRates = { politics: { winRate: 0.67, tradeCount: 3 } };
+    const resolved = { category: 'politics' as const, source: 'auto' as const, confidence: 1 };
+    const gateCounts: Record<string, number> = {};
+    const res = s.evaluate(candidate, profile(100, 0.67), resolved, winRates, small, gateCounts);
+    expect(['SATELLITE', 'PRIMARY']).not.toContain(res.tier);
+    expect(res.tier).toBe('WATCHLIST');
+  });
+  it('keeps a wallet with >= 30 distinct markets eligible for PRIMARY by sample', () => {
+    const s = service as any;
+    const candidate = { address: '0x' + '1'.repeat(40), source: 'auto' as const, autoRank: 1 };
+    // All-wins across 30 distinct markets: score clears SATELLITE easily, and
+    // the sample floor must not demote it (positive control for the floor).
+    const many = Array.from({ length: 30 }, (_, i) => position(0.2, now, `condition-many-${i}`));
+    const winRates = { politics: { winRate: 1, tradeCount: 30 } };
+    const resolved = { category: 'politics' as const, source: 'auto' as const, confidence: 1 };
+    const gateCounts: Record<string, number> = {};
+    const res = s.evaluate(candidate, profile(30, 1), resolved, winRates, many, gateCounts);
+    expect(res.copyScore).toBeGreaterThanOrEqual(45);
+    expect(res.tier).not.toBe('WATCHLIST'); // score + sample allow SATELLITE/PRIMARY
+  });
 });

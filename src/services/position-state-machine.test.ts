@@ -78,6 +78,23 @@ describe('evaluateExit', () => {
     expect(evaluateExit({ ...base, inventoryShares: 0 }).action).toBe('NO_INVENTORY');
   });
 
+  it('sells a collapsed position when fair value is the live market price', () => {
+    // Audit scenario: entry 0.245, market collapsed to bid 0.044 / ask 0.06.
+    // Live mid ~0.052; holding buffer 0.02 -> holdValue 0.032/share.
+    // sellValue = (0.044 - 0.002 - 0.005)*q = 0.037*q > holdValue -> SELL.
+    const r = evaluateExit({
+      inventoryShares: 100,
+      executableBidVwap: 0.044,
+      sellFeePerShare: 0.002,
+      impactBufferPerShare: 0.005,
+      holdingRiskBufferPerShare: 0.02,
+      fairProb: (0.044 + 0.06) / 2, // live mid, not the stale entry winRate
+      leaderExit: { leaderShares: 0, confirmed: true },
+    });
+    expect(r.action).toBe('SELL');
+    if (r.action === 'SELL') expect(r.quantity).toBe(100);
+  });
+
   it('sells when the executable bid value beats holding expected value', () => {
     // sell 0.55-0.007=0.543/share; hold 0.5 → sell
     const r = evaluateExit(base);

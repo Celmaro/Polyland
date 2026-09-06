@@ -882,7 +882,15 @@ export class BasketQuorumService {
         if (bestBid <= 0) continue;
         // --- replacement trigger evaluation (position state machine) -----------
         const feeRateBps = this.feeRateCache.get(tokenId) ?? this.feeRateCache.get(pos.conditionId) ?? 0;
-        const fairProb = basket?.winRate ?? pos.entryPrice;
+        // Fair probability = LIVE market-implied probability of the position
+        // token, from the book we just fetched. The basket's historical
+        // winRate is an entry-time belief that never updates; using it as
+        // "expected settlement value" makes the value-exit HOLD every
+        // collapsing position to zero (audit: 15/15 live positions at ~0.04
+        // with zero exits). The market mid is the honest settlement prior.
+        const bestAsk = book.asks.length > 0 ? parseFloat(book.asks[0].price) : bestBid;
+        const liveProb = Math.min(0.99, Math.max(0.01, (bestBid + bestAsk) / 2));
+        const fairProb = liveProb;
         const exitDecision = evaluateExit({
           inventoryShares: pos.size,
           executableBidVwap: bestBid,
