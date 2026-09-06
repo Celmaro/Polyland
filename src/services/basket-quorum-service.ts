@@ -878,7 +878,8 @@ export class BasketQuorumService {
           ? await this.tradingService.getPublicOrderBook(tokenId)
           : await this.tradingService.getOrderBook(tokenId);
         if (!book) continue;
-        const bestBid = book.bids.length > 0 ? parseFloat(book.bids[0].price) : 0;
+        const bestBid = book.bids.length > 0 ? Math.max(...book.bids.map((l) => parseFloat(l.price))) : 0;
+        const bestAsk = book.asks.length > 0 ? Math.min(...book.asks.map((l) => parseFloat(l.price))) : bestBid;
         if (bestBid <= 0) continue;
         // --- replacement trigger evaluation (position state machine) -----------
         const feeRateBps = this.feeRateCache.get(tokenId) ?? this.feeRateCache.get(pos.conditionId) ?? 0;
@@ -888,11 +889,12 @@ export class BasketQuorumService {
         // "expected settlement value" makes the value-exit HOLD every
         // collapsing position to zero (audit: 15/15 live positions at ~0.04
         // with zero exits). The market mid is the honest settlement prior.
-        const bestAsk = book.asks.length > 0 ? parseFloat(book.asks[0].price) : bestBid;
         const liveProb = Math.min(0.99, Math.max(0.01, (bestBid + bestAsk) / 2));
         const fairProb = liveProb;
+        const entryPrice = pos.entryPrice;
         const exitDecision = evaluateExit({
           inventoryShares: pos.size,
+          entryPrice,
           executableBidVwap: bestBid,
           sellFeePerShare: takerFeePerShare(bestBid, feeRateBps || DEFAULT_FEE_RATE_BPS),
           impactBufferPerShare: 0.005,

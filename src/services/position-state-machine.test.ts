@@ -95,6 +95,19 @@ describe('evaluateExit', () => {
     if (r.action === 'SELL') expect(r.quantity).toBe(100);
   });
 
+  it('forces a bounded adverse-move exit even when live fair value says hold', () => {
+    const r = evaluateExit({
+      inventoryShares: 100,
+      entryPrice: 0.245,
+      executableBidVwap: 0.044,
+      sellFeePerShare: 0.002,
+      impactBufferPerShare: 0.005,
+      fairProb: 0.052,
+      maxAdverseMovePct: 0.35,
+    });
+    expect(r).toEqual({ action: 'RISK_EXIT', quantity: 100, reason: 'adverse_move' });
+  });
+
   it('sells when the executable bid value beats holding expected value', () => {
     // sell 0.55-0.007=0.543/share; hold 0.5 → sell
     const r = evaluateExit(base);

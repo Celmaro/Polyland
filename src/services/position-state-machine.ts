@@ -111,6 +111,7 @@ export function transition(current: PositionState, event: ExitEvent): Transition
 
 export interface ExitEvaluationInput {
   inventoryShares: number;
+  entryPrice?: number;
   executableBidVwap: number;
   /** Post-sale fee per share. */
   sellFeePerShare: number;
@@ -122,7 +123,9 @@ export interface ExitEvaluationInput {
   holdingRiskBufferPerShare?: number;
   /** Required edge margin for selling vs holding, per share. */
   requiredMarginPerShare?: number;
-  /** Set when the leader confirmed a SELL of the same market/side. */
+  /** Maximum tolerated loss from entry before a risk exit (decimal, e.g. 0.35). */
+  maxAdverseMovePct?: number;
+  /** Set when the confirmed leader exit is available. */
   leaderExit?: { leaderShares: number; confirmed: boolean };
   /** Market is resolved and this token won. */
   resolvedWinning?: boolean;
@@ -147,6 +150,11 @@ export function evaluateExit(input: ExitEvaluationInput): ExitAction {
 
   if (input.riskHalt) return { action: 'RISK_EXIT', quantity: inv, reason: 'risk_halt' };
   if (input.resolvedWinning) return { action: 'RESOLVE', quantity: inv, reason: 'winning_resolved' };
+  const maxAdverse = input.maxAdverseMovePct ?? 0.35;
+  if (input.entryPrice !== undefined && input.entryPrice > 0 &&
+      input.executableBidVwap <= input.entryPrice * (1 - maxAdverse)) {
+    return { action: 'RISK_EXIT', quantity: inv, reason: 'adverse_move' };
+  }
 
   const sellValue = (input.executableBidVwap - input.sellFeePerShare - input.impactBufferPerShare) * inv;
   const holdValue = (input.fairProb - (input.holdingRiskBufferPerShare ?? 0)) * inv;

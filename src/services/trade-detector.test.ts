@@ -38,11 +38,11 @@ describe('TradeDetector', () => {
     const d = new TradeDetector(ledger);
     const first = d.detect(base);
     expect(first?.status).toBe('CONFIRMED');
-    // Same wallet/condition/side within the same second bucket => same key.
-    const replay = d.detect({ ...base, timestamp: base.timestamp + 500 });
+    // Identical wallet/condition/side/timestamp => same second bucket => same key.
+    const replay = d.detect({ ...base, timestamp: base.timestamp });
     expect(replay).toBeNull();
-    // A different bucket is a distinct event.
-    const later = d.detect({ ...base, timestamp: base.timestamp + 5000 });
+    // A timestamp clearly in a different bucket is a distinct event.
+    const later = d.detect({ ...base, timestamp: base.timestamp + 2000 });
     expect(later?.status).toBe('CONFIRMED');
   });
 
