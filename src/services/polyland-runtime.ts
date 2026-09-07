@@ -13,7 +13,7 @@ import { ChainlinkTwapOracle } from './chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './clob-market-ws.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
-import { TradeDetector } from './trade-detector.js';
+import { TradeDetector, FileSeenTradeLedger } from './trade-detector.js';
 import { DecisionLedger } from './decision-ledger.js';
 import { computeGoLiveReport, DEFAULT_GO_LIVE_CRITERIA, formatGoLiveReport, type GoLiveReport } from './go-live-gate.js';
 export interface PolylandRuntimeConfig {
@@ -34,6 +34,7 @@ export class PolylandRuntime {
   private stateStore: any = null;
   private tradeSub: { unsubscribe: () => void } | null = null;
   private tradeDetector: TradeDetector | null = null;
+  private tradeSeen: FileSeenTradeLedger | null = null;
   private gamma: GammaResolutionPoller | null = null;
   private clob: ClobMarketWsService | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -59,7 +60,13 @@ export class PolylandRuntime {
     this.ledger = new DecisionLedger();
     const ledgerRecords = await this.ledger.start();
     console.log(`[PolylandRuntime] decision ledger replayed ${ledgerRecords.length} records`);
-    this.tradeDetector = new TradeDetector({ claim: () => true, get: () => undefined });
+    // Wire the trade detector to a REAL durable ledger. The previous stub
+    // (claim always true, get always undefined) disabled identity dedup in
+    // production, letting every replayed/reconnect fill flood votes (audit:
+    // received=427k, 99% stale). Persisted to trade-seen.jsonl, loaded at boot.
+    this.tradeSeen = new FileSeenTradeLedger('./data/trade-seen.jsonl');
+    this.tradeSeen.start();
+    this.tradeDetector = new TradeDetector(this.tradeSeen, { minNotional: 1 });
     this.quorum = new BasketQuorumService(this.sdk.tradingService, this.quorumConfig); this.quorum.setRiskManager(this.risk); if (this.config.independence) this.quorum.setIndependenceSettings(this.config.independence); if (this.config.basketRisk) this.quorum.setBasketRiskConfig(this.config.basketRisk); this.quorum.setPaperExplorationMode(this.config.paperExploration ?? false); this.quorum.setGammaApi(this.sdk.gammaApi); this.quorum.setDecisionLedger(this.ledger); this.quorum.setSpecializationThresholds(Number(this.screeningConfig.minCategoryTrades ?? 3), Number(this.screeningConfig.minCategoryWinRate ?? 0.58)); this.quorum.startExitLadder(); this.quorum.onSettledTrade = p => { this.recordSettled(p); this.onSettledTrade?.(p); };
     if (process.env.ANTI_SNIPER_ENABLED === 'true') this.quorum.setAntiSniper(new AntiSniperGuard(null));
     if (process.env.TWAP_ENABLED === 'true') { const twap = new ChainlinkTwapOracle({ autoReconnect: true, reconnectDelayMs: 3000, pingIntervalMs: 5000, maxStalenessMs: 30000 }); this.quorum.setTwapOracle(twap); void twap.connect(); }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { TradeDetector, identityKey, type CandidateTrade, type TradeLedger } from './trade-detector.js';
+import { unlinkSync } from 'node:fs';
+import { TradeDetector, identityKey, FileSeenTradeLedger, type CandidateTrade, type TradeLedger } from './trade-detector.js';
 
 class MemLedger implements TradeLedger {
   private m = new Map<string, unknown>();
@@ -106,5 +107,21 @@ describe('TradeDetector', () => {
     const ledger = new MemLedger();
     const d = new TradeDetector(ledger);
     expect(d.aggregate('missing')).toBeNull();
+  });
+
+  it('FileSeenTradeLedger persists claims and dedupes across instances (restart)', () => {
+    const file = `./__trade-seen-test-${Date.now()}.jsonl`;
+    const l1 = new FileSeenTradeLedger(file);
+    expect(l1.claim('key1', { detectedAt: 1 })).toBe(true);
+    expect(l1.claim('key1', { detectedAt: 2 })).toBe(false); // duplicate in same instance
+    expect(l1.get('key1')).toEqual({ detectedAt: 1 });
+    // "Restart": a fresh instance loading the same file must remember key1.
+    const l2 = new FileSeenTradeLedger(file);
+    l2.start();
+    expect(l2.get('key1')).toEqual({ detectedAt: 1 });
+    expect(l2.claim('key1', {})).toBe(false); // still deduped after reload
+    expect(l2.claim('key2', { detectedAt: 3 })).toBe(true);
+    // cleanup
+    try { unlinkSync(file); } catch { /* ignore */ }
   });
 });

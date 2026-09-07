@@ -977,8 +977,20 @@ export class BasketQuorumService {
         const book = this.config.dryRun
           ? await this.tradingService.getPublicOrderBook(tokenId)
           : await this.tradingService.getOrderBook(tokenId);
-        if (!book) continue;
-        const bestBid = book.bids.length > 0 ? Math.max(...book.bids.map((l) => parseFloat(l.price))) : 0;
+        // Fail-open book fetch: previously a missing book silently skipped the
+        // exit with no trace, so the audit could not distinguish "no quote to
+        // price the exit" from "decided to hold" (audit: 13 positions, zero
+        // [exit] lines). Count/log it and record an audit event instead.
+        if (!book || book.bids.length === 0) {
+          this.stats.exitLiquidityBlocked = (this.stats.exitLiquidityBlocked ?? 0) + 1;
+          console.warn(`[BasketQuorum][exit] exit_liquidity_blocked ${pos.marketSlug} (${tokenId}): no live bid`);
+          signalAuditStore.appendJsonl('exit_liquidity_blocked', {
+            tokenId, conditionId: pos.conditionId, marketSlug: pos.marketSlug,
+            entryPrice: pos.entryPrice, firedAt: pos.firedAt, ts: Date.now(),
+          });
+          continue;
+        }
+        const bestBid = Math.max(...book.bids.map((l) => parseFloat(l.price)));
         const bestAsk = book.asks.length > 0 ? Math.min(...book.asks.map((l) => parseFloat(l.price))) : bestBid;
         if (bestBid <= 0) continue;
         // --- replacement trigger evaluation (position state machine) -----------
@@ -1336,9 +1348,29 @@ export class BasketQuorumService {
     }
     const maxMidStalenessMs = Number(process.env.BASKET_MID_MAX_STALENESS_MS ?? 30_000);
     const observedMid = trade.tokenId ? this.liveMid.get(trade.tokenId) : undefined;
-    const currentPrice = observedMid && now - observedMid.ts <= maxMidStalenessMs ? observedMid.price : trade.price;
-    if (!observedMid || now - observedMid.ts > maxMidStalenessMs) {
-      console.warn(`[BasketQuorum] drift fallback: no fresh live mid for ${trade.tokenId ?? signal.conditionId}`);
+    // Fail-closed drift: when the live mid is stale/absent, fetch the public
+    // CLOB book mid synchronously (same source the exit pass uses). If that
+    // also fails, REJECT the fire — never fall back to the leader's own fill
+    // price (drift≈0 auto-pass), which silently defeated the gate (audit:
+    // "drift fallback" floods while 13 fires executed on unvalidated drift).
+    let currentPrice: number | null = null;
+    if (observedMid && now - observedMid.ts <= maxMidStalenessMs) {
+      currentPrice = observedMid.price;
+    } else if (trade.tokenId) {
+      try {
+        const book = await this.tradingService.getPublicOrderBook(trade.tokenId);
+        if (book && book.bids.length > 0 && book.asks.length > 0) {
+          const bestBid = Math.max(...book.bids.map((l) => parseFloat(l.price)));
+          const bestAsk = Math.min(...book.asks.map((l) => parseFloat(l.price)));
+          if (bestBid > 0 && bestAsk > 0) currentPrice = (bestBid + bestAsk) / 2;
+        }
+      } catch { /* fall through to reject */ }
+    }
+    if (currentPrice === null) {
+      console.warn(`[BasketQuorum] drift unpriced (no live mid/book) for ${trade.tokenId ?? signal.conditionId}`);
+      this.stats.quorumSkippedDrift++;
+      this.planDecision(this.ledgerDecision(trade, 'execution', false, 'drift'));
+      return;
     }
     const drift = Math.abs(currentPrice - signal.consensusPrice) / (signal.consensusPrice || 1);
     if (drift > this.config.maxPriceDrift) {
@@ -1361,7 +1393,12 @@ export class BasketQuorumService {
         const seconds = end === null ? null : Math.max(0, Math.floor((end - Date.now()) / 1000));
         if (seconds !== null && seconds < 60) return { minEdge: 0.20, minProb: 0.70 };
         if (seconds !== null && seconds < 180) return { minEdge: 0.10, minProb: 0.60 };
-        return { minEdge: 0, minProb: 0 };
+        // Long-horizon floor: previously {minEdge:0,minProb:0} disabled the
+        // edge gate for any market beyond 3 minutes, letting the bot buy
+        // 0.90+ tickets on winRate alone (the core loss driver). Enforce a
+        // persistent minimum edge so a fair coin can't clear on a high basket
+        // EMA that no longer reflects the market.
+        return { minEdge: 0.05, minProb: 0.55 };
       },
       liquidityCheck: async (tokenId, shares, price) => {
         try {

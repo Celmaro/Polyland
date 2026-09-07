@@ -59,6 +59,35 @@ describe('ExecutionEngine', () => {
     if (!decision.accepted) expect(decision.reason).toBe('min_size');
   });
 
+  it('rejects near-certain entries above the price ceiling with reason edge', async () => {
+    // Regression: audit showed the bot buying esports/soccer at 0.90-0.95
+    // (negative expectancy). The price ceiling must reject regardless of
+    // winRate, even when edge would otherwise clear.
+    const engine = new ExecutionEngine(makeTrading(), null, makeDeps(), { ...CONFIG, maxEntryPrice: 0.85 });
+    const hot: ConsensusSignal = { ...SIGNAL, consensusPrice: 0.92, winRate: 0.95 };
+    const decision = await engine.evaluate(hot, TRADE, BASKET);
+    expect(decision.accepted).toBe(false);
+    if (!decision.accepted) {
+      expect(decision.reason).toBe('edge');
+      expect(decision.detail ?? '').toContain('price_ceiling');
+    }
+  });
+
+  it('floor-clamps a sub-min but non-dust consensus up to minTradeSize instead of rejecting', async () => {
+    // Regression: sizing proportional to leader shares scaled thin leaders
+    // below min order notional (audit: 1047 min_size rejections). A real
+    // consensus with a notional above the $1 dust bound should be clamped up
+    // to minTradeSize, not rejected.
+    const engine = new ExecutionEngine(makeTrading(), null, makeDeps(), { ...CONFIG }); // minTradeSize 10
+    // totalSize 10 -> amount 10*0.5*0.6 = $3 >= $1 dust but < $10 min.
+    const thin: ConsensusSignal = { ...SIGNAL, totalSize: 10, winRate: 0.7 };
+    const decision = await engine.evaluate(thin, TRADE, BASKET);
+    expect(decision.accepted).toBe(true);
+    if (decision.accepted) {
+      expect(decision.value.amountUsd).toBeGreaterThanOrEqual(CONFIG.minTradeSize * 0.99);
+    }
+  });
+
   it('rejects when riskManager.canTrade() is false with reason risk', async () => {
     const risk = { canTrade: () => false, isBasketKilled: () => false } as unknown as import('./risk-manager.js').RiskManager;
     const engine = new ExecutionEngine(makeTrading(), risk, makeDeps(), CONFIG);

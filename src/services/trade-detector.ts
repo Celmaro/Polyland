@@ -16,6 +16,8 @@
  * itself; the runtime provides a `ledger` with `claim(key, value)`, and
  * `reconcile()` drives the copy planner.
  */
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 export type TradeSide = 'BUY' | 'SELL';
 
 /** Raw candidate from the fast hint path (Activity WS). */
@@ -81,6 +83,50 @@ export interface TradeLedger {
   /** Returns true if `key` was not yet present and now claimed. */
   claim(key: string, value: unknown): boolean;
   get(key: string): unknown;
+}
+
+/**
+ * Durable, file-backed TradeLedger. The detector's identity dedup is only as
+ * good as this store's memory: wiring the detector to a no-op ledger
+ * (claim always true, get always undefined) disabled dedup in production and
+ * let every replayed/reconnected fill flood votes (audit: received=427k, 99%
+ * stale). This persists claimed canonical keys to an append-only JSONL loaded
+ * at boot, so replay and reconnect fills are recognized as already-seen across
+ * restarts. File I/O is async fire-and-forget; a slow disk must never block
+ * the trade-intake hot path.
+ */
+export class FileSeenTradeLedger implements TradeLedger {
+  private readonly seen = new Map<string, unknown>();
+  constructor(private readonly path: string) {}
+
+  /** Load already-claimed keys from disk (idempotent, never throws). */
+  start(): void {
+    try {
+      const raw = readFileSync(this.path, 'utf8');
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const rec = JSON.parse(line) as { key?: string; value?: unknown };
+          if (rec.key) this.seen.set(rec.key, rec.value);
+        } catch { /* skip malformed line */ }
+      }
+    } catch { /* missing/corrupt file -> empty set */ }
+  }
+
+  get(key: string): unknown {
+    return this.seen.has(key) ? this.seen.get(key) : undefined;
+  }
+
+  claim(key: string, value: unknown): boolean {
+    if (this.seen.has(key)) return false;
+    this.seen.set(key, value);
+    // Durable append, fire-and-forget — never block the intake hot path.
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      appendFileSync(this.path, JSON.stringify({ key, value }) + '\n', 'utf8');
+    } catch { /* persistence must never break detection */ }
+    return true;
+  }
 }
 
 export interface AggregatedTrade {

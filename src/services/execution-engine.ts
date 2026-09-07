@@ -11,6 +11,9 @@ import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 export interface ExecutionEngineConfig {
   dryRun: boolean; orderType: 'FOK' | 'FAK'; maxSlippage: number;
   minTradeSize: number; maxSizePerTrade: number; sizeScale: number;
+  /** Absolute upper bound on entry price (0-1). Rejects buying near-certain
+   * tickets (e.g. >0.85) where risk/reward is structurally bad. */
+  maxEntryPrice?: number;
 }
 export interface ExecutionEngineDeps {
   tickSizeFor: (conditionId: string) => number;
@@ -45,10 +48,27 @@ export class ExecutionEngine {
     amount = Math.min(amount, Math.max(0, this.deps.bankrollFor(category) - spent));
     const tick = tickSizeToEnum(this.deps.tickSizeFor(signal.conditionId));
     const price = quantizeBuyPrice(signal.consensusPrice * (1 + this.config.maxSlippage), tick);
-    const exact = computeExactSharesAndCost(amount, price, tick);
-    if (exact.costUsd < this.config.minTradeSize || exact.costUsd < 1) return { accepted: false, reason: 'min_size' };
+    let exact = computeExactSharesAndCost(amount, price, tick);
+    // Sizing floor-clamp: sizing is proportional to the leader's share count,
+    // so a thin leader can scale the copy below the minimum order notional.
+    // Rather than reject a real consensus outright, clamp UP to minTradeSize
+    // when the computed notional is above the $1 dust bound and the edge
+    // (checked below) is real. Caps at maxSizePerTrade. This converts the
+    // historical min_size rejections (audit: 1047) into executed paper trades.
+    if (exact.costUsd < this.config.minTradeSize && exact.costUsd >= 1 && amount < this.config.maxSizePerTrade) {
+      const clamped = Math.min(this.config.minTradeSize, this.config.maxSizePerTrade);
+      exact = computeExactSharesAndCost(clamped, price, tick);
+      if (exact.costUsd > this.config.maxSizePerTrade) exact = computeExactSharesAndCost(this.config.maxSizePerTrade, price, tick);
+    }
+    if (exact.costUsd < 1) return { accepted: false, reason: 'min_size' };
     const fee = takerFeePerShare(signal.consensusPrice, this.deps.feeRateFor(signal.conditionId) || DEFAULT_FEE_RATE_BPS);
     const edge = signal.winRate - signal.consensusPrice - fee;
+    // Absolute price ceiling: buying near-certain tickets (>= ~0.85) risks a
+    // lot to win a little and cannot be validated by a copy signal. Reject
+    // regardless of the basket's winRate (audit: entries at 0.90-0.95 in
+    // esports/soccer were the core loss driver).
+    const maxEntry = this.config.maxEntryPrice ?? 0.85;
+    if (signal.consensusPrice > maxEntry) return { accepted: false, reason: 'edge', detail: `price_ceiling ${signal.consensusPrice.toFixed(3)} > ${maxEntry}` };
     const phase = this.deps.phaseEdge(signal);
     if (edge <= phase.minEdge || signal.winRate < phase.minProb) return { accepted: false, reason: 'edge' };
     if (!this.config.dryRun && trade.tokenId && !(await this.deps.liquidityCheck(trade.tokenId, exact.shares, price))) return { accepted: false, reason: 'liquidity' };
