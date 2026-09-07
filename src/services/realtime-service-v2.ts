@@ -1063,6 +1063,13 @@ export class RealtimeServiceV2 extends EventEmitter {
       if (price === 0.5 && size > 0 && (payload.side === undefined || payload.side === '')) {
         return; // mechanical conversion, not a trade
       }
+      // Feed-dedup: 'orders_matched' re-delivers every fill that the 'trades'
+      // topic already carries (each matched order prints individually). Passing
+      // both through doubled feed volume (audit 09-06: +156k received/5min
+      // bursts), double-counted votes, and multiplied drift-fallback logging.
+      // The 'trades' topic is the authoritative per-fill stream; drop the
+      // duplicate. (tx-level dedup downstream survives as a second layer.)
+      return;
     }
     const trade: ActivityTrade = {
       asset: payload.asset as string || '',

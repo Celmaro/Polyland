@@ -213,6 +213,11 @@ export class BasketQuorumService {
   private walletCategoryWinRate = new Map<string, number>();
   /** conditionId:outcome -> last computed vote-cluster HHI (0-1, 1 = one wallet). */
   private lastVoteHHI = new Map<string, number>();
+  // Feed-burst detector state (L10 pressure valve): events in the current
+  // minute + last burst warning time.
+  private _feedEventsThisMinute = 0;
+  private _feedMinuteStart = 0;
+  private _lastFeedBurstLogAt = 0;
   private walletTierMap = new Map<string, 'PRIMARY' | 'SATELLITE'>();
   /** conditionId:outcome -> last fired timestamp (cooldown/one-shot) */
   private lastFired = new Map<string, number>();
@@ -640,6 +645,13 @@ export class BasketQuorumService {
   onTrade(trade: SmartMoneyTrade): void {
     // Count every raw incoming trade exactly once.
     this.stats.feedReceived++
+    // Feed-burst window counter (resets each minute; consumed by the L10
+    // staleness pressure valve below).
+    if (Date.now() - this._feedMinuteStart > 60_000) {
+      this._feedMinuteStart = Date.now();
+      this._feedEventsThisMinute = 0;
+    }
+    this._feedEventsThisMinute++;
     // We can't build a consensus key without a market; skip.
     const conditionId = trade.conditionId;
     const marketSlug = trade.marketSlug;
@@ -683,7 +695,18 @@ export class BasketQuorumService {
     // signals — a vote older than 2× the basket window is dropped, not
     // processed. This bounds worst-case signal age.
     const nowTs = Date.now();
-    if (trade.timestamp && nowTs - trade.timestamp > 2 * this.windowMs(categorizeMarket(marketSlug))) {
+    const cat0 = categorizeMarket(marketSlug);
+    const window = this.windowMs(cat0);
+    // Backfill burst detector: the smart-money feed replays history after
+    // reconnects (audit 09-06: +156k received in 5min, all stale). During a
+    // burst (>5000 events/min), tighten from 2× to 0.33× the window and log
+    // once per burst so replay floods are visible instead of silent.
+    if (nowTs - this._lastFeedBurstLogAt > 60_000 && this._feedEventsThisMinute > 5000) {
+      console.warn(`[BasketQuorum] feed backfill burst: ${this._feedEventsThisMinute} events/min — tightening staleness gate to 1/3 window`);
+      this._lastFeedBurstLogAt = nowTs;
+    }
+    const staleMultiplier = this._feedEventsThisMinute > 5000 ? 0.33 : 2;
+    if (trade.timestamp && nowTs - trade.timestamp > staleMultiplier * window) {
       this.stats.quorumSkippedStaleMarket = (this.stats.quorumSkippedStaleMarket ?? 0) + 1;
       this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'stale'));
       return;
@@ -799,16 +822,28 @@ export class BasketQuorumService {
    */
   private _isMarketStale(trade: SmartMoneyTrade): boolean {
     // SmartMoneyTrade only has marketSlug; the slug itself encodes the
-    // resolution date (e.g. 'highest-temperature-in-nyc-on-march-15-2026').
+    // resolution date. Three formats seen in prod:
+    //   1. weather:  'highest-temperature-in-nyc-on-march-15-2026'
+    //   2. crypto:   'eth-updown-5m-1788454500' (trailing unix epoch)
+    //   3. sports:   'lol-ig1-we-2026-09-06' (ISO date, no epoch suffix).
+    // (3) was previously UNMATCHED — finished esports/soccer games lingered
+    // as fresh votes until the L10 timestamp gate caught their replays.
     const haystack = (trade.marketSlug ?? '').toLowerCase();
-    // Look for "on-<month>-<day>-<year>" pattern in the slug, which is how
-    // Polymarket titles resolved markets (e.g. "highest-temperature-in-nyc-on-march-15-2026").
-    const m = haystack.match(/on-([a-z]+)-(\d{1,2})-(\d{4})/);
+    // ISO date anywhere in the slug: 'YYYY-MM-DD'. Market day ends 23:59:59 UTC.
+    const iso = haystack.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) {
+      const expiry = new Date(Date.UTC(+iso[1], +iso[2] - 1, +iso[3], 23, 59, 59));
+      if (Number.isFinite(expiry.getTime()) && expiry.getTime() < Date.now()) return true;
+      // Future-dated ISO slug: not stale.
+      return false;
+    }
+    // Trailing epoch: 10-digit seconds or 13-digit ms.
     const epoch = haystack.match(/-(\d{10,})$/);
-    if (!m && epoch) {
+    if (epoch) {
       const expiry = Number(epoch[1]) * (epoch[1].length >= 13 ? 1 : 1000);
       return Number.isFinite(expiry) && expiry < Date.now();
     }
+    const m = haystack.match(/on-([a-z]+)-(\d{1,2})-(\d{4})/);
     if (!m) return false;
     const monthNames = [
       'january', 'february', 'march', 'april', 'may', 'june',
@@ -1156,19 +1191,21 @@ export class BasketQuorumService {
           }
         }
         if (!quorumReached) {
-          // Diagnostic: log NEAR-MISSES so we can see if consensus is *almost* there.
-          // Rate-limited: one line per market+outcome per nearMissLogIntervalMs.
-          // Only logs the "waiting" state the operator cares about: 2+ wallets
-          // already aligned (primary>=1 or satellite>=2), still short of quorum.
+          // Mid subscription: request on EVERY aligned vote, NOT inside the
+          // near-miss log gate. The old code only subscribed when the log
+          // actually printed (rate-limited to 1/5min), so a market reaching
+          // quorum between log windows executed its drift check against the
+          // leader's own fill price (fallback) — the gate passed by
+          // construction (audit 09-07: 496/533 SKIP-drift markets were never
+          // near-missed; 7,882 fallbacks vs 103 fires).
           if (primaryCount + satelliteCount >= 2 && trade.tokenId) {
+            if (this.onMidInterest) this.onMidInterest(trade.tokenId);
+            // Diagnostic near-miss log — rate-limited separately.
             const lastLog = this.nearMissLogAt.get(key) ?? 0;
             if (now - lastLog >= this.nearMissLogIntervalMs) {
               this.nearMissLogAt.set(key, now);
               const voters = [...outcomeVotes.values()].map(v => `${v.tier}@${v.price}`).join(',');
               console.log(`[Quorum near-miss] ${marketSlug} ${outcome} primary=${primaryCount} sat=${satelliteCount} votes=[${voters}]`);
-              // Signal live quorum interest so the operator wiring can feed
-              // the anti-sniper guard a real mid buffer for this token.
-              if (this.onMidInterest) this.onMidInterest(trade.tokenId);
             }
           }
           // Not enough tier-weighted consensus — wait for more basket members.
@@ -1183,6 +1220,10 @@ export class BasketQuorumService {
       prices.length % 2 === 0
         ? (prices[mid - 1] + prices[mid]) / 2
         : prices[mid];
+    // Quorum reached: guarantee the token is subscribed before the drift
+    // check runs (markets can jump 1→quorum between votes and never pass
+    // through a near-miss). subscribe() is idempotent + evicts oldest.
+    if (trade.tokenId && this.onMidInterest) this.onMidInterest(trade.tokenId);
     const signal: ConsensusSignal = {
       signalId: `${conditionId}-${outcome}-${now}`,
       conditionId,
