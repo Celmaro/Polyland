@@ -19,7 +19,7 @@
  *  - FAK preferred (partial fills acceptable, remainder cancels); FOK when an
  *    all-or-nothing position is required.
  */
-import { quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
+import { quantizeBuyPrice, quantizeToTick, tickSizeToEnum } from '../utils/price-utils.js';
 
 export interface BookLevel {
   price: number;
@@ -184,7 +184,10 @@ export class CopyPlanner {
     if (v.price < signal.price * (1 - this.config.maxSlippagePct)) {
       return { accepted: false, reason: 'drift', detail: `bid ${v.price.toFixed(4)} vs leader ${signal.price.toFixed(4)}` };
     }
-    const price = quantizeBuyPrice(v.price, tick);
+    // SELL limit quantizes UP (ceil): a sell limit below the executable VWAP
+    // would instant-cross at the worse price; ceil keeps the limit at/above
+    // the computed executable value (quantizeBuyPrice floors — wrong for SELL).
+    const price = quantizeToTick(v.price, tick, 'ceil');
     const feePerShare = takerFeePerShare(price, meta.takerFeeRateBps);
     const shares = Math.floor(signal.size);
     const costUsd = shares * price;

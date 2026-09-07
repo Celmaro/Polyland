@@ -125,6 +125,12 @@ export interface ExitEvaluationInput {
   requiredMarginPerShare?: number;
   /** Maximum tolerated loss from entry before a risk exit (decimal, e.g. 0.35). */
   maxAdverseMovePct?: number;
+  /** Seconds until market expiry — scales the adverse-move tolerance (short horizon → tighter). */
+  secondsToExpiry?: number;
+  /** Current bid-ask spread of the book — drives the value-exit hysteresis. */
+  bookSpread?: number;
+  /** Explicit exit hysteresis per share; defaults to max(2c, halfSpread). */
+  exitHysteresisPerShare?: number;
   /** Set when the confirmed leader exit is available. */
   leaderExit?: { leaderShares: number; confirmed: boolean };
   /** Market is resolved and this token won. */
@@ -150,29 +156,47 @@ export function evaluateExit(input: ExitEvaluationInput): ExitAction {
 
   if (input.riskHalt) return { action: 'RISK_EXIT', quantity: inv, reason: 'risk_halt' };
   if (input.resolvedWinning) return { action: 'RESOLVE', quantity: inv, reason: 'winning_resolved' };
-  const maxAdverse = input.maxAdverseMovePct ?? 0.35;
-  if (input.entryPrice !== undefined && input.entryPrice > 0 &&
-      input.executableBidVwap <= input.entryPrice * (1 - maxAdverse)) {
-    return { action: 'RISK_EXIT', quantity: inv, reason: 'adverse_move' };
+
+  // Bounded adverse-move loss cut. The tolerance shrinks with time remaining:
+  // a sub-hour binary has no recovery path, so allow −10% immediately after
+  // entry and widen toward the 35% cap only for long-horizon positions
+  // (audit: entries 0.85 → 0.04 with the flat 35% cap never risk-exited).
+  if (input.entryPrice !== undefined && input.entryPrice > 0) {
+    let maxAdverse = input.maxAdverseMovePct ?? 0.35;
+    if (input.secondsToExpiry !== undefined) {
+      // −10% floor, linear widening to maxAdverse over 60 minutes.
+      const scaled = Math.min(maxAdverse, 0.10 + (input.secondsToExpiry / 3600) * 0.25);
+      maxAdverse = Math.min(maxAdverse, scaled);
+    }
+    if (input.executableBidVwap <= input.entryPrice * (1 - maxAdverse)) {
+      return { action: 'RISK_EXIT', quantity: inv, reason: 'adverse_move' };
+    }
   }
 
-  const sellValue = (input.executableBidVwap - input.sellFeePerShare - input.impactBufferPerShare) * inv;
-  const holdValue = (input.fairProb - (input.holdingRiskBufferPerShare ?? 0)) * inv;
+  const sellFee = input.sellFeePerShare ?? 0;
+  const impact = input.impactBufferPerShare ?? 0;
+  const sellValue = (input.executableBidVwap - sellFee - impact) * inv;
+  const holdBuffer = input.holdingRiskBufferPerShare ?? 0;
+  const holdValue = (input.fairProb - holdBuffer) * inv;
   const margin = input.requiredMarginPerShare ?? 0;
 
-  // A confirmed leader exit re-evaluates first and caps the exit quantity at
-  // the leader's proportional reduction; it is never an unconditional mirror.
-  if (input.leaderExit?.confirmed) {
+  // A confirmed leader/reverse-quorum exit is an INFORMATION event, not an
+  // arithmetic one: the wallets that justified the entry have flipped. It
+  // bypasses the value comparison (which in a wide-spread thin book would
+  // prefer holding all the way to zero) and caps quantity at the leader's
+  // proportional reduction — never an unconditional mirror.
+  if (input.leaderExit?.confirmed && input.leaderExit.leaderShares > 0) {
     const leaderQty = Math.min(input.leaderExit.leaderShares, inv);
-    if (leaderQty > 0 && sellValue > holdValue) {
-      return { action: 'SELL', quantity: leaderQty, reason: 'leader_exit' };
-    }
-    if (leaderQty > 0) {
-      return { action: 'HOLD', reason: 'leader_exit_but_value_prefers_hold' };
-    }
+    return { action: 'SELL', quantity: leaderQty, reason: 'leader_exit' };
   }
 
-  if (sellValue > holdValue + margin * inv) {
+  // Value exit with hysteresis: the sell side must beat the hold side by MORE
+  // than one tick of spread noise. Without this, every tight-spread book
+  // (halfSpread < 1.5c − fee) triggers a −1-tick dump that donates the full
+  // round-trip spread + fee to the market maker (audit: 8/8 exits −1 tick).
+  const spread = input.bookSpread ?? 0;
+  const hysteresis = input.exitHysteresisPerShare ?? Math.max(0.02, spread / 2);
+  if (sellValue > holdValue + margin * inv + hysteresis * inv) {
     return { action: 'SELL', quantity: inv, reason: 'value_exit' };
   }
 

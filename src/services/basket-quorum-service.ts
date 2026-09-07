@@ -157,6 +157,8 @@ export interface QuorumStats {
   ignoredNotMember: number;
   ignoredUnsupportedSide: number;
   ignoredInvalidMarket: number;
+  /** Trades dropped by the domain kill-switch (BASKET_DISABLED_CATEGORIES). */
+  ignoredDisabledDomain?: number;
   /** Votes that survived pre-vote filters and were recorded. */
   votesRecorded: number;
   voters: number;
@@ -205,6 +207,12 @@ export class BasketQuorumService {
   /** conditionId -> outcome -> wallet -> Vote */
   private votes = new Map<string, Map<string, Map<string, Vote>>>();
   /** Wallet address -> tier map. Populated in seed(). Used for tiered quorum. */
+  // Confidence maps (populated in seed()): per-wallet CopyScore→reliability and
+  // per wallet:category winRate for the planner's fairProb. Rebuilt on re-seed.
+  private walletReliability = new Map<string, number>();
+  private walletCategoryWinRate = new Map<string, number>();
+  /** conditionId:outcome -> last computed vote-cluster HHI (0-1, 1 = one wallet). */
+  private lastVoteHHI = new Map<string, number>();
   private walletTierMap = new Map<string, 'PRIMARY' | 'SATELLITE'>();
   /** conditionId:outcome -> last fired timestamp (cooldown/one-shot) */
   private lastFired = new Map<string, number>();
@@ -547,6 +555,14 @@ export class BasketQuorumService {
       // before basket.wallets.includes() — if cases differ the vote is silently
       // dropped and every wallet shows primary=0 in logs.
       this.walletTierMap.set(w.address.toLowerCase(), w.tier as 'PRIMARY' | 'SATELLITE');
+      // Confidence signals for the execution layer: per-wallet CopyScore
+      // (0-100 → 0-1) becomes the planner's `reliability`, and per-category
+      // winRate becomes the wallet-calibrated probability for the category
+      // basket's fairProb blend. Before this, the planner call hardcoded
+      // reliability/executionConfidence/independenceAdjustment = 1, so the
+      // entire Phase-2/3 confidence layer never touched an execution decision.
+      this.walletReliability.set(w.address.toLowerCase(), Math.max(0, Math.min(1, w.copyScore / 100)));
+      this.walletCategoryWinRate.set(`${w.address.toLowerCase()}:${w.category}`, Math.max(0, Math.min(1, w.winRate)));
     }
     // Rebuild baskets Map using existing config defaults.
     // FIRST seed only: baskets were empty before, so there is no prior state
@@ -681,6 +697,23 @@ export class BasketQuorumService {
       this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'no_basket'));
       return;
     }
+    // 1b. Domain kill-switch: operator can disable a category via env
+    //    (BASKET_DISABLED_CATEGORIES="tennis,itf" comma list). The audit
+    //    (09-07) showed thin tennis/ITF books produced the day's worst
+    //    outcomes (entries 0.85→0.04); disabling beats parameter-tuning
+    //    a structurally losing domain. Match on slug substrings too, since
+    //    categorizeMarket may not isolate "atp-"/"itf-" prefixed slugs.
+    const rawDisabled = (process.env.BASKET_DISABLED_CATEGORIES ?? '').toLowerCase();
+    if (rawDisabled) {
+      const tokens = rawDisabled.split(',').map((t) => t.trim()).filter(Boolean);
+      const slug = (marketSlug ?? '').toLowerCase();
+      const hit = tokens.some((t) => category === t || slug.includes(t));
+      if (hit) {
+        this.stats.ignoredDisabledDomain = (this.stats.ignoredDisabledDomain ?? 0) + 1;
+        this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'domain_disabled'));
+        return;
+      }
+    }
     // 2. Only count wallets that are members of this basket.
     const traderKey = trade.traderAddress.toLowerCase();
     if (!basket.wallets.includes(traderKey)) {
@@ -692,6 +725,20 @@ export class BasketQuorumService {
     //    are recorded but not counted toward firing, so we can see counter-flow.)
     // SELL votes were normalized above; unsupported labels returned early.
     const now = Date.now();
+    // Reverse-flow tracking (exit side): any basket-member fill that is either
+    // a SELL or a BUY on some outcome — recorded per conditionId+wallet with a
+    // timestamp so _countReverseQuorum can detect post-entry flips even after
+    // the vote maps prune. A SELL by a quorum wallet on our outcome, or a BUY
+    // by a quorum wallet on the opposite outcome, is the same information event.
+    for (const [tokenId, p] of this.openPositions) {
+      if (p.conditionId !== conditionId) continue;
+      if (!p.quorumWallets?.includes(traderKey)) continue;
+      const isOppositeBuy = voteSide === 'BUY' && voteOutcome !== p.outcome;
+      const isSameSell = voteSide === 'SELL' && voteOutcome === p.outcome;
+      if (isOppositeBuy || isSameSell) {
+        this._reverseFills.set(`${conditionId}:${traderKey}`, { conditionId, wallet: traderKey, ts: now });
+      }
+    }
     // 4. Prune stale votes in THIS market/outcome (rolling window).
     const outcomeVotes = this.getVoteMap(conditionId, voteOutcome);
     for (const [wallet, vote] of outcomeVotes) {
@@ -883,14 +930,20 @@ export class BasketQuorumService {
         if (bestBid <= 0) continue;
         // --- replacement trigger evaluation (position state machine) -----------
         const feeRateBps = this.feeRateCache.get(tokenId) ?? this.feeRateCache.get(pos.conditionId) ?? 0;
-        // Fair probability = LIVE market-implied probability of the position
-        // token, from the book we just fetched. The basket's historical
-        // winRate is an entry-time belief that never updates; using it as
-        // "expected settlement value" makes the value-exit HOLD every
-        // collapsing position to zero (audit: 15/15 live positions at ~0.04
-        // with zero exits). The market mid is the honest settlement prior.
+        // Fair settlement probability — blended estimate, NOT the raw live mid
+        // (that degenerates the value-exit into spread-width arithmetic: with
+        // fairProb = mid, "sell beats hold" reduces to halfSpread < 1.5c − fee,
+        // i.e. a −1-tick dump on every tight book, audit 09-07: 8/8 exits −1 tick)
+        // and NOT the stale entry winRate (that held collapsing positions to zero).
+        // Blend: live mid carries the market's information; the entry thesis
+        // (consensus price) carries the quorum's original conviction. The blend
+        // decays toward the market as expiry nears (the market knows best late).
         const liveProb = Math.min(0.99, Math.max(0.01, (bestBid + bestAsk) / 2));
-        const fairProb = liveProb;
+        const thesisProb = Math.min(0.99, Math.max(0.01, pos.entryPrice));
+        const secondsLeft = endMs ? Math.max(0, Math.floor((endMs - Date.now()) / 1000)) : null;
+        // Long horizon (≥60min): 50/50; short horizon (<5min): 90% market.
+        const marketWeight = secondsLeft === null ? 0.5 : Math.min(0.9, Math.max(0.5, 0.9 - secondsLeft / 7200));
+        const fairProb = marketWeight * liveProb + (1 - marketWeight) * thesisProb;
         const entryPrice = pos.entryPrice;
         const exitDecision = evaluateExit({
           inventoryShares: pos.size,
@@ -902,6 +955,8 @@ export class BasketQuorumService {
           // expected settlement value minus capital-lock/oracle risk.
           holdingRiskBufferPerShare: 0.02,
           fairProb,
+          bookSpread: Math.max(0, bestAsk - bestBid),
+          secondsToExpiry: secondsLeft ?? undefined,
           leaderExit: pos.quorumWallets && pos.quorumWallets.length > 0 && this._countReverseQuorum(pos) >= REVERSE_QUORUM_MIN
             ? { leaderShares: pos.size, confirmed: true }
             : undefined,
@@ -971,17 +1026,28 @@ export class BasketQuorumService {
    * Item 2: count how many of the position's original quorum wallets have
    * since voted BUY on the OPPOSITE outcome of the same market, or SELLed
    * the same outcome (mirror signal, deduped per wallet).
+   *
+   * Freshness: the vote maps are pruned on the basket window (30min), so a
+   * position older than the window would never see reverse votes — the
+   * strongest exit signal would be structurally impossible. Reverse fills
+   * are therefore also recorded in `_reverseFills` (timestamped, per
+   * conditionId+wallet) by onTrade, independent of vote pruning.
    */
-  private _countReverseQuorum(pos: { conditionId: string; outcome: string; quorumWallets?: string[] }): number {
+  private _reverseFills = new Map<string, { conditionId: string; wallet: string; ts: number }>();
+
+  private _countReverseQuorum(pos: { conditionId: string; outcome: string; quorumWallets?: string[]; firedAt: number }): number {
     if (!pos.quorumWallets || pos.quorumWallets.length === 0) return 0;
     const flipped = new Set<string>();
     for (const wallet of pos.quorumWallets) {
-      // Opposite-outcome BUY votes (recorded in the other outcome's vote map).
+      // 1. Live vote map (fresh window) — opposite-outcome BUY votes.
       for (const [outcomeName, byWallet] of this.votes.get(pos.conditionId) ?? []) {
         if (outcomeName === pos.outcome) continue;
         const vote = byWallet.get(wallet);
         if (vote && vote.side === 'BUY') flipped.add(wallet);
       }
+      // 2. Timestamped reverse-fill record (survives vote pruning).
+      const rec = this._reverseFills.get(`${pos.conditionId}:${wallet}`);
+      if (rec && rec.ts >= pos.firedAt) flipped.add(wallet);
     }
     return flipped.size;
   }
@@ -1075,6 +1141,9 @@ export class BasketQuorumService {
           const limits = { maxHHI: this.independenceSettings.maxHHI, minNEffective: satelliteOnly ? Math.max(3, this.independenceSettings.minNEffective) : this.independenceSettings.minNEffective };
           const strength = consensusStrength(outcomeVotes);
           const minStrength = satelliteOnly ? (this.independenceSettings.consensusStrengthSatellite ?? 0.70) : (this.independenceSettings.consensusStrengthPrimary ?? 0.60);
+          // Remember the cluster HHI for the execution layer's independence
+          // adjustment (consumed in executeIfInBand's CopyPlanner call).
+          this.lastVoteHHI.set(`${conditionId}:${outcome}`, summary.hhi);
           if (!isDiverse(summary.hhi, summary.nEff, limits)) {
             this.stats.quorumNearMissIndependence = (this.stats.quorumNearMissIndependence ?? 0) + 1;
             if (this.paperExploration) this.stats.shadowSignals = (this.stats.shadowSignals ?? 0) + 1;
@@ -1196,6 +1265,15 @@ export class BasketQuorumService {
     key: string,
     now: number,
   ): Promise<void> {
+    // Fee rate: fetch-and-cache per conditionId before any edge math. Without
+    // this the cache defaults to 0 and every edge/exit calculation runs
+    // fee-free (systematically optimistic by the full taker fee).
+    if (signal.conditionId && !this.feeRateCache.has(signal.conditionId)) {
+      try {
+        const bps = await this.tradingService.getMarketFeeRateBps(signal.conditionId);
+        if (Number.isFinite(bps) && bps >= 0) this.feeRateCache.set(signal.conditionId, bps);
+      } catch { /* non-fatal: fallbacks below handle the miss */ }
+    }
     const maxMidStalenessMs = Number(process.env.BASKET_MID_MAX_STALENESS_MS ?? 30_000);
     const observedMid = trade.tokenId ? this.liveMid.get(trade.tokenId) : undefined;
     const currentPrice = observedMid && now - observedMid.ts <= maxMidStalenessMs ? observedMid.price : trade.price;
@@ -1211,7 +1289,7 @@ export class BasketQuorumService {
     }
     const engine = new ExecutionEngine(this.tradingService, this.riskManager, {
       tickSizeFor: (conditionId) => this.tickSizeCache.get(conditionId) ?? 0.01,
-      feeRateFor: (conditionId) => this.feeRateCache.get(conditionId) ?? 0,
+      feeRateFor: (conditionId) => this.feeRateCache.get(conditionId) ?? DEFAULT_FEE_RATE_BPS,
       bankrollFor: (category) => this.bankrollFor(category as MarketCategory),
       basketSpendGet: (category) => this.basketSpend.get(category as MarketCategory) ?? 0,
       basketSpendAdd: (category, amount) => {
@@ -1291,23 +1369,52 @@ export class BasketQuorumService {
         const meta: MarketMeta = {
           tickSize: this.tickSizeCache.get(signal.conditionId) ?? 0.01,
           minNotional: 1,
-          takerFeeRateBps: this.feeRateCache.get(signal.conditionId) ?? 0,
+          takerFeeRateBps: this.feeRateCache.get(signal.conditionId) ?? DEFAULT_FEE_RATE_BPS,
           acceptingOrders: true,
         };
         const s = signal.wallets[0] ?? (trade.traderAddress ?? '').toLowerCase();
+        // Confidence wiring: pull REAL screening-derived values for the quorum's
+        // wallets. reliability = mean CopyScore (0-1) across the firing wallets;
+        // independenceAdjustment = 1 − HHI of the vote cluster (computed in
+        // tryFire); fairProb = per-wallet category winRate (wallet-calibrated)
+        // blended with the basket EMA. Falls back to neutral values only when
+        // the wallet has no screening data yet.
+        const walletStats = signal.wallets.map((w) => ({
+          rel: this.walletReliability.get(w) ?? 0.5,
+          wr: this.walletCategoryWinRate.get(`${w}:${signal.category}`),
+        }));
+        const reliability = walletStats.length
+          ? walletStats.reduce((a, b) => a + b.rel, 0) / walletStats.length
+          : 0.5;
+        const wrVals = walletStats.map((x) => x.wr).filter((v): v is number => typeof v === 'number');
+        const walletWinRate = wrVals.length
+          ? wrVals.reduce((a, b) => a + b, 0) / wrVals.length
+          : null;
+        // Blend: wallet-calibrated rate (if any) 60%, basket EMA 40%. The EMA
+        // alone made the edge gate a falling-knife filter; the wallet rate is
+        // the actual "these specific people win here" number.
+        const fairProb = walletWinRate !== null
+          ? 0.6 * walletWinRate + 0.4 * (signal.winRate ?? 0.6)
+          : (signal.winRate ?? 0.6);
+        const hhi = this.lastVoteHHI.get(`${signal.conditionId}:${signal.outcome}`) ?? 1;
+        const independenceAdjustment = Math.max(0.2, Math.min(1, 1 - hhi));
       const planDecision = planner.plan(
         {
           wallet: s,
             conditionId: signal.conditionId,
             tokenId: trade.tokenId ?? signal.conditionId,
             side: 'BUY',
-            size: signal.totalSize,
+            // Request OUR copy size (shares the engine actually plans to buy),
+            // not the whales' aggregate totalSize — walking the book for the
+            // full whale notional overstates the executable price on thin
+            // books and produces spurious drift/no_edge rejections.
+            size: Math.max(1, (decision.value.amountUsd || 0) / Math.max(signal.consensusPrice, 0.01)),
             price: signal.consensusPrice,
             timestamp: now,
-            fairProb: signal.winRate,
-            reliability: 1,
+            fairProb,
+            reliability,
             executionConfidence: 1,
-            independenceAdjustment: 1,
+            independenceAdjustment,
           },
           book,
           meta,
@@ -1485,11 +1592,18 @@ export class BasketQuorumService {
   recordResolution(conditionId: string, resolved: 0 | 1): void {
     // 1. Update the audit store so we can compute realized edge
     signalAuditStore.recordSettlement(conditionId, resolved);
-    // 2. Update each basket's rolling win rate.
-    //    W_new = W_old * (1 - α) + outcome * α   (EMA with α=0.1)
+    // 2. Update ONLY the baskets that actually fired on this market. The old
+    //   code moved EVERY basket's EMA on ANY resolution — a single crypto
+    //   settlement dragged the politics/weather baskets' winRate too
+    //   (landmine: re-wiring this would silently corrupt every basket prior).
+    //   Scoped via the audit store's per-condition signal baskets.
     const ALPHA = 0.1;
-    for (const [, basket] of this.baskets) {
-      if (!basket.enabled) continue;
+    const firedBaskets = new Set<string>(
+      signalAuditStore.getSignalsByCondition(conditionId).map((s) => s.basket),
+    );
+    for (const basketName of firedBaskets) {
+      const basket = this.baskets.get(basketName as MarketCategory);
+      if (!basket || !basket.enabled) continue;
       const won = resolved === 1 ? 1 : 0;
       basket.winRate = basket.winRate * (1 - ALPHA) + won * ALPHA;
     }

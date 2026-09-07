@@ -67,7 +67,12 @@ export class ExecutionEngine {
       else result = await this.tradingService.createMarketOrder({ tokenId: trade.tokenId, side: 'BUY', amount: amountUsd, price, orderType: this.config.orderType });
       if (!result.success) { this.failed++; release(); return { ok: false }; }
       this.deps.basketSpendAdd(category, amountUsd);
-      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: price, size: amountUsd / price, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets });
+      // Audit pricePaid = the CONSENSUS price, not the slippage-marked limit.
+      // The limit is a BUY cost ceiling: recording it systematically understates
+      // realized edge and biases the go-live gate. Consensus is the honest
+      // executable estimate; replace with the true average fill once order
+      // results carry it.
+      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: signal.consensusPrice, size: amountUsd / signal.consensusPrice, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets });
       this.deps.onPositionOpened(trade?.tokenId, amountUsd, amountUsd / price, price, signal);
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
       if (trade?.tokenId) this.deps.onAntiSniperFire(trade.tokenId);
