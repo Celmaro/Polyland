@@ -103,6 +103,8 @@ export class ClobMarketWsService {
   private intentionallyClosed = false;
   private destroyed = false;
   private pingPongSeenAt = 0;
+  /** Timestamp of the last non-PONG (data) message — L12b silent-feed guard. */
+  private lastDataMessageAt = 0;
   private connectPending = false;
 
   /** Book mid price per asset (best bid + best ask) / 2 */
@@ -248,20 +250,40 @@ export class ClobMarketWsService {
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
-          // L12: dead-feed detection (qualiaenjoyer/polymarket-apis pattern).
-          // TCP can stay open while the server stops streaming data (half-open
-          // proxy, stuck upstream). PONG replies are our liveness signal: if
-          // none seen for 3 consecutive ping intervals (30s), force-close so
-          // the normal reconnect ladder takes over.
-          if (this.pingPongSeenAt > 0 && Date.now() - this.pingPongSeenAt > 30_000) {
-            console.warn('[ClobMarketWs] no PONG for 30s — force-closing dead feed');
-            this.pingPongSeenAt = Date.now(); // reset so we only fire once per window
-            try { this.ws.close(4000, 'stale'); } catch { /* already closing */ }
-            return;
+            // L12: dead-feed detection (qualiaenjoyer/polymarket-apis pattern).
+            // TCP can stay open while the server stops streaming data (half-open
+            // proxy, stuck upstream). PONG replies are our liveness signal: if
+            // none seen for 3 consecutive ping intervals (30s), force-close so
+            // the normal reconnect ladder takes over.
+            if (this.pingPongSeenAt > 0 && Date.now() - this.pingPongSeenAt > 30_000) {
+              console.warn('[ClobMarketWs] no PONG for 30s — force-closing dead feed');
+              this.pingPongSeenAt = Date.now(); // reset so we only fire once per window
+              try { this.ws.close(4000, 'stale'); } catch { /* already closing */ }
+              return;
+            }
+            // L12b: silent-but-alive detection (prod-observed failure mode,
+            // 2026-09-07 audit: WS answered PONGs for ~1h while delivering ZERO
+            // data events — PONG liveness alone kept a data-dead connection
+            // alive and the funnel starved: received=143236, recorded=1859,
+            // then frozen for 60+ min with no error logged). If we hold
+            // subscriptions and no data message has arrived for 5 minutes,
+            // treat the feed as dead and force a reconnect (PONGs will resume
+            // on the fresh connection, but the data channel is also new).
+            if (
+              this.subscribedAssets.size > 0 &&
+              Date.now() - this.lastDataMessageAt > 5 * 60_000
+            ) {
+              console.warn(
+                `[ClobMarketWs] no data events for 5min across ${this.subscribedAssets.size} subscribed assets — ` +
+                'force-closing silent feed (PONGs alive, data channel dead)'
+              );
+              this.lastDataMessageAt = Date.now(); // only fire once per window
+              try { this.ws.close(4000, 'silent'); } catch { /* already closing */ }
+              return;
+            }
+            this.ws.send('PING');
           }
-          this.ws.send('PING');
-        }
-      }, 10_000);
+        }, 10_000);
     };
 
     this.ws.onmessage = (event: WebSocket.MessageEvent) => {
@@ -272,6 +294,8 @@ export class ClobMarketWsService {
           this.pingPongSeenAt = Date.now();
           return;
         }
+        // Any other message = real data (price_change/trade/book/etc).
+        this.lastDataMessageAt = Date.now();
         const data = JSON.parse(raw);
         this.handleMessage(data as ClobMessage);
       } catch (err) {
