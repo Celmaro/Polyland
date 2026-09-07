@@ -55,6 +55,7 @@ export class PolylandRuntime {
     this.risk = new RiskManager(riskConfig, this.config.capital.totalUsd);
     RiskManager.enablePersistence('./data/risk-state.json'); this.risk.loadPersistedState(); this.risk.setStateStore(this.stateStore);
     SignalAuditStore.enableJsonl('./data/signal-audit.jsonl'); signalAuditStore.setStateStore(this.stateStore); signalAuditStore.replayJsonl('./data/signal-audit.jsonl');
+    this.rebuildSnapshotFromAudit();
     this.ledger = new DecisionLedger();
     const ledgerRecords = await this.ledger.start();
     console.log(`[PolylandRuntime] decision ledger replayed ${ledgerRecords.length} records`);
@@ -87,7 +88,33 @@ export class PolylandRuntime {
   }
   private async seed(screened: any[], key: string): Promise<void> { if (!this.quorum) return; const eligible = screened.filter(w => w.tier === 'PRIMARY' || w.tier === 'SATELLITE'); this.quorum.seed(eligible); setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
   private scheduleRefresh(delay: number, ingestion: WalletIngestionService, screening: WalletScreeningService, key: string): void { this.refreshTimer = setTimeout(async () => { if (!this.refreshing) { this.refreshing = true; try { const candidates = await ingestion.collect(); const screened = await screening.score(candidates); const nextKey = JSON.stringify({ version: 1, candidates: candidates.map(c => ({ address: c.address, source: c.source, autoRank: c.autoRank })).sort((a,b) => a.address.localeCompare(b.address)), config: this.screeningConfig }); await this.seed(screened, nextKey); } catch (e) { console.warn('[PolylandRuntime] screening refresh failed:', e instanceof Error ? e.message : e); } finally { this.refreshing = false; } } this.scheduleRefresh(21600000, ingestion, screening, key); }, delay); }
-  private recordSettled(pnl: number): void { const s = this.snapshot; s.totalPnL += pnl; s.dailyPnL += pnl; s.monthlyPnL += pnl; if (pnl < 0) { s.consecutiveLosses++; s.consecutiveWins = 0; } else { s.consecutiveWins++; s.consecutiveLosses = 0; } s.currentCapital = this.config.capital.totalUsd + s.totalPnL; s.peakCapital = Math.max(s.peakCapital, s.currentCapital); s.currentDrawdown = (s.peakCapital - s.currentCapital) / s.peakCapital; }
+  /** Mutate the P&L/streak snapshot for one settled trade (no callback). */
+  private applySettled(pnl: number): void { const s = this.snapshot; s.totalPnL += pnl; s.dailyPnL += pnl; s.monthlyPnL += pnl; if (pnl < 0) { s.consecutiveLosses++; s.consecutiveWins = 0; } else { s.consecutiveWins++; s.consecutiveLosses = 0; } s.currentCapital = this.config.capital.totalUsd + s.totalPnL; s.peakCapital = Math.max(s.peakCapital, s.currentCapital); s.currentDrawdown = (s.peakCapital - s.currentCapital) / s.peakCapital; }
+  private recordSettled(pnl: number): void { this.applySettled(pnl); this.onSettledTrade?.(pnl); }
+  /**
+   * Reconcile the runtime P&L/streak snapshot with the replayed audit trail on
+   * boot. Previously the audit store rebuilt its settled signals from the
+   * append-only JSONL on restart, but the risk streak/PnL snapshot started at
+   * zero and was only fed by live settlements going forward — so [edge] showed
+   * the full settled history while [risk] showed an empty streak (audit: 8
+   * settled but 0L/1W). Replaying settled realized P&L into the snapshot makes
+   * the two systems agree after a restart.
+   */
+  private rebuildSnapshotFromAudit(): void {
+      const s = this.snapshot;
+      s.startTime = this.startedAt; s.dailyPnL = 0; s.totalPnL = 0; s.monthlyPnL = 0;
+      s.consecutiveLosses = 0; s.consecutiveWins = 0;
+      s.currentCapital = this.config.capital.totalUsd;
+      s.peakCapital = this.config.capital.totalUsd; s.currentDrawdown = 0;
+      s.permanentlyHalted = false; s.isPaused = false;
+      let settledCount = 0;
+      for (const sig of signalAuditStore.getSettledSignals()) {
+        if (typeof sig.realizedEdge !== 'number') continue;
+        this.applySettled(sig.realizedEdge);
+        settledCount++;
+      }
+      if (settledCount > 0) console.log(`[PolylandRuntime] snapshot rebuilt from ${settledCount} settled audit signals (streak ${this.snapshot.consecutiveWins}W/${this.snapshot.consecutiveLosses}L)`);
+    }
     getFunnelStats(): QuorumStats | null { return this.quorum?.getStats() ?? null; } getAuditStats() { return signalAuditStore.getStats(); } getStateSnapshot(): RuntimeStateSnapshot { return { ...this.snapshot, permanentlyHalted: this.risk ? !this.risk.canTrade() : false }; }
     /** Phase 5 gate: operator-facing go-live readiness from settled paper signals. */
     getGoLiveReport(): GoLiveReport {

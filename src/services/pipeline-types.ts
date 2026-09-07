@@ -67,6 +67,8 @@ export interface ConsensusSignal {
   consensusPrice: number;
   totalSize: number;
   winRate: number;
+  /** Token ID used to fetch the live CLOB book for follow-up telemetry. */
+  tokenId?: string;
 }
 export interface ExecutionDecision {
   signal: ConsensusSignal;

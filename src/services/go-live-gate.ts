@@ -108,15 +108,18 @@ function clusteredSE(edges: number[], clusters: string[]): number {
   const iidSe = Math.sqrt(iidVar / edges.length);
   return g === edges.length ? iidSe : Math.max(clusterSe, iidSe);
 }
-/** Peak-to-trough drawdown on a cumulative PnL series. */
-export function maxDrawdown(realized: number[]): number {
-  let peak = 0;
-  let cum = 0;
+/** Peak-to-trough drawdown on a cumulative PnL series, measured against a
+ * positive capital baseline (not 0). Starting `peak` at 0 made a uniformly
+ * losing series report 0% drawdown (0/0 → 0) — the exact case that must not
+ * be hidden. */
+export function maxDrawdown(realized: number[], initialCapital = 0): number {
+  let peak = initialCapital;
+  let equity = initialCapital;
   let maxDd = 0;
   for (const r of realized) {
-    cum += r;
-    peak = Math.max(peak, cum);
-    if (peak > 0) maxDd = Math.max(maxDd, (peak - cum) / peak);
+    equity += r;
+    peak = Math.max(peak, equity);
+    if (peak > 0) maxDd = Math.max(maxDd, (peak - equity) / peak);
   }
   return maxDd;
 }
@@ -132,12 +135,19 @@ export function computeGoLiveReport(
   const domains = [...new Set(settled.map((o) => o.domain))];
   const deployedUsd = settled.reduce((s, o) => s + o.deployedUsd, 0);
   const haircut = criteria.executionHaircutBps / 10_000;
-  const edges = settled.map((o) => (o.realizedEdge ?? 0) - haircut);
+  // realizedEdge is dollar P&L (valuePerShare - price - fee) × size. To report
+  // an honest, size-invariant edge, normalize each signal to return-on-deployed
+  // capital: realizedEdge / deployedUsd. Previously the gate multiplied dollar
+  // P&L by 100 and rendered a $1.56 loss on a tiny paper position as "-156%".
+  const edges = settled.map((o) =>
+    o.deployedUsd > 0 ? ((o.realizedEdge ?? 0) / o.deployedUsd) - haircut : -haircut);
   const meanEdge = edges.length ? edges.reduce((a, b) => a + b, 0) / edges.length : 0;
   const se = edges.length ? clusteredSE(edges, settled.map((o) => o.conditionId)) : Number.NaN;
   const lcb = edges.length ? lcbEdge(meanEdge, se, 1.645) : Number.NaN;
-  // Drawdown on cumulative realized PnL in deployed-capital units.
-  const dd = maxDrawdown(settled.map((o) => o.realizedEdge ?? 0));
+  // Drawdown on cumulative realized PnL against the deployed capital baseline.
+  // Using deployed (not 0) as the starting equity means a uniformly losing
+  // book no longer reports 0% drawdown.
+  const dd = maxDrawdown(settled.map((o) => o.realizedEdge ?? 0), deployedUsd);
   // Domain concentration of deployed capital.
   const perDomain = new Map<string, number>();
   for (const o of settled) perDomain.set(o.domain, (perDomain.get(o.domain) ?? 0) + o.deployedUsd);
@@ -153,7 +163,7 @@ export function computeGoLiveReport(
     nIndependentMarkets: independentMarkets.size,
     domains,
     grossEdgePct: meanEdge * 100,
-    netEdgePct: (meanEdge - haircut) * 100,
+    netEdgePct: meanEdge * 100,
     seEdgePct: Number.isNaN(se) ? 0 : se * 100,
     lcbEdgePct: Number.isNaN(lcb) ? -Infinity : lcb * 100,
     maxDrawdownPct: dd * 100,

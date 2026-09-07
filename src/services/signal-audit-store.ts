@@ -335,14 +335,19 @@ export class SignalAuditStore {
     }
 
     const expectedEdges = settled.map(s => s.expectedEdge);
-    const realizedEdges = settled.map(s => s.realizedEdge ?? 0);
+    // realizedEdge is dollar P&L ((valuePerShare - price - fee) × size); the
+    // expectedEdge is per-share. Normalize realized to per-share so exp vs real
+    // (and their difference, alpha) are comparable — previously $ realized was
+    // subtracted from a per-share expectation and the [edge] line showed
+    // real=-1.55 next to exp=+0.24 (two different units).
+    const realizedEdges = settled.map(s => s.size > 0 ? (s.realizedEdge ?? 0) / s.size : 0);
 
     const meanExpected = arrMean(expectedEdges);
     const meanRealized = arrMean(realizedEdges);
     const edgeAlpha = meanRealized - meanExpected;
 
     // t-stat for one-sample t-test: does realizedEdge differ from expectedEdge?
-    const diffs = settled.map((s, i) => (s.realizedEdge ?? 0) - s.expectedEdge);
+    const diffs = settled.map((s) => (s.size > 0 ? (s.realizedEdge ?? 0) / s.size : 0) - s.expectedEdge);
     const tStat = arrTStat(diffs);
 
     // Distinct markets (clusters) in the settled window (for reporting only —

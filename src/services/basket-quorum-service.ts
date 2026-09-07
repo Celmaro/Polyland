@@ -187,6 +187,8 @@ export interface QuorumStats {
   quorumSkippedNegativeEdge?: number;
   /** Dropped because dynamic sizing shrank the order below minTradeSize */
   quorumSkippedMinSize?: number;
+  /** Exit pass could not price a position because the live book was unavailable/empty. */
+  exitLiquidityBlocked?: number;
   /** Breakdown of anti-sniper block reasons (no_mid_observations, mid_jump, ...) */
   antiSniperReasons?: Record<string, number>;
   executed: number;
@@ -428,19 +430,35 @@ export class BasketQuorumService {
     const checkPrice = (label: string, delayMs: number) => {
       const timer = setTimeout(async () => {
         try {
-          const markets = await this.gammaApi!.getMarkets({
-            conditionId: signal.conditionId,
-          });
-          const market = markets[0];
-          if (!market) {
-            console.log(`[BasketQuorum][${label}] ${id}: market not found`);
-            return;
-          }
-          const currentPrice = market.lastTradePrice ?? market.bestBid ?? 0;
-          const priceMoved = Math.abs(currentPrice - signal.consensusPrice);
-          const pctMove = signal.consensusPrice > 0
-            ? (priceMoved / signal.consensusPrice) * 100
-            : 0;
+                  // Gamma metadata lookup is used only as a "market exists" check.
+                  const markets = await this.gammaApi!.getMarkets({
+                    conditionId: signal.conditionId,
+                  });
+                  if (!markets || markets.length === 0) {
+                    console.log(`[BasketQuorum][${label}] ${id}: market not found`);
+                    return;
+                  }
+                  // Gamma's lastTradePrice/bestBid becomes a stale/terminal value after
+                  // resolution (audit showed unrelated markets all reporting 0.040).
+                  // Prefer the live CLOB book for follow-up telemetry; never turn a
+                  // missing quote into a fake zero price or a false unfavorable result.
+                  let currentPrice: number | null = null;
+                  if (signal.tokenId) {
+                    const book = await this.tradingService.getPublicOrderBook(signal.tokenId);
+                    if (book && book.bids.length > 0 && book.asks.length > 0) {
+                      const bestBid = Math.max(...book.bids.map((l) => parseFloat(l.price)));
+                      const bestAsk = Math.min(...book.asks.map((l) => parseFloat(l.price)));
+                      if (bestBid > 0 && bestAsk > 0) currentPrice = (bestBid + bestAsk) / 2;
+                    }
+                  }
+                  if (currentPrice === null) {
+                    console.log(`[BasketQuorum][${label}] ${signal.marketSlug}: live CLOB quote unavailable`);
+                    return;
+                  }
+                  const priceMoved = Math.abs(currentPrice - signal.consensusPrice);
+                  const pctMove = signal.consensusPrice > 0
+                    ? (priceMoved / signal.consensusPrice) * 100
+                    : 0;
           const movedFavorably = signal.side === 'BUY'
             ? currentPrice > signal.consensusPrice
             : currentPrice < signal.consensusPrice;
@@ -1235,9 +1253,10 @@ export class BasketQuorumService {
       wallets: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').map((v) => v.wallet),
       consensusPrice,
       winRate: basket.winRate ?? 0.6,
-      side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
-      totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
-    };
+            side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
+            totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
+            tokenId: trade.tokenId,
+          };
     // Schedule 1h and 24h follow-up price checks (whalewatch-style validation loop)
     this._scheduleFollowup(signal);
     this._schedulePersist();
