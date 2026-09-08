@@ -21,6 +21,8 @@ export interface PolylandRuntimeConfig {
   capital: { totalUsd: number };
   risk: Record<string, number | boolean>;
   smartMoney: { enabled: boolean; topN: number; customWallets: string[] };
+  /** Optional: BotMetrics instance for parallel Prometheus surface. */
+  botMetrics?: import('./bot-metrics.js').BotMetrics | null;
   independence?: { maxHHI: number; minNEffective: number; clusterThreshold?: number; consensusStrengthPrimary?: number; consensusStrengthSatellite?: number; capPerWallet?: number };
   basketRisk?: import('./basket-risk.js').BasketRiskConfig;
   paperExploration?: boolean;
@@ -67,7 +69,7 @@ export class PolylandRuntime {
     this.tradeSeen = new FileSeenTradeLedger('./data/trade-seen.jsonl');
     this.tradeSeen.start();
     this.tradeDetector = new TradeDetector(this.tradeSeen, { minNotional: 1 });
-    this.quorum = new BasketQuorumService(this.sdk.tradingService, this.quorumConfig); this.quorum.setRiskManager(this.risk); if (this.config.independence) this.quorum.setIndependenceSettings(this.config.independence); if (this.config.basketRisk) this.quorum.setBasketRiskConfig(this.config.basketRisk); this.quorum.setPaperExplorationMode(this.config.paperExploration ?? false); this.quorum.setGammaApi(this.sdk.gammaApi); this.quorum.setDecisionLedger(this.ledger); this.quorum.setSpecializationThresholds(Number(this.screeningConfig.minCategoryTrades ?? 3), Number(this.screeningConfig.minCategoryWinRate ?? 0.58)); this.quorum.startExitLadder(); this.quorum.onSettledTrade = p => { this.recordSettled(p); this.onSettledTrade?.(p); };
+    this.quorum = new BasketQuorumService(this.sdk.tradingService, this.quorumConfig); this.quorum.setRiskManager(this.risk); if (this.config.botMetrics) this.quorum.setBotMetrics(this.config.botMetrics); if (this.config.independence) this.quorum.setIndependenceSettings(this.config.independence); if (this.config.basketRisk) this.quorum.setBasketRiskConfig(this.config.basketRisk); this.quorum.setPaperExplorationMode(this.config.paperExploration ?? false); this.quorum.setGammaApi(this.sdk.gammaApi); this.quorum.setDecisionLedger(this.ledger); this.quorum.setSpecializationThresholds(Number(this.screeningConfig.minCategoryTrades ?? 3), Number(this.screeningConfig.minCategoryWinRate ?? 0.58)); this.quorum.startExitLadder(); this.quorum.onSettledTrade = p => { this.recordSettled(p); this.onSettledTrade?.(p); };
     if (process.env.ANTI_SNIPER_ENABLED === 'true') this.quorum.setAntiSniper(new AntiSniperGuard(null));
     if (process.env.TWAP_ENABLED === 'true') { const twap = new ChainlinkTwapOracle({ autoReconnect: true, reconnectDelayMs: 3000, pingIntervalMs: 5000, maxStalenessMs: 30000 }); this.quorum.setTwapOracle(twap); void twap.connect(); }
     const buffer: SmartMoneyTrade[] = []; this.tradeSub = this.sdk.smartMoney.subscribeSmartMoneyTrades(t => {

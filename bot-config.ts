@@ -8,6 +8,7 @@
  */
 import 'dotenv/config';
 import { PolymarketSDK, PolylandRuntime, type BasketQuorumConfig } from './src/index.js';
+import { BotMetrics, startMetricsServer } from './src/services/bot-metrics.js';
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -301,9 +302,28 @@ async function main() {
   }
   const sdk = await PolymarketSDK.create({ privateKey: process.env.POLYMARKET_PRIVATE_KEY });
   log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
+  // Prometheus-format metrics: histograms of entry price / PnL per share /
+  // hold duration that the funnel log line cannot express. Disabled unless
+  // PROMETHEUS_PORT is set. Once a `curl http://host:9090/metrics` works, a
+  // notebook can query "what's the realized-edge p50 in crypto sub-hour?" —
+  // the question the audit repeatedly couldn't answer from the log line.
+  const botMetrics = new BotMetrics();
+  const promPort = Number(process.env.PROMETHEUS_PORT ?? 0);
+  let metricsServer: import('node:http').Server | null = null;
+  if (promPort > 0) {
+    metricsServer = startMetricsServer(botMetrics, promPort);
+  } else {
+    log('INFO', 'Prometheus /metrics disabled (set PROMETHEUS_PORT to enable)');
+  }
   const runtime = new PolylandRuntime(
     sdk,
-    { dryRun: CONFIG.dryRun, capital: CONFIG.capital, risk: CONFIG.risk, smartMoney: CONFIG.smartMoney },
+    {
+      dryRun: CONFIG.dryRun,
+      capital: CONFIG.capital,
+      risk: CONFIG.risk,
+      smartMoney: CONFIG.smartMoney,
+      botMetrics, // wire the parallel Prometheus surface
+    },
     screeningConfig,
     BASKET_QUORUM_CONFIG,
     recordTrade,
@@ -317,6 +337,9 @@ async function main() {
     shuttingDown = true;
     clearInterval(statusTimer);
     console.log(`\\n\\nShutting down (${sig})...`);
+    if (metricsServer) {
+      await new Promise<void>((resolve) => metricsServer!.close(() => resolve()));
+    }
     await runtime.stop();
     process.exit(0);
   };

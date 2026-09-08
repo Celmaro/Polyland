@@ -254,6 +254,8 @@ export class BasketQuorumService {
   private riskManager: RiskManager | null = null;
   /** Optional VoteStateStore — persists votes + lastFired across restarts. */
   private stateStore: VoteStateStore | null = null;
+  /** Optional BotMetrics — when set, parallel Prometheus histograms are fed. */
+  private botMetrics: import('./bot-metrics.js').BotMetrics | null = null;
   /** Per-basket spend tracker (USDC spent on this basket) */
   private basketSpend: Map<MarketCategory, number> = new Map();
   /** Debounce timer for state persistence */
@@ -321,6 +323,16 @@ export class BasketQuorumService {
    */
   setRiskManager(risk: RiskManager): void {
     this.riskManager = risk;
+  }
+  /**
+   * Optional hook to a BotMetrics instance — when set, the funnel
+   * log path also feeds the per-snapshot counters, and position
+   * events observe entry-price / PnL / hold-duration histograms.
+   * The funnel log line itself stays unchanged; this is purely a
+   * parallel metrics surface.
+   */
+  setBotMetrics(metrics: import('./bot-metrics.js').BotMetrics | null): void {
+    this.botMetrics = metrics;
   }
   /**
    * Set the per-category specialization thresholds used by seed() to route
@@ -1671,6 +1683,22 @@ export class BasketQuorumService {
             `(n=${edgeStats.signalsSettled} settled/${edgeStats.signalsFired} fired)`
           : ''),
     );
+    // Parallel Prometheus surface: mirror the snapshot into histograms/counters
+    // so a `curl /metrics` exposes distribution shape (loss tail, entry-price
+    // cluster, hold duration) that the mean-only funnel line cannot.
+    if (this.botMetrics) {
+      this.botMetrics.feedFunnel({
+        feedReceived: funnel.feed_received,
+        votesRecorded: funnel.votes_recorded,
+        filtered: funnel.filtered,
+        filteredThin: funnel.filtered_thin,
+        filteredStale: funnel.filtered_stale,
+        quorumFired: funnel.quorum_fired,
+        executed: funnel.executed,
+        failed: funnel.failed,
+        byReason: s.antiSniperReasons ?? {},
+      });
+    }
     return funnel;
   }
   /** Drop all state (used on basket re-config). */
