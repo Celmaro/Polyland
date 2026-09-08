@@ -6,6 +6,8 @@ import {
   RiskManager,
   DEFAULT_RISK_CONFIG,
   type TradeRecord,
+  validateRiskConfig,
+  assertValidRiskConfig,
 } from './risk-manager.js';
 
 const ONE_DAY = 24 * 60 * 60_000;
@@ -177,5 +179,28 @@ describe('RiskManager sanity', () => {
     const risk = new RiskManager({}, 1000);
     risk.recordTrade(trade(-60));
     expect(risk.sizeOrder(100)).toBe(0);
+  });
+});
+
+describe('RiskConfig startup validation (P2)', () => {
+  it('accepts the default risk configuration', () => {
+    expect(validateRiskConfig(DEFAULT_RISK_CONFIG)).toEqual([]);
+    expect(() => assertValidRiskConfig(DEFAULT_RISK_CONFIG)).not.toThrow();
+  });
+  it('rejects contradictory loss-halt ordering', () => {
+    const problems = validateRiskConfig({ ...DEFAULT_RISK_CONFIG, monthlyMaxLossPct: 0.04, dailyMaxLossPct: 0.05 });
+    expect(problems.some((p) => p.includes('monthlyMaxLossPct'))).toBe(true);
+    expect(() => new RiskManager({ monthlyMaxLossPct: 0.04, dailyMaxLossPct: 0.05 }, 1000)).toThrow(/invalid risk config/);
+  });
+  it('rejects drawdown after terminal loss and invalid position bounds', () => {
+    const problems = validateRiskConfig({ ...DEFAULT_RISK_CONFIG, maxDrawdownFromPeak: 0.5, totalMaxLossPct: 0.4, minPositionPct: 0.2, maxPositionPct: 0.1 });
+    expect(problems.some((p) => p.includes('maxDrawdownFromPeak'))).toBe(true);
+    expect(problems.some((p) => p.includes('minPositionPct'))).toBe(true);
+  });
+  it('rejects invalid consecutive-loss, sizing, and basket sample settings', () => {
+    const problems = validateRiskConfig({ ...DEFAULT_RISK_CONFIG, maxConsecutiveLosses: 0, lossSizingReduction: 1, basketKillWindow: 2, basketKillMinSamples: 3 });
+    expect(problems.some((p) => p.includes('maxConsecutiveLosses'))).toBe(true);
+    expect(problems.some((p) => p.includes('lossSizingReduction'))).toBe(true);
+    expect(problems.some((p) => p.includes('basketKillMinSamples'))).toBe(true);
   });
 });

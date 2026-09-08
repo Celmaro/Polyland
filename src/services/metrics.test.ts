@@ -156,7 +156,7 @@ describe('POLYLAND_BUCKETS', () => {
     expect(POLYLAND_BUCKETS.ENTRY_PRICE).toContain(0.85);
     expect(POLYLAND_BUCKETS.PNL_PER_SHARE).toContain(0);
     expect(POLYLAND_BUCKETS.HOLD_SECONDS).toContain(300);
-    expect(POLYLAND_BUCKETS.LATENCY_MS).toContain(50);
+    expect(POLYLAND_BUCKETS.LATENCY_SECONDS).toContain(0.05);
     // Each set must be strictly increasing.
     for (const [, buckets] of Object.entries(POLYLAND_BUCKETS)) {
       for (let i = 1; i < buckets.length; i++) {

@@ -8,13 +8,18 @@
  * No exchange connectivity. Pure offline backtest. Output is JSON,
  * pipeable into jq for "which categories would the new exit logic
  * have improved?" queries.
+ *
+ * Results are cached by content fingerprint (config + source stat) under
+ * data/replay-cache/ (override with REPLAY_CACHE_DIR), so re-running the
+ * same profile against an unchanged data file skips the recompute.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { replaySettlements, type ReplayConfig } from './replay.js';
+import { replayFingerprint, ReplayFileCache } from './replay-cache.js';
 import type { FiredSignal } from './signal-audit-store.js';
 
-function main(): void {
+async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const file = args.find((a) => !a.startsWith('--'));
   if (!file) {
@@ -43,21 +48,41 @@ function main(): void {
   }
 
   const config: ReplayConfig = { exitConfig: profile };
-  const result = replaySettlements(signals, config);
+  // Content-addressed cache: same config + same data file → same digest →
+  // skip the recompute. Any change to profile/parameters or the JSONL
+  // (mtime/size) invalidates the entry and re-runs.
+  const cacheDir = process.env.REPLAY_CACHE_DIR ?? path.join('data', 'replay-cache');
+  const cache = new ReplayFileCache(cacheDir);
+  const stat = fs.statSync(fullPath);
+  const fingerprint = replayFingerprint(config, {
+    path: fullPath,
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+  });
+
+  const cached = await cache.load(fingerprint);
+  const source = cached ?? replaySettlements(signals, config);
+  if (!cached) await cache.save(fingerprint, source);
+
   console.log(JSON.stringify({
-    input: { file: fullPath, total: signals.length, settled: result.entries.length, profile },
+    cached: cached !== null,
+    fingerprint,
+    input: { file: fullPath, total: signals.length, settled: source.entries.length, profile },
     summary: {
-      totalRecorded: result.totalRecorded,
-      totalSimulated: result.totalSimulated,
-      totalDelta: result.totalDelta,
-      slippageFlags: result.slippageFlags,
+      totalRecorded: source.totalRecorded,
+      totalSimulated: source.totalSimulated,
+      totalDelta: source.totalDelta,
+      slippageFlags: source.slippageFlags,
     },
-    byCategory: result.byCategory,
-    topSlippageEntries: result.entries
+    byCategory: source.byCategory,
+    topSlippageEntries: source.entries
       .filter((e) => e.slippageFlag)
       .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
       .slice(0, 10),
   }, null, 2));
 }
 
-main();
+main().catch((err) => {
+  console.error('replay-cli failed:', err instanceof Error ? err.message : err);
+  process.exit(1);
+});

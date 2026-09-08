@@ -21,6 +21,26 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { Counter, Gauge, Histogram, Summary, MetricRegistry, POLYLAND_BUCKETS } from './metrics.js';
 
+export const LABEL_VOCABULARY = {
+  category: ['crypto', 'politics', 'sports', 'esports', 'entertainment', 'economics', 'science', 'other'],
+  outcome: ['won', 'lost', 'pending'],
+  side: ['BUY', 'SELL'],
+  tier: ['PRIMARY', 'SATELLITE', 'WATCHLIST', 'all'],
+  exitReason: ['value_exit', 'adverse_move', 'leader_exit', 'risk_exit', 'risk_halt', 'resolution', 'manual', 'unknown', 'other'],
+  reason: ['drift', 'bankroll', 'edge', 'min_size', 'liquidity', 'risk', 'cooldown', 'anti_sniper', 'twap_stale', 'twap_misaligned', 'thin_liquidity', 'negative_edge', 'order', 'other'],
+  op: ['drift_check', 'reserve', 'exit_pass', 'reconcile', 'other'],
+} as const;
+
+/** Map runtime label values to a bounded vocabulary before exposition. */
+export function normalizeMetricLabel(value: string, vocabulary: readonly string[]): string {
+  const raw = String(value ?? '');
+  const exact = vocabulary.find((candidate) => candidate === raw);
+  if (exact) return exact;
+  const folded = raw.toLowerCase();
+  const insensitive = vocabulary.find((candidate) => candidate.toLowerCase() === folded);
+  return insensitive ?? 'other';
+}
+
 // ============================================================================
 // Type
 // ============================================================================
@@ -73,6 +93,11 @@ export class BotMetrics {
     'Fires skipped at a pre-execution gate',
     ['reason', 'category'],
   );
+  private readonly cLabelViolations = this.registry.counter(
+    'polyland_metric_label_violations_total',
+    'Metric label values normalized to the bounded other bucket',
+    ['label'],
+  );
   // Realized PnL per share — the histogram that exposes the loss tail.
   private readonly hPnlPerShare = this.registry.histogram(
     'polyland_pnl_per_share',
@@ -96,11 +121,11 @@ export class BotMetrics {
   );
   // Operation latency — drift check, ledger reserve, exit pass. Sits
   // empty until instrumented; cheap to register now.
-  private readonly hOpMs = this.registry.histogram(
-    'polyland_op_ms',
-    'Internal operation latency',
+  private readonly hOpSec = this.registry.histogram(
+    'polyland_operation_duration_seconds',
+    'Internal operation latency in seconds',
     ['op'],
-    { buckets: POLYLAND_BUCKETS.LATENCY_MS },
+    { buckets: POLYLAND_BUCKETS.LATENCY_SECONDS },
   );
   // Live state gauges (sampled at scrape time).
   private readonly gOpen = this.registry.gauge('polyland_open_positions', 'Currently open positions');
@@ -133,10 +158,18 @@ export class BotMetrics {
    * Mirror a funnel snapshot into metrics. Called from the funnel log
    * path so we don't add a separate event hook.
    */
+  private label(name: keyof typeof LABEL_VOCABULARY, value: string): string {
+    const normalized = normalizeMetricLabel(value, LABEL_VOCABULARY[name]);
+    if (normalized === 'other' && value.toLowerCase() !== 'other') {
+      this.cLabelViolations.inc({ label: name });
+    }
+    return normalized;
+  }
+
   feedFunnel(s: FunnelStatsSnapshot): void {
-    const cat = s.firedCategory ?? 'other';
-    const tier = 'all';
-    const side = s.firedSide ?? 'BUY';
+    const cat = this.label('category', s.firedCategory ?? 'other');
+    const tier = this.label('tier', 'all');
+    const side = this.label('side', s.firedSide ?? 'BUY');
     const key = `${cat}|${tier}|${side}`;
     const prev = this.lastFunnelByKey.get(key);
     this.lastFunnelByKey.set(key, { ...s });
@@ -159,14 +192,14 @@ export class BotMetrics {
         const cur = s.byReason[reason] ?? 0;
         const last = prevReasons[reason] ?? 0;
         const d = cur >= last ? cur - last : cur;
-        if (d !== 0) this.cSkipped.inc({ reason, category: cat }, d);
+        if (d !== 0) this.cSkipped.inc({ reason: this.label('reason', reason), category: cat }, d);
       }
     }
   }
 
   /** Record a single fire with the entry price (for top-buy distribution). */
   observeEntryPrice(category: string, tier: string, entryPrice: number): void {
-    this.hEntryPrice.observe({ category, tier }, entryPrice);
+    this.hEntryPrice.observe({ category: this.label('category', category), tier: this.label('tier', tier) }, entryPrice);
   }
 
   /** Record a settled or exited position's PnL. */
@@ -175,7 +208,7 @@ export class BotMetrics {
     side: 'BUY' | 'SELL'; pnlPerShare: number;
   }): void {
     this.hPnlPerShare.observe(
-      { category: opts.category, outcome: opts.outcome, side: opts.side },
+      { category: this.label('category', opts.category), outcome: this.label('outcome', opts.outcome), side: this.label('side', opts.side) },
       opts.pnlPerShare,
     );
   }
@@ -184,24 +217,24 @@ export class BotMetrics {
     category: string; exitReason: string; holdSeconds: number;
   }): void {
     this.hHoldSec.observe(
-      { category: opts.category, exitReason: opts.exitReason },
+      { category: this.label('category', opts.category), exitReason: this.label('exitReason', opts.exitReason) },
       opts.holdSeconds,
     );
   }
 
-  observeOp(op: string, ms: number): void {
-    this.hOpMs.observe({ op }, ms);
+  observeOp(op: string, seconds: number): void {
+    this.hOpSec.observe({ op: this.label('op', op) }, seconds);
   }
 
   setOpenPositions(n: number): void { this.gOpen.set(n); }
   setBankrollUtil(category: string, ratio: number): void {
-    this.gBankrollUtil.set({ category }, Math.max(0, Math.min(1, ratio)));
+    this.gBankrollUtil.set({ category: this.label('category', category) }, Math.max(0, Math.min(1, ratio)));
   }
   setConsecLosses(category: string, n: number): void {
-    this.gConsecLoss.set({ category }, n);
+    this.gConsecLoss.set({ category: this.label('category', category) }, n);
   }
   observeRollingPnl(category: string, pnl: number): void {
-    this.sPnl10m.observe({ category }, pnl);
+    this.sPnl10m.observe({ category: this.label('category', category) }, pnl);
   }
 }
 

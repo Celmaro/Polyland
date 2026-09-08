@@ -89,6 +89,57 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
 };
 
 // ============================================================================
+// Config validation (fail fast at startup before any capital moves)
+// ============================================================================
+
+/** Return a list of human-readable problems with a RiskConfig (empty = valid). */
+export function validateRiskConfig(config: RiskConfig): string[] {
+  const problems: string[] = [];
+  const pct = (v: number): boolean => !(v > 0 && v <= 1);
+  if (pct(config.dailyMaxLossPct)) problems.push(`dailyMaxLossPct must be in (0,1], got ${config.dailyMaxLossPct}`);
+  if (pct(config.monthlyMaxLossPct)) problems.push(`monthlyMaxLossPct must be in (0,1], got ${config.monthlyMaxLossPct}`);
+  if (pct(config.totalMaxLossPct)) problems.push(`totalMaxLossPct must be in (0,1], got ${config.totalMaxLossPct}`);
+  if (pct(config.maxDrawdownFromPeak)) problems.push(`maxDrawdownFromPeak must be in (0,1], got ${config.maxDrawdownFromPeak}`);
+  if (config.monthlyMaxLossPct < config.dailyMaxLossPct) {
+    problems.push(`monthlyMaxLossPct (${config.monthlyMaxLossPct}) must be >= dailyMaxLossPct (${config.dailyMaxLossPct})`);
+  }
+  if (config.totalMaxLossPct < config.monthlyMaxLossPct) {
+    problems.push(`totalMaxLossPct (${config.totalMaxLossPct}) must be >= monthlyMaxLossPct (${config.monthlyMaxLossPct})`);
+  }
+  if (config.maxDrawdownFromPeak > config.totalMaxLossPct) {
+    problems.push(`maxDrawdownFromPeak (${config.maxDrawdownFromPeak}) must not exceed totalMaxLossPct (${config.totalMaxLossPct})`);
+  }
+  if (config.maxConsecutiveLosses < 1) problems.push(`maxConsecutiveLosses must be >= 1, got ${config.maxConsecutiveLosses}`);
+  if (config.pauseOnBreachMinutes < 0) problems.push(`pauseOnBreachMinutes must be >= 0, got ${config.pauseOnBreachMinutes}`);
+  if (config.minPositionPct < 0 || config.minPositionPct > 1) problems.push(`minPositionPct must be in [0,1], got ${config.minPositionPct}`);
+  if (config.maxPositionPct < config.minPositionPct || config.maxPositionPct > 1) {
+    problems.push(`maxPositionPct (${config.maxPositionPct}) must be in [minPositionPct (${config.minPositionPct}), 1]`);
+  }
+  if (config.basePositionPct < config.minPositionPct || config.basePositionPct > config.maxPositionPct) {
+    problems.push(`basePositionPct (${config.basePositionPct}) must be within [minPositionPct (${config.minPositionPct}), maxPositionPct (${config.maxPositionPct})]`);
+  }
+  if (!(config.lossSizingReduction >= 0 && config.lossSizingReduction < 1)) {
+    problems.push(`lossSizingReduction must be in [0,1), got ${config.lossSizingReduction}`);
+  }
+  if (!(config.winSizingIncrease >= 0 && config.winSizingIncrease < 1)) {
+    problems.push(`winSizingIncrease must be in [0,1), got ${config.winSizingIncrease}`);
+  }
+  if (config.basketKillWindow < 1 || config.basketKillMinSamples < 1 || config.basketKillMinSamples > config.basketKillWindow) {
+    problems.push(`basketKillWindow (${config.basketKillWindow}) and basketKillMinSamples (${config.basketKillMinSamples}) must be >=1 with minSamples <= window`);
+  }
+  if (config.basketKillSigma < 0) problems.push(`basketKillSigma must be >= 0, got ${config.basketKillSigma}`);
+  return problems;
+}
+
+/** Throw at startup when the merged risk config is contradictory or malformed. */
+export function assertValidRiskConfig(config: RiskConfig): void {
+  const problems = validateRiskConfig(config);
+  if (problems.length > 0) {
+    throw new Error(`invalid risk config: ${problems.join('; ')}`);
+  }
+}
+
+// ============================================================================
 // Trade record (what the bot reports back)
 // ============================================================================
 
@@ -174,6 +225,7 @@ export class RiskManager {
 
   constructor(config: Partial<RiskConfig> = {}, startingCapital = 1000) {
     this.config = { ...DEFAULT_RISK_CONFIG, ...config };
+    assertValidRiskConfig(this.config);
     this.startingCapital = startingCapital;
     this._peakCapital = startingCapital;
   }

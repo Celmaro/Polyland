@@ -32,12 +32,16 @@ describe('BotMetrics hook contracts', () => {
     expect(out).toContain('polyland_pnl_per_share_count{category="crypto",outcome="pending",side="SELL"} 1');
   });
 
-  it('records hold duration with category + exit_reason labels', () => {
-    const m = new BotMetrics();
-    m.observeHold({ category: 'crypto', exitReason: 'ADVERSE_MOVE', holdSeconds: 14 });
-    m.observeHold({ category: 'crypto', exitReason: 'VALUE_EXIT', holdSeconds: 35 });
-    const out = m.registry.toProm();
-    expect(out).toContain('polyland_hold_seconds_count{category="crypto",exitReason="ADVERSE_MOVE"} 1');
-    expect(out).toContain('polyland_hold_seconds_count{category="crypto",exitReason="VALUE_EXIT"} 1');
-  });
+  it('records hold duration with category + canonical exit_reason labels', () => {
+      const m = new BotMetrics();
+      m.observeHold({ category: 'crypto', exitReason: 'ADVERSE_MOVE', holdSeconds: 14 });
+      m.observeHold({ category: 'crypto', exitReason: 'VALUE_EXIT', holdSeconds: 35 });
+      const out = m.registry.toProm();
+      // P2 bounded-vocabulary canonicalization: uppercase runtime exit reasons
+      // are folded into the lowercase canonical label set.
+      expect(out).toContain('polyland_hold_seconds_count{category="crypto",exitReason="adverse_move"} 1');
+      expect(out).toContain('polyland_hold_seconds_count{category="crypto",exitReason="value_exit"} 1');
+      expect(out).not.toContain('ADVERSE_MOVE');
+      expect(out).not.toContain('VALUE_EXIT');
+    });
 });

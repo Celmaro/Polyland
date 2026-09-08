@@ -430,6 +430,6 @@ export const POLYLAND_BUCKETS = {
   PNL_PER_SHARE: [-0.99, -0.85, -0.50, -0.20, -0.05, 0, 0.05, 0.20, 0.50, 0.85, 0.99] as Buckets,
   /** Hold duration in seconds (5m -> 30m, then 12h+ for long markets). */
   HOLD_SECONDS: [60, 180, 300, 600, 900, 1800, 3600, 7200, 14400, 43200, 86400] as Buckets,
-  /** Operation latency in ms (drift check, ledger reserve, exit pass). */
-  LATENCY_MS: [1, 5, 10, 25, 50, 100, 250, 500, 1000, 3000, 10000] as Buckets,
+  /** Operation latency in seconds (drift check, ledger reserve, exit pass). */
+  LATENCY_SECONDS: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 3, 10] as Buckets,
 };

@@ -155,3 +155,34 @@ function httpGet(url: string): Promise<string> {
     }).end();
   });
 }
+
+describe('BotMetrics base units (P2)', () => {
+  it('exposes operation latency in seconds, never milliseconds', () => {
+    const m = new BotMetrics();
+    m.observeOp('drift_check', 0.05); // 50ms expressed in seconds
+    const out = m.registry.toProm();
+    expect(out).toContain('polyland_operation_duration_seconds');
+    expect(out).not.toContain('polyland_op_ms');
+    // Buckets are in seconds; 0.05s falls in le=0.05 and le=0.1.
+    expect(out).toContain('polyland_operation_duration_seconds_bucket{op="drift_check",le="0.05"} 1');
+    expect(out).toContain('polyland_operation_duration_seconds_bucket{op="drift_check",le="0.1"} 1');
+  });
+});
+
+describe('bounded metric label vocabulary (P2)', () => {
+  it('normalizes unknown labels to other without creating unbounded series', () => {
+    const m = new BotMetrics();
+    m.observeHold({ category: 'crypto', exitReason: 'wallet-0xabc', holdSeconds: 1 });
+    m.observeHold({ category: 'crypto', exitReason: 'wallet-0xdef', holdSeconds: 2 });
+    const out = m.registry.toProm();
+    expect(out).toContain('exitReason="other"');
+    expect(out).not.toContain('wallet-0xabc');
+    expect(out).not.toContain('wallet-0xdef');
+    expect(out).toContain('polyland_metric_label_violations_total{label="exitReason"} 2');
+  });
+  it('accepts the full market category vocabulary', () => {
+    const m = new BotMetrics();
+    m.setBankrollUtil('economics', 0.25);
+    expect(m.registry.toProm()).toContain('category="economics"');
+  });
+});
