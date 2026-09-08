@@ -261,7 +261,7 @@ const screeningConfig = {
     minTradeCount: 100,
     minWinRate: 0.60,
     minCategoryWinRate: 0.58,
-    minCategoryTrades: 3,
+    minCategoryTrades: 12,
     maxInactiveDays: 60,   // edge decays — 60d matches Poly Syncer window
   };
 // ============================================================================

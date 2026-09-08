@@ -161,7 +161,7 @@ export const DEFAULT_SCREENING_CONFIG: WalletScreeningConfig = {
   // 58% win rate over >= 3 SETTLED category positions beats coin-flip-with-vig.
   // (Settled positions aggregate fills — 3 settled markets is a real sample.)
   minCategoryWinRate: 0.58,
-  minCategoryTrades: 3,
+  minCategoryTrades: 12,
   // Edge decays — a wallet idle 60+ days is not a live signal source.
   maxInactiveDays: 60,
   // Win-rate recency window (days) over timestamped closed positions; a
@@ -368,11 +368,38 @@ export class WalletScreeningService {
           results.set(c.address, { category: normalizeCategory(c.leaderboardCategory), source: 'auto', confidence: 0.9 });
           return;
         }
-        // Inference from recent activity — check cache first
+        // Inference: top-N recent activities with weighted vote (newer = heavier).
+        // A single first-activity pick misclassifies science wallets whose
+        // latest trade was a random music market; multi-activity voting with
+        // a minimum-share threshold avoids that (audit 09-08: 144/168 in 'other').
         const cached = this.activityCache?.get(c.address) as { activities?: Array<{ title?: string }> } | null;
-        if (cached?.activities?.[0]?.title) {
-          const inferred = categorizeMarket(cached.activities[0].title!) as MarketCategory;
-          results.set(c.address, { category: inferred, source: 'inferred', confidence: 0.6 });
+        const titles = (cached?.activities ?? [])
+          .slice(0, 10)
+          .map((a) => a.title)
+          .filter((t): t is string => typeof t === 'string' && t.length > 0);
+        if (titles.length > 0) {
+          // Recent-weighted votes: weight[i] = 1 / (1 + i/3), so the latest
+          // activity counts ~3x more than the 10th. A 60% share is the minimum
+          // to claim a non-'other' category.
+          const votes = new Map<MarketCategory, number>();
+          for (let i = 0; i < titles.length; i++) {
+            const w = 1 / (1 + i / 3);
+            const cat = categorizeMarket(titles[i]) as MarketCategory;
+            votes.set(cat, (votes.get(cat) ?? 0) + w);
+          }
+          const total = [...votes.values()].reduce((a, b) => a + b, 0);
+          let best: MarketCategory = 'other';
+          let bestShare = 0;
+          for (const [cat, score] of votes) {
+            const share = score / total;
+            if (share > bestShare) { best = cat; bestShare = share; }
+          }
+          if (best !== 'other' && bestShare >= 0.60) {
+            results.set(c.address, { category: best, source: 'inferred', confidence: Math.min(0.9, 0.5 + bestShare / 2) });
+            return;
+          }
+          // No clear winner — leave as 'other' but with low confidence.
+          results.set(c.address, { category: 'other', source: 'inferred', confidence: 0.3 });
           return;
         }
         results.set(c.address, { category: 'other', source: 'inferred', confidence: 0.3 });
@@ -402,8 +429,15 @@ export class WalletScreeningService {
           }
           const winRates: Record<string, { winRate: number; tradeCount: number }> = {};
           for (const [cat, stats] of Object.entries(byCategory)) {
+            // Category win rate is displayed/used for routing, so shrink the
+            // raw wins/total with the same Bayesian prior as overall scoring.
+            // Otherwise 1/1, 3/3, ... appear as "specialist winRate=1" and
+            // pass the seed gate despite having no evidence. Prior=20 means
+            // 3/3 displays 0.652, 12/12 displays 0.813, 73/73 displays 0.957.
+            const prior = Math.max(1, this.config.winRatePriorTrades);
+            const adjustedWinRate = (stats.wins + prior / 2) / (stats.total + prior);
             winRates[cat] = {
-              winRate: stats.total > 0 ? stats.wins / stats.total : 0,
+              winRate: adjustedWinRate,
               tradeCount: stats.total,
             };
           }
@@ -695,7 +729,7 @@ export class WalletScreeningService {
     const catStat = catWinRates[resolvedCat];
     // DEBUG: log high-copyScore candidates' copyScore vs specializes evaluation
     if (copyScore >= 55) {  // lowered from 75 to catch SPORTS=90
-      console.log(`[Score] ${c.address} copyScore=${copyScore} winRate=${profile.winRate} smartScore=${profile.smartScore} cat=${resolvedCat} catStat=${JSON.stringify(catStat)} specializes=${copyScore>=75||(!!catStat&&catStat.tradeCount>=12?catStat.winRate>=0.58:0)}`);
+      console.log(`[Score] ${c.address} copyScore=${copyScore} overallWinRate=${profile.winRate.toFixed(3)} overallTrades=${profile.tradeCount} smartScore=${profile.smartScore} cat=${resolvedCat} categorySource=${resolved?.source ?? 'unset'} categoryConfidence=${(resolved?.confidence ?? 0).toFixed(2)} catStat=${JSON.stringify(catStat)} specializes=${!!catStat && catStat.tradeCount >= 12 && catStat.winRate >= this.config.minCategoryWinRate}`);
     }
     // Category specialization gate.
     // A wallet routing to a specific basket must prove it actually wins there.
@@ -703,21 +737,18 @@ export class WalletScreeningService {
     // For mid-tier wallets, we require either:
     //   (a) >=12 category trades with winRate >= 58%, OR
     //   (b) concentration >= 30% (or >= minConcentration) if catStat is unavailable.
-    // If catStat is undefined AND copyScore < 75, use concentration fallback.
-    const concentration = catStat?.tradeCount
-      ? catStat.tradeCount / profile.tradeCount
-      : 0;
-    const minConcentration = copyScore >= 75 ? 0 : 0.30;
-    // Category edge: >=3 SETTLED positions in the category with >=58% win rate.
-    // Settled positions aggregate fills — 150+ trades may collapse to 10-30
-    // distinct markets, so trade-count thresholds must be position-based.
+    // If catStat is undefined, we have no per-category evidence — the wallet
+    // stays unresolved (no `other` automatic fallback) unless catStat exists
+    // and meets the category thresholds.
     const hasCatEdge = !!catStat
       && catStat.tradeCount >= this.config.minCategoryTrades
       && catStat.winRate >= this.config.minCategoryWinRate;
-    const specializes =
-      copyScore >= 75 ||   // elite generalist — CopyScore is the proof (bypasses catStat check)
-      hasCatEdge ||        // proven category winner on settled markets
-      concentration >= minConcentration && profile.winRate >= this.config.minWinRate;
+    // A wallet routes into a specific category basket ONLY if it has
+    // category-level evidence (no elite-CopyScore bypass — a 90 copyScore on
+    // science trades doesn't prove it wins esports). Without catEdge, the
+    // wallet is recorded as a generalist watchlist entry but does NOT enter
+    // any basket.
+    const specializes = hasCatEdge;
     if (!specializes) {
       if (gateCounts) gateCounts['not specialized'] = (gateCounts['not specialized'] ?? 0) + 1;
       return this.buildResult(

@@ -563,8 +563,13 @@ export class BasketQuorumService {
       for (const cat of Object.keys(w.categoryWinRates) as MarketCategory[]) {
         if (qualifiesFor(w, cat)) cats.add(cat);
       }
-      // No per-category proof (bypassed / manual / thin data) → trust resolved cat.
-      if (cats.size === 0) {
+      // No per-category proof (bypassed / manual / thin data) — but don't
+      // dump unresolved wallets into the `other` basket as a default. Only
+      // add the resolved category when the wallet actually has data for it
+      // OR it's a manual/bypassed override. Previously this caught all
+      // unclassified wallets (144/168 in the 09-08 audit) and inflated
+      // `other` into a junk drawer.
+      if (cats.size === 0 && w.bypassed && w.category !== 'other') {
         cats.add(w.category);
       } else if (cats.size > 1) {
         multiBasket++;
@@ -620,10 +625,33 @@ export class BasketQuorumService {
     const summary = [...byCategory.entries()]
       .map(([c, ws]) => c + '=' + ws.length)
       .join(', ');
+    // Unresolved wallet breakdown (audit 09-08: 144/168 wallets used to land
+    // in `other` because the seed-loop fell back to resolved cat for
+    // everything. Now `other` is reached only via categoryWinRates.other, so
+    // the count here reflects genuine unclassified wallets — not a junk
+    // drawer. Track distinct categories and primaryCategory distribution.
+    const uniqueByPrimary = new Map<MarketCategory, number>();
+    for (const w of eligible) {
+      const cats = new Set<MarketCategory>();
+      for (const cat of Object.keys(w.categoryWinRates) as MarketCategory[]) {
+        if (qualifiesFor(w, cat)) cats.add(cat);
+      }
+      const primary = cats.size > 0 ? [...cats][0] : (w.bypassed ? w.category : 'other');
+      uniqueByPrimary.set(primary, (uniqueByPrimary.get(primary) ?? 0) + 1);
+    }
+    const primarySummary = [...uniqueByPrimary.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([c, n]) => c + '=' + n)
+      .join(', ');
     console.log(
       `[BasketQuorum] seeded ${eligible.length} wallets across ` +
-        `${byCategory.size} baskets: ${summary} ` +
-        `(inferred: ${inferredCount}, fallback-to-other: ${otherCount}, multi-basket: ${multiBasket})`
+      `${byCategory.size} baskets: ${summary} ` +
+      `(inferred: ${inferredCount}, fallback-to-other: ${otherCount}, multi-basket: ${multiBasket})`
+    );
+    console.log(
+      `[BasketQuorum] primary-category distribution: ${primarySummary} ` +
+      `(total ${eligible.length}; wallets with zero qualified categories: ` +
+      `${eligible.length - [...uniqueByPrimary.values()].reduce((a, b) => a + b, 0)})`
     );
   }
   private windowMs(category: MarketCategory): number {
