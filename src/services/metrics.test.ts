@@ -165,3 +165,26 @@ describe('POLYLAND_BUCKETS', () => {
     }
   });
 });
+
+describe('label serialization consistency (A2 audit finding)', () => {
+  it('Counter and Histogram render empty label values identically', () => {
+    // A2: Counter/Gauge used to emit {label=""} for empty values while
+    // Histogram/Summary dropped them — same series identity must be stable
+    // across metric types or dashboards/joins break.
+    const c = new Counter('test_ser_total', 'h', ['a', 'b']);
+    c.inc({ a: 'x', b: '' });
+    const h = new Histogram('test_ser_hist', 'h', ['a', 'b'], { buckets: [1] });
+    h.observe({ a: 'x', b: '' }, 0.5);
+    const out = c.toProm().concat(h.toProm()).join('\n');
+    expect(out).toContain('test_ser_total{a="x"} 1');
+    expect(out).not.toContain('b=""');
+    expect(out).toContain('test_ser_hist_bucket{a="x",le="1"} 1');
+    expect(out).toContain('test_ser_hist_count{a="x"} 1');
+  });
+  it('renders all-empty labels without braces', () => {
+    const c = new Counter('test_empty_total', 'h', ['a']);
+    c.inc({ a: '' });
+    expect(c.toProm().join('\n')).toContain('test_empty_total 1');
+    expect(c.toProm().join('\n')).not.toContain('{a=""}');
+  });
+});

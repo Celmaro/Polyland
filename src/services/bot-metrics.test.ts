@@ -22,21 +22,42 @@ function snap(over: Partial<FunnelStatsSnapshot> = {}): FunnelStatsSnapshot {
 }
 
 describe('BotMetrics.feedFunnel', () => {
-  it('mirrors snapshot scalars into Prometheus counters with category labels', () => {
+  it('emits per-interval DELTAS, not cumulative totals (double-count regression)', () => {
     const m = new BotMetrics();
-    m.feedFunnel(snap({ firedCategory: 'crypto', firedSide: 'BUY' }));
-    m.feedFunnel(snap({ firedCategory: 'crypto', firedSide: 'BUY' }));
-    m.feedFunnel(snap({ firedCategory: 'sports', firedSide: 'SELL' }));
+    // Two identical snapshots for crypto: the second carries the SAME cumulative
+    // count as the first, so it must contribute 0 to the counter. Feeding the
+    // lifetime total on each scrape was the /metrics-inflation bug.
+    m.feedFunnel(snap({ firedCategory: 'crypto', firedSide: 'BUY' }));   // received=1000
+    m.feedFunnel(snap({ firedCategory: 'crypto', firedSide: 'BUY' }));   // identical → delta 0
+    m.feedFunnel(snap({ firedCategory: 'sports', firedSide: 'SELL' }));  // received=1000
     const out = m.registry.toProm();
-    expect(out).toContain('polyland_funnel_received_total{category="crypto"} 2000');
-    expect(out).toContain('polyland_funnel_fired_total{category="crypto",tier="all",side="BUY"} 6');
+    expect(out).toContain('polyland_funnel_received_total{category="crypto"} 1000');
+    expect(out).toContain('polyland_funnel_fired_total{category="crypto",tier="all",side="BUY"} 3');
     expect(out).toContain('polyland_funnel_executed_total{category="sports",tier="all",side="SELL"} 3');
   });
-  it('attaches skip-reason counters per category', () => {
+  it('emits the increment when cumulative counters grow between snapshots', () => {
+    const m = new BotMetrics();
+    // received grows 1000 → 1700 across an interval: counter gets +700, not +1700.
+    m.feedFunnel(snap());
+    m.feedFunnel(snap({ feedReceived: 1700, quorumFired: 4, executed: 4 }));
+    const out = m.registry.toProm();
+    expect(out).toContain('polyland_funnel_received_total{category="other"} 1700');
+    expect(out).toContain('polyland_funnel_fired_total{category="other",tier="all",side="BUY"} 4');
+  });
+  it('resets cleanly when cumulative counters drop (stats.reset before re-config)', () => {
+    const m = new BotMetrics();
+    m.feedFunnel(snap({ feedReceived: 5000 }));               // +5000
+    m.feedFunnel(snap({ feedReceived: 100 }));                // reset to 100 → +100, not negative
+    expect(m.registry.toProm()).toContain('polyland_funnel_received_total{category="other"} 5100');
+  });
+  it('emits per-reason skip deltas, not cumulative', () => {
     const m = new BotMetrics();
     m.feedFunnel(snap({ firedCategory: 'crypto', byReason: { drift: 5, anti_sniper: 3 } }));
+    m.feedFunnel(snap({ firedCategory: 'crypto', byReason: { drift: 9, anti_sniper: 3 } }));
     const out = m.registry.toProm();
-    expect(out).toContain('polyland_funnel_skipped_total{reason="drift",category="crypto"} 5');
+    // drift: 5 (first snapshot delta) + 4 (5→9 growth) = 9. Naive cumulative
+    // re-increment would have produced 5+9=14; deltas give 9.
+    expect(out).toContain('polyland_funnel_skipped_total{reason="drift",category="crypto"} 9');
     expect(out).toContain('polyland_funnel_skipped_total{reason="anti_sniper",category="crypto"} 3');
   });
 });

@@ -122,6 +122,13 @@ export class BotMetrics {
     ['category'],
   );
 
+  /** Last-seen cumulative funnel snapshot, keyed by label-set (category/tier/side),
+   *  used to emit per-interval DELTAS. Prometheus counters are monotonically
+   *  increasing totals; feeding a lifetime cumulative value to `Counter.inc()`
+   *  on every scrape would re-add the whole run each interval (the observed
+   *  "/metrics inflation" bug). */
+  private lastFunnelByKey = new Map<string, FunnelStatsSnapshot>();
+
   /**
    * Mirror a funnel snapshot into metrics. Called from the funnel log
    * path so we don't add a separate event hook.
@@ -130,13 +137,29 @@ export class BotMetrics {
     const cat = s.firedCategory ?? 'other';
     const tier = 'all';
     const side = s.firedSide ?? 'BUY';
-    this.cReceived.inc({ category: cat }, s.feedReceived);
-    this.cFired.inc({ category: cat, tier, side }, s.quorumFired);
-    this.cExecuted.inc({ category: cat, tier, side }, s.executed);
-    this.cFailed.inc({ reason: 'order', category: cat }, s.failed);
+    const key = `${cat}|${tier}|${side}`;
+    const prev = this.lastFunnelByKey.get(key);
+    this.lastFunnelByKey.set(key, { ...s });
+    // Reset detection: if a cumulative counter DECREASED (e.g. stats.reset()
+    // on basket re-config), the new cumulative total is the delta from a fresh
+    // zero baseline; otherwise emit `current - last`.
+    const delta = (cur: number, key: keyof FunnelStatsSnapshot): number => {
+      const last = prev === undefined ? 0 : (prev[key] as number);
+      return cur >= last ? cur - last : cur;
+    };
+    this.cReceived.inc({ category: cat }, delta(s.feedReceived, 'feedReceived'));
+    this.cFired.inc({ category: cat, tier, side }, delta(s.quorumFired, 'quorumFired'));
+    this.cExecuted.inc({ category: cat, tier, side }, delta(s.executed, 'executed'));
+    this.cFailed.inc({ reason: 'order', category: cat }, delta(s.failed, 'failed'));
+    // antiSniperReasons is a cumulative per-reason map; emit per-reason deltas.
     if (s.byReason) {
-      for (const [reason, n] of Object.entries(s.byReason)) {
-        this.cSkipped.inc({ reason, category: cat }, n);
+      const prevReasons = (prev?.byReason ?? {}) as Record<string, number>;
+      const reasons = new Set<string>([...Object.keys(prevReasons), ...Object.keys(s.byReason)]);
+      for (const reason of reasons) {
+        const cur = s.byReason[reason] ?? 0;
+        const last = prevReasons[reason] ?? 0;
+        const d = cur >= last ? cur - last : cur;
+        if (d !== 0) this.cSkipped.inc({ reason, category: cat }, d);
       }
     }
   }

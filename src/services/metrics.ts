@@ -91,7 +91,11 @@ export class Counter {
   private renderLabels(k: string): string {
     if (this.labelNames.length === 0) return '';
     const vals = k.split('|');
-    const pairs = this.labelNames.map((n, i) => `${n}="${escapeLabel(vals[i] ?? '')}"`);
+    const pairs = this.labelNames
+      .map((n, i) => [n, vals[i] ?? ''] as [string, string])
+      .filter(([, v]) => v !== '')
+      .map(([n, v]) => `${n}="${escapeLabel(v)}"`);
+    if (pairs.length === 0) return '';
     return `{${pairs.join(',')}}`;
   }
 }
@@ -151,7 +155,10 @@ export class Gauge {
   private renderLabels(k: string): string {
     if (this.labelNames.length === 0) return '';
     const vals = k.split('|');
-    const pairs = this.labelNames.map((n, i) => `${n}="${escapeLabel(vals[i] ?? '')}"`);
+    const pairs = this.labelNames
+      .map((n, i) => [n, vals[i] ?? ''] as [string, string])
+      .filter(([, v]) => v !== '')
+      .map(([n, v]) => `${n}="${escapeLabel(v)}"`);
     return `{${pairs.join(',')}}`;
   }
 }
