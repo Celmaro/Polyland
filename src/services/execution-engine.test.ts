@@ -190,3 +190,59 @@ describe('ExecutionEngine stale-quote gating (P1)', () => {
     expect(engine.failed).toBe(1);
   });
 });
+
+describe('ExecutionEngine depth-aware dry-run fills (P1-5 shared fill engine)', () => {
+  it('records the executable VWAP and partial size when dry-run depth-aware fills are on', async () => {
+    let fired: Record<string, unknown> | null = null;
+    let openedShares = 0;
+    const deps = makeDeps({
+      auditStore: { recordFire: (params: Record<string, unknown>) => { fired = params; return 'id'; } },
+      onPositionOpened: (_tokenId: unknown, _usd: unknown, shares: unknown) => { openedShares = shares as number; },
+      bookLookup: async () => ({
+        asks: [{ price: 0.60, size: 50 }],
+        bids: [],
+        minOrderSize: 0,
+        tickSize: 0.01,
+        timestamp: Date.now(),
+      }),
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(true);
+    // Depth caps at 50 shares @ 0.60; audit must record the true fill.
+    expect(fired).not.toBeNull();
+    expect(fired!.pricePaid).toBeCloseTo(0.60, 6);
+    expect(fired!.size).toBeCloseTo(50, 6);
+    expect(openedShares).toBeCloseTo(50, 6);
+  });
+
+  it('fails closed (ok:false, no spend) when the book is unavailable and depth-aware fills are on', async () => {
+    let spent = 0;
+    const deps = makeDeps({
+      basketSpendAdd: (_c, amount) => { spent += amount; },
+      bookLookup: async () => null,
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(false);
+    expect(engine.failed).toBe(1);
+    expect(spent).toBe(0);
+  });
+
+  it('keeps legacy full-fill behavior when depth-aware fills are off', async () => {
+    let fired: Record<string, unknown> | null = null;
+    const deps = makeDeps({
+      auditStore: { recordFire: (params: Record<string, unknown>) => { fired = params; return 'id'; } },
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: false });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(true);
+    expect(fired!.pricePaid).toBe(SIGNAL.consensusPrice); // legacy: consensus, no book
+  });
+});

@@ -18,6 +18,7 @@
  * structural subset carrying the fields it needs (see ReplayCandidate).
  */
 import { computeExactSharesAndCost, quantizeBuyPrice, type TickSize } from '../utils/price-utils.js';
+import { executeAgainstBook } from './fill-engine.js';
 // ============================================================================
 // Types
 // ============================================================================
@@ -250,26 +251,20 @@ export class ReplayEvaluator {
     if (!usableLevels || usableLevels.length === 0) {
       return blocked(side === 'BUY' ? 'no_best_ask' : 'no_depth', 'no levels on executable side');
     }
-    const fills: { price: number; shares: number }[] = [];
-    let remaining = size;
-    for (const level of usableLevels) {
-      if (remaining <= 0) break;
-      const take = Math.min(remaining, level.size);
-      // Respect book min-order-size: a level smaller than minOrderSize cannot
-      // be hit by a single market order in the CLOB.
-      if (book.minOrderSize > 0 && take < book.minOrderSize && fills.length === 0) {
-        continue;
-      }
-      fills.push({ price: level.price, shares: take });
-      remaining -= take;
-    }
-    if (fills.length === 0) {
+    // ---- shared depth-consumption model (P1-5: identical in live + replay) ----
+    const fillResult = executeAgainstBook({ side, size }, {
+      asks: book.asks as { price: number; size: number }[],
+      bids: book.bids as { price: number; size: number }[],
+      minOrderSize: book.minOrderSize,
+      tickSize: book.tickSize,
+      timestamp: book.timestamp,
+    });
+    if (fillResult.verdict === 'no_levels' || fillResult.verdict === 'below_min_order') {
       return blocked(side === 'BUY' ? 'no_best_ask' : 'no_depth', 'no level meets min_order_size');
     }
-    // ---- executable VWAP over the levels actually consumed ----
-    const totalShares = fills.reduce((acc, f) => acc + f.shares, 0);
-    const vwap =
-      fills.reduce((acc, f) => acc + f.price * f.shares, 0) / (totalShares || 1);
+    const fills = fillResult.fills;
+    const totalShares = fillResult.executableSize;
+    const vwap = fillResult.executableVwap;
     details.levelsUsed = fills.length;
     // ---- slippage vs reference (leader-observed) price ----
     const slippageBps = referencePrice > 0 ? Math.round(((vwap - referencePrice) / referencePrice) * 10_000) : 0;

@@ -6,6 +6,7 @@ import type { BasketConfig } from './basket-quorum-service.js';
 import type { ConsensusSignal, ExecutionDecision, PipelineDecision, RejectReason } from './pipeline-types.js';
 import { BankrollReservationLedger } from './bankroll-reservation.js';
 import { computeExactSharesAndCost, quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
+import { executeAgainstBook, type FillBook } from './fill-engine.js';
 import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 
 export interface ExecutionEngineConfig {
@@ -16,6 +17,8 @@ export interface ExecutionEngineConfig {
   maxEntryPrice?: number;
   /** Max age (ms) of the consensus quote before it is stale-cancelled. Default 30s. */
   maxQuoteAgeMs?: number;
+  /** Price dry-run fills from live book depth (shared fill-engine). Default true in dry-run. */
+  depthAwareFills?: boolean;
 }
 export interface ExecutionEngineDeps {
   tickSizeFor: (conditionId: string) => number;
@@ -30,6 +33,8 @@ export interface ExecutionEngineDeps {
   onAntiSniperFire: (tokenId: string) => void;
   /** P1 observability: a stale consensus quote was cancelled (fail-closed). */
   onStaleQuoteSkip?: () => void;
+  /** P1-5: live book lookup so dry-run fills use the SAME depth model as replay. */
+  bookLookup?: (tokenId: string) => Promise<FillBook | null>;
   auditStore: { recordFire: (params: Record<string, unknown>) => unknown };
 }
 
@@ -124,14 +129,36 @@ export class ExecutionEngine {
       else if (!trade?.tokenId) throw new Error('missing tokenId');
       else result = await this.tradingService.createMarketOrder({ tokenId: trade.tokenId, side: 'BUY', amount: amountUsd, price, orderType: this.config.orderType });
       if (!result.success) { this.failed++; release(); return { ok: false }; }
-      this.deps.basketSpendAdd(category, amountUsd);
-      // Audit pricePaid = the CONSENSUS price, not the slippage-marked limit.
-      // The limit is a BUY cost ceiling: recording it systematically understates
-      // realized edge and biases the go-live gate. Consensus is the honest
-      // executable estimate; replace with the true average fill once order
-      // results carry it.
-      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: signal.consensusPrice, size: amountUsd / signal.consensusPrice, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category });
-      this.deps.onPositionOpened(trade?.tokenId, amountUsd, amountUsd / price, price, signal);
+      // ---- depth-aware dry-run fill (P1-5): same fill engine as replay ----
+      // When enabled, a dry-run order is priced through the live book with the
+      // shared executeAgainstBook model: partial fills and executable VWAP are
+      // recorded instead of assuming the limit ceiling fills in full.
+      let auditPrice = signal.consensusPrice;
+      let auditShares = amountUsd / signal.consensusPrice;
+      let placedUsd = amountUsd;
+      const depthAware = this.config.depthAwareFills ?? this.config.dryRun;
+      if (depthAware && decision.value.dryRun && trade?.tokenId && this.deps.bookLookup) {
+        const book = await this.deps.bookLookup(trade.tokenId);
+        if (!book) {
+          this.failed++; release();
+          console.warn(`[ExecutionEngine] SKIP depth-unknown: no live book for ${trade.tokenId}`);
+          return { ok: false };
+        }
+        const fill = executeAgainstBook({ side: 'BUY', size: amountUsd / price, maxPrice: price }, book);
+        if (fill.verdict !== 'filled' || fill.executableSize <= 0) {
+          this.failed++; release();
+          console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} has no executable level`);
+          return { ok: false };
+        }
+        auditPrice = fill.executableVwap;
+        auditShares = fill.executableSize;
+        placedUsd = fill.executableVwap * fill.executableSize;
+      }
+      this.deps.basketSpendAdd(category, placedUsd);
+      // Audit pricePaid = the honest executable estimate: consensus when the
+      // book is not used, otherwise the true depth-aware fill VWAP.
+      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category });
+      this.deps.onPositionOpened(trade?.tokenId, placedUsd, auditShares, auditPrice, signal);
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
       if (trade?.tokenId) this.deps.onAntiSniperFire(trade.tokenId);
       return { ok: true, orderId: result.orderId };

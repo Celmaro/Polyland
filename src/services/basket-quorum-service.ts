@@ -1468,6 +1468,26 @@ export class BasketQuorumService {
       onAntiSniperFire: (tokenId) => this.antiSniper?.recordFire(tokenId),
       onStaleQuoteSkip: () => { this.botMetrics?.staleQuoteCancelled(); },
       auditStore: { recordFire: (params) => signalAuditStore.recordFire(params as Parameters<typeof signalAuditStore.recordFire>[0]) },
+      bookLookup: async (tokenId) => {
+        try {
+          const book = await this.tradingService.getPublicOrderBook(tokenId);
+          if (!book || !Array.isArray(book.bids) || !Array.isArray(book.asks) || book.bids.length === 0 || book.asks.length === 0) return null;
+          const level = (l: { price: string | number; size: string | number }) => {
+            const price = typeof l.price === 'number' ? l.price : parseFloat(l.price);
+            const size = typeof l.size === 'number' ? l.size : parseFloat(l.size);
+            return { price, size };
+          };
+          return {
+            asks: book.asks.map(level),
+            bids: book.bids.map(level),
+            minOrderSize: 0,
+            tickSize: this.tickSizeCache.get(tokenId) ?? 0.01,
+            timestamp: Date.now(),
+          };
+        } catch {
+          return null;
+        }
+      },
     }, {
       dryRun: this.config.dryRun, orderType: this.config.orderType, maxSlippage: this.config.maxSlippage,
       minTradeSize: this.config.minTradeSize, maxSizePerTrade: this.config.maxSizePerTrade, sizeScale: this.config.sizeScale,
