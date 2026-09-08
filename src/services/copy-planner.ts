@@ -62,6 +62,9 @@ export interface CopyPlannerConfig {
   maxSizeUsd: number;        // hard per-trade cap
   reliabilityFloor: number;
   defaultOrderType: 'FAK' | 'FOK';
+  /** Max BUY entry price (0-1). Near-certain entries (0.95+) have asymmetric
+   *  payoff: win 1-5c, lose 20-99c. Audit 09-07: three 0.99+ fires. Default 0.90. */
+  maxEntryPrice?: number;
 }
 
 export interface CopyPlan {
@@ -146,6 +149,16 @@ export class CopyPlanner {
       }
 
       const price = quantizeBuyPrice(v.price, tick);
+
+      // Entry price ceiling: near-certain entries carry terrible asymmetry —
+      // a 0.97 entry wins 3c net of fees but loses 97c when the 3% hits.
+      // Audit 09-07: fires at 0.997/0.999 (negEdge gate caught 383 but
+      // wallet-winRate blends pushed fairProb above price for some).
+      const maxEntry = this.config.maxEntryPrice ?? 0.90;
+      if (price > maxEntry) {
+        return { accepted: false, reason: 'no_edge', detail: `price ${price.toFixed(3)} > ceiling ${maxEntry}` };
+      }
+
       const feePerShare = takerFeePerShare(price, meta.takerFeeRateBps);
       const slippageBuffer = this.config.maxSlippagePct * price;
       const edge = signal.fairProb - price - feePerShare - slippageBuffer;

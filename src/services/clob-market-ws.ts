@@ -125,7 +125,11 @@ export class ClobMarketWsService {
     return () => this.midObservers.delete(observer);
   }
 
-  private static readonly MAX_SUBSCRIBED_ASSETS = 20;
+  // 50 slots: the 09-07 audit showed 20 churned too fast once every aligned
+  // market requests a mid (eviction wiped fresh mids mid-fire). Watch the
+  // code-1006 disconnect rate after raising — slow-consumer disconnects were
+  // the historical reason for the cap. If 1006s spike, fall back to 30.
+  private static readonly MAX_SUBSCRIBED_ASSETS = 50;
   private static readonly SUBSCRIBE_BATCH_SIZE = 5;
   private static readonly SUBSCRIBE_BATCH_DELAY_MS = 100;
 

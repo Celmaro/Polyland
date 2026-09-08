@@ -32,6 +32,8 @@ export interface ExecutionEngineDeps {
 export class ExecutionEngine {
   private readonly ledger: BankrollReservationLedger<string>;
   public failed = 0;
+  /** Per-category rate-limit state for bankroll-saturation warnings. */
+  private _lastBankrollLogAt = new Map<string, number>();
   constructor(
     private readonly tradingService: TradingService,
     private readonly riskManager: RiskManager | null,
@@ -79,7 +81,25 @@ export class ExecutionEngine {
     const { signal, amountUsd, price } = decision.value;
     const category = basket?.category ?? signal.category;
     const release = this.ledger.reserve(category, amountUsd, this.deps.basketSpendGet(category));
-    if (!release) { this.failed++; return { ok: false }; }
+    if (!release) {
+      // Bankroll saturation: make the invisible failure visible. The audit
+      // (09-07) showed failed=52 vs executed=24 (68% rejection) with zero
+      // operator-visible reason. Rate-limited to one line per 60s per category.
+      this.failed++;
+      const now = Date.now();
+      const last = this._lastBankrollLogAt.get(category) ?? 0;
+      if (now - last >= 60_000) {
+        this._lastBankrollLogAt.set(category, now);
+        const limit = this.deps.bankrollFor(category);
+        const spent = this.deps.basketSpendGet(category);
+        console.warn(
+          `[ExecutionEngine] SKIP bankroll: ${category} slice full — ` +
+          `spent=$${spent.toFixed(2)} of $${limit.toFixed(2)} ` +
+          `(${(spent * 100 / Math.max(limit, 1)).toFixed(0)}%), wanted $${amountUsd.toFixed(2)} for ${signal.marketSlug}`
+        );
+      }
+      return { ok: false };
+    }
     try {
       let result: OrderResult;
       if (decision.value.dryRun) result = { success: true, orderId: `dry_run_${Date.now()}` };
