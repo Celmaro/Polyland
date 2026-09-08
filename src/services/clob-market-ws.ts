@@ -30,6 +30,29 @@ export interface ClobMidObservation {
 
 export type MidObserver = (obs: ClobMidObservation) => void;
 
+export type BookInvalidationReason = 'sequence_gap' | 'missing_sequence' | 'malformed_sequence';
+export interface ClobResyncRequest { assetId: string; reason: BookInvalidationReason; expected?: number; received?: number; }
+export type ResyncObserver = (request: ClobResyncRequest) => void;
+export interface ClobWsIntegrityState {
+  sequenceGaps: number;
+  resyncs: number;
+  invalidBooks: number;
+  /** unix ms of the last non-PONG data message (0 = none yet). */
+  lastDataMessageAt: number;
+  /** Bytes buffered in the WS socket (0 when not connected). */
+  bufferedAmount: number;
+  /** True when bufferedAmount >= backpressureBytes threshold. */
+  backpressure: boolean;
+}
+export interface ClobMarketWsOptions {
+  /** Bytes at which the socket is considered backpressured. Default 256 KiB. */
+  backpressureBytes?: number;
+  /** Called when the book for an asset must be re-fetched (P0 sequencing). */
+  onResync?: ResyncObserver;
+  /** Compatibility: allow book updates with no sequence field (P0, default false). */
+  allowUnsequencedBooks?: boolean;
+}
+
 interface ClobInitialMessage {
   assets_ids: string[];
   type: 'market';
@@ -106,6 +129,37 @@ export class ClobMarketWsService {
   /** Timestamp of the last non-PONG (data) message — L12b silent-feed guard. */
   private lastDataMessageAt = 0;
   private connectPending = false;
+
+  private readonly options: ClobMarketWsOptions;
+  /** Sequence-integrity counters (P1 observability; incremented by P0 checks). */
+  private sequenceGaps = 0;
+  private resyncs = 0;
+  private invalidBooks = 0;
+  /** Overridable buffered amount for tests; fallback reads the live socket. */
+  private bufferedAmountBytes = 0;
+
+  constructor(options: ClobMarketWsOptions = {}) {
+    this.options = options;
+  }
+
+  /**
+   * Bounded, read-only telemetry snapshot for orchestrator health checks.
+   * Never throws; returns zeroed state when not connected.
+   */
+  getIntegrityState(): ClobWsIntegrityState {
+    const buffered = this.ws && typeof (this.ws as WebSocket & { bufferedAmount?: number }).bufferedAmount === 'number'
+      ? (this.ws as WebSocket & { bufferedAmount?: number }).bufferedAmount!
+      : this.bufferedAmountBytes;
+    const threshold = this.options.backpressureBytes ?? 256 * 1024;
+    return {
+      sequenceGaps: this.sequenceGaps,
+      resyncs: this.resyncs,
+      invalidBooks: this.invalidBooks,
+      lastDataMessageAt: this.lastDataMessageAt,
+      bufferedAmount: Math.max(0, buffered),
+      backpressure: buffered >= threshold,
+    };
+  }
 
   /** Book mid price per asset (best bid + best ask) / 2 */
   private bookMids = new Map<string, number>();

@@ -98,6 +98,38 @@ export class BotMetrics {
     'Metric label values normalized to the bounded other bucket',
     ['label'],
   );
+
+  // Stale-quote cancellations and feed-lag (P1 observability).
+  private readonly cStaleQuote = this.registry.counter(
+    'polyland_stale_quote_cancellations_total',
+    'Executions cancelled because the consensus quote was stale (fail-closed)',
+  );
+  private readonly gFeedLag = this.registry.gauge(
+    'polyland_feed_lag_seconds',
+    'Age of the newest processed feed event, seconds',
+  );
+  // Book integrity / queue pressure (P1 observability) — fed from the
+  // ClobMarketWs integrity snapshot; bounded cardinality (no labels).
+  private readonly gQueueBytes = this.registry.gauge(
+    'polyland_queue_backpressure_bytes',
+    'WebSocket bufferedAmount, bytes',
+  );
+  private readonly gQueuePressure = this.registry.gauge(
+    'polyland_queue_backpressure',
+    'True (1) when WS bufferedAmount exceeds the backpressure threshold',
+  );
+  private readonly cSeqGaps = this.registry.counter(
+    'polyland_book_sequence_gaps_total',
+    'Order-book sequence gaps detected (feed integrity)',
+  );
+  private readonly cResyncs = this.registry.counter(
+    'polyland_book_resyncs_total',
+    'Order-book resynchronizations requested',
+  );
+  private readonly cInvalidBooks = this.registry.counter(
+    'polyland_book_invalidations_total',
+    'Order-book invalidations',
+  );
   // Realized PnL per share — the histogram that exposes the loss tail.
   private readonly hPnlPerShare = this.registry.histogram(
     'polyland_pnl_per_share',
@@ -227,6 +259,25 @@ export class BotMetrics {
   }
 
   setOpenPositions(n: number): void { this.gOpen.set(n); }
+
+  /** A stale consensus quote was cancelled (execution-level fail-closed). */
+  staleQuoteCancelled(): void { this.cStaleQuote.inc(); }
+  /** Update the feed-lag gauge (seconds since newest processed event). */
+  setFeedLagSeconds(ageSec: number): void { this.gFeedLag.set(Number.isFinite(ageSec) ? Math.max(0, ageSec) : 0); }
+
+  setQueueBackpressureBytes(bytes: number): void { this.gQueueBytes.set(Math.max(0, bytes)); }
+  setQueueBackpressure(on: boolean): void { this.gQueuePressure.set(on ? 1 : 0); }
+  recordBookSequenceGap(): void { this.cSeqGaps.inc(); }
+  recordBookResync(): void { this.cResyncs.inc(); }
+  recordInvalidBook(): void { this.cInvalidBooks.inc(); }
+  /** Mirror the CLOB WebSocket integrity snapshot (bounded, no labels). */
+  mirrorClobIntegrity(state: { bufferedAmount: number; backpressure: boolean; sequenceGaps: number; resyncs: number; invalidBooks: number }): void {
+    this.gQueueBytes.set(Math.max(0, state.bufferedAmount));
+    this.gQueuePressure.set(state.backpressure ? 1 : 0);
+    if (state.sequenceGaps > 0) this.cSeqGaps.inc({}, state.sequenceGaps);
+    if (state.resyncs > 0) this.cResyncs.inc({}, state.resyncs);
+    if (state.invalidBooks > 0) this.cInvalidBooks.inc({}, state.invalidBooks);
+  }
   setBankrollUtil(category: string, ratio: number): void {
     this.gBankrollUtil.set({ category: this.label('category', category) }, Math.max(0, Math.min(1, ratio)));
   }

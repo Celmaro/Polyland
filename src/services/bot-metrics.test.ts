@@ -186,3 +186,33 @@ describe('bounded metric label vocabulary (P2)', () => {
     expect(m.registry.toProm()).toContain('category="economics"');
   });
 });
+
+describe('P1 observability metrics (staleness, feed-lag, queue, resync)', () => {
+  it('exposes a bounded stale-quote cancellation counter', () => {
+    const m = new BotMetrics();
+    m.staleQuoteCancelled();
+    m.staleQuoteCancelled();
+    const out = m.registry.toProm();
+    expect(out).toContain('polyland_stale_quote_cancellations_total 2');
+  });
+  it('exposes feed-lag seconds as a gauge', () => {
+    const m = new BotMetrics();
+    m.setFeedLagSeconds(12.5);
+    const out = m.registry.toProm();
+    expect(out).toContain('polyland_feed_lag_seconds 12.5');
+  });
+  it('exposes queue backpressure bytes and book-integrity counters', () => {
+    const m = new BotMetrics();
+    m.setQueueBackpressureBytes(131_072);
+    m.setQueueBackpressure(true);
+    m.recordBookSequenceGap();
+    m.recordBookResync();
+    m.recordInvalidBook();
+    const out = m.registry.toProm();
+    expect(out).toContain('polyland_queue_backpressure_bytes 131072');
+    expect(out).toContain('polyland_queue_backpressure 1');
+    expect(out).toContain('polyland_book_sequence_gaps_total 1');
+    expect(out).toContain('polyland_book_resyncs_total 1');
+    expect(out).toContain('polyland_book_invalidations_total 1');
+  });
+});

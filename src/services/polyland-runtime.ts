@@ -93,7 +93,14 @@ export class PolylandRuntime {
     const persisted = await this.stateStore.load(); if (!screened && Array.isArray(persisted?.walletUniverse)) screened = persisted.walletUniverse as any[];
     if (!screened) screened = await screening.score(candidates);
     await this.seed(screened, key); for (const t of buffer) this.quorum.onTrade(t); buffer.length = 0;
-    this.funnelTimer = setInterval(() => this.quorum?.logFunnel(), 300000); this.scheduleRefresh(21600000, ingestion, screening, key);
+    this.funnelTimer = setInterval(() => {
+      this.quorum?.logFunnel();
+      const metrics = this.config.botMetrics;
+      if (metrics) {
+        if (this.clob) metrics.mirrorClobIntegrity(this.clob.getIntegrityState());
+        metrics.setFeedLagSeconds(this.quorum ? Math.max(0, (Date.now() - this.quorum.getLastFeedEventAt()) / 1000) : 0);
+      }
+    }, 300000); this.scheduleRefresh(21600000, ingestion, screening, key);
   }
   private async seed(screened: any[], key: string): Promise<void> { if (!this.quorum) return; const eligible = screened.filter(w => w.tier === 'PRIMARY' || w.tier === 'SATELLITE'); this.quorum.seed(eligible); setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
   private scheduleRefresh(delay: number, ingestion: WalletIngestionService, screening: WalletScreeningService, key: string): void { this.refreshTimer = setTimeout(async () => { if (!this.refreshing) { this.refreshing = true; try { const candidates = await ingestion.collect(); const screened = await screening.score(candidates); const nextKey = JSON.stringify({ version: 1, candidates: candidates.map(c => ({ address: c.address, source: c.source, autoRank: c.autoRank })).sort((a,b) => a.address.localeCompare(b.address)), config: this.screeningConfig }); await this.seed(screened, nextKey); } catch (e) { console.warn('[PolylandRuntime] screening refresh failed:', e instanceof Error ? e.message : e); } finally { this.refreshing = false; } } this.scheduleRefresh(21600000, ingestion, screening, key); }, delay); }

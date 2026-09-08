@@ -28,6 +28,8 @@ export interface ExecutionEngineDeps {
   onPositionOpened: (...args: unknown[]) => void;
   onDedupFire: (key: string, now: number) => void;
   onAntiSniperFire: (tokenId: string) => void;
+  /** P1 observability: a stale consensus quote was cancelled (fail-closed). */
+  onStaleQuoteSkip?: () => void;
   auditStore: { recordFire: (params: Record<string, unknown>) => unknown };
 }
 
@@ -47,6 +49,7 @@ export class ExecutionEngine {
     if (this.riskManager && (!this.riskManager.canTrade() || this.riskManager.isBasketKilled(basket.name))) return { accepted: false, reason: 'risk' };
     const maxQuoteAge = this.config.maxQuoteAgeMs ?? 30_000;
     if (signal.observedAt !== undefined && Date.now() - signal.observedAt > maxQuoteAge) {
+      this.deps.onStaleQuoteSkip?.();
       return { accepted: false, reason: 'stale_quote', detail: `quote_age_ms=${Date.now() - signal.observedAt}` };
     }
     const category = basket.category;
@@ -91,6 +94,7 @@ export class ExecutionEngine {
     const maxQuoteAge = this.config.maxQuoteAgeMs ?? 30_000;
     if (signal.observedAt !== undefined && Date.now() - signal.observedAt > maxQuoteAge) {
       this.failed++;
+      this.deps.onStaleQuoteSkip?.();
       console.warn(`[ExecutionEngine] SKIP stale quote: ${signal.marketSlug} age_ms=${Date.now() - signal.observedAt}`);
       return { ok: false };
     }

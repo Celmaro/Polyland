@@ -218,6 +218,8 @@ export class BasketQuorumService {
   // Feed-burst detector state (L10 pressure valve): events in the current
   // minute + last burst warning time.
   private _feedEventsThisMinute = 0;
+  /** unix ms of the newest processed feed event — feed-lag observability. */
+  private _lastFeedEventAt = Date.now();
   private _feedMinuteStart = 0;
   private _lastFeedBurstLogAt = 0;
   private walletTierMap = new Map<string, 'PRIMARY' | 'SATELLITE'>();
@@ -703,6 +705,7 @@ export class BasketQuorumService {
   onTrade(trade: SmartMoneyTrade): void {
     // Count every raw incoming trade exactly once.
     this.stats.feedReceived++
+    if (trade.timestamp) this._lastFeedEventAt = Math.max(this._lastFeedEventAt, trade.timestamp);
     // Feed-burst window counter (resets each minute; consumed by the L10
     // staleness pressure valve below).
     if (Date.now() - this._feedMinuteStart > 60_000) {
@@ -1463,6 +1466,7 @@ export class BasketQuorumService {
       },
       onDedupFire: (dedupKey, timestamp) => { this._lastProcessedFire.set(dedupKey, timestamp); },
       onAntiSniperFire: (tokenId) => this.antiSniper?.recordFire(tokenId),
+      onStaleQuoteSkip: () => { this.botMetrics?.staleQuoteCancelled(); },
       auditStore: { recordFire: (params) => signalAuditStore.recordFire(params as Parameters<typeof signalAuditStore.recordFire>[0]) },
     }, {
       dryRun: this.config.dryRun, orderType: this.config.orderType, maxSlippage: this.config.maxSlippage,
@@ -1604,6 +1608,11 @@ export class BasketQuorumService {
   }
   getStats(): QuorumStats {
     return { ...this.stats };
+  }
+
+  /** unix ms of the newest processed feed event (0 = none yet). */
+  getLastFeedEventAt(): number {
+    return this._lastFeedEventAt;
   }
   /**
    * Pretty-print the funnel: how many signals came in, how many were
