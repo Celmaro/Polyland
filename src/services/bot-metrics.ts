@@ -91,7 +91,7 @@ export class BotMetrics {
   private readonly hHoldSec = this.registry.histogram(
     'polyland_hold_seconds',
     'Time from fire to exit/settlement, in seconds',
-    ['category', 'exit_reason'],
+    ['category', 'exitReason'],   // camelCase to match the other histograms' label style
     { buckets: POLYLAND_BUCKETS.HOLD_SECONDS },
   );
   // Operation latency — drift check, ledger reserve, exit pass. Sits

@@ -1117,6 +1117,14 @@ export class BasketQuorumService {
           console.warn('[BasketQuorum][exit] posMachine exit failed:', e instanceof Error ? e.message : e);
         }
         this.recordSettledTrade(pnl, Date.now(), 'SELL');
+        // Feed the Prometheus histogram with hold duration + exit reason.
+        if (this.botMetrics && pos.firedAt) {
+          this.botMetrics.observeHold({
+            category: String(pos.basketCategory ?? 'unknown'),
+            exitReason: reason,
+            holdSeconds: Math.max(0, (Date.now() - pos.firedAt) / 1000),
+          });
+        }
         signalAuditStore.markExited(pos.conditionId, bestBid, reason, pos.outcome);
         this.openPositions.delete(tokenId);
         // Release the cost basis back to the basket slice (same as resolution).
@@ -1579,6 +1587,16 @@ export class BasketQuorumService {
       this.stats.quorumFired++;
       this.stats.executed++;
       this._schedulePersist();
+      // Feed the Prometheus histogram with the entry price. `decision.value.price`
+      // is the audited price (the consensus/limit price before slippage) — that's
+      // the entry-price cluster the funnel mean cannot show.
+      if (this.botMetrics) {
+        this.botMetrics.observeEntryPrice(
+          String(signal.category ?? 'unknown'),
+          String(basket?.name ?? 'all'),
+          Number(decision.value.price ?? 0),
+        );
+      }
     } else {
       this.stats.failed++;
     }
@@ -1841,6 +1859,22 @@ export class BasketQuorumService {
       // PT4: feed the kill switch — per-basket settled outcomes.
       if (this.riskManager && sig.side === 'BUY') {
         this.riskManager.recordBasketOutcome(sig.basket, sigResolved === 1);
+      }
+      // Feed the Prometheus histogram with realized PnL per share, segmented
+      // by outcome (won|pending|lost) + category + side. This is the
+      // distribution shape the funnel mean cannot show.
+      if (this.botMetrics && typeof sig.pricePaid === 'number' && sig.pricePaid > 0) {
+        const won = sigResolved === 1;
+        const entryPrice = sig.pricePaid;
+        const pnlPerShare = sig.side === 'BUY'
+          ? (won ? 1 - entryPrice : -entryPrice)
+          : (won ? entryPrice - 1 : entryPrice);
+        this.botMetrics.observePnl({
+          category: String(sig.basket ?? 'unknown'),
+          outcome: won ? 'won' : 'lost',
+          side: sig.side,
+          pnlPerShare,
+        });
       }
     }
     if (!anySettled) return;
