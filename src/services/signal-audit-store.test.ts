@@ -98,6 +98,19 @@ describe('SignalAuditStore realized-edge math', () => {
     expect(ids.sort()).toEqual(['cond-1', 'cond-2']);
   });
 
+  it('rolls up settled signals by exit reason and attribution dimensions', () => {
+      // feePerShare pinned to 0 so the rollup asserts grouping + per-share P&L
+      // semantics, not fee math (dynamic fee is covered by its own test).
+      const a = mkFire(store, { conditionId: 'a', side: 'BUY', pricePaid: 0.4, size: 2, feePerShare: 0, category: 'crypto', tier: 'T1', entrySignal: 'momentum', signalAttribution: 'whale' });
+      const b = mkFire(store, { conditionId: 'b', side: 'SELL', pricePaid: 0.6, size: 4, feePerShare: 0, category: 'crypto', tier: 'T1', entrySignal: 'momentum', signalAttribution: 'whale' });
+      store.markExited('a', 0.7, 'EDGE_TP');
+      store.markExited('b', 0.5, 'EMERGENCY');
+      expect(store.getAttributionRollups()).toEqual([
+              { key: 'category=crypto|tier=T1|side=BUY|ageBucket=unknown|exitReason=EDGE_TP|entrySignal=momentum|signalAttribution=whale', count: 1, totalPerSharePnl: expect.closeTo(0.3, 6), meanPerSharePnl: expect.closeTo(0.3, 6), wins: 1, losses: 0, sampleSize: 1 },
+              { key: 'category=crypto|tier=T1|side=SELL|ageBucket=unknown|exitReason=EMERGENCY|entrySignal=momentum|signalAttribution=whale', count: 1, totalPerSharePnl: expect.closeTo(-0.1, 6), meanPerSharePnl: expect.closeTo(-0.1, 6), wins: 0, losses: 1, sampleSize: 1 },
+            ]);
+    });
+
   it('uses fee-math dynamic fee by default (not the legacy flat 0.003)', () => {
     const id = mkFire(store, { pricePaid: 0.5 });
     const s = store.getSignal(id)!;

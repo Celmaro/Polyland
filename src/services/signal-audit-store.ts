@@ -30,6 +30,16 @@ import type { StateStore } from './state-store.js';
 export type SignalSide = 'BUY' | 'SELL';
 export type SignalOutcome = 'won' | 'lost' | 'pending';
 
+export interface AttributionRollup {
+  key: string;
+  count: number;
+  totalPerSharePnl: number;
+  meanPerSharePnl: number;
+  wins: number;
+  losses: number;
+  sampleSize: number;
+}
+
 export interface FiredSignal {
   id: string;
   conditionId: string;
@@ -51,6 +61,11 @@ export interface FiredSignal {
   exitPrice?: number;    // best bid at exit
   exitReason?: string;   // EDGE_TP | LATE_TP | EMERGENCY | REVERSE_QUORUM | MIRROR_EXIT | KILL_SWITCH
   cluster: string;       // = conditionId for clustering
+  category?: string;
+  tier?: string;
+  entrySignal?: string;
+  signalAttribution?: string;
+  ageBucket?: string;
 }
 
 /** Summary stats exposed to logFunnel() */
@@ -157,6 +172,10 @@ export class SignalAuditStore {
     basket: string;
     wallets: string[];
     feePerShare?: number;   // optional: the taker fee the execution gate used
+    category?: string;
+    tier?: string;
+    entrySignal?: string;
+    signalAttribution?: string;
   }): string {
     const id = `${params.conditionId}-${params.outcome}-${Date.now()}-${nextFireSeq()}`;
     const impliedProb = params.side === 'BUY' ? params.pricePaid : (1 - params.pricePaid);
@@ -180,6 +199,10 @@ export class SignalAuditStore {
       wallets: params.wallets,
       firedAt: Date.now(),
       cluster: params.conditionId,
+      category: params.category,
+      tier: params.tier,
+      entrySignal: params.entrySignal,
+      signalAttribution: params.signalAttribution,
     };
 
     this.pruneOldSignals();
@@ -389,6 +412,33 @@ export class SignalAuditStore {
       clusterCount: clusters.size,
       brierScore: Math.round(brierScore * 10000) / 10000,
     };
+  }
+
+  /** Deterministic settled P&L rollups by exit and signal attribution dimensions. */
+  getAttributionRollups(): AttributionRollup[] {
+    const groups = new Map<string, AttributionRollup>();
+    for (const s of Object.values(this.signals).filter(signal => signal.settledAt !== undefined)) {
+      const ageBucket = s.ageBucket ?? 'unknown';
+      const key = [
+        `category=${s.category ?? 'unknown'}`,
+        `tier=${s.tier ?? 'unknown'}`,
+        `side=${s.side}`,
+        `ageBucket=${ageBucket}`,
+        `exitReason=${s.exitReason ?? 'resolution'}`,
+        `entrySignal=${s.entrySignal ?? 'unknown'}`,
+        `signalAttribution=${s.signalAttribution ?? 'unknown'}`,
+      ].join('|');
+      const pnl = s.size > 0 ? (s.realizedEdge ?? 0) / s.size : 0;
+      const row = groups.get(key) ?? { key, count: 0, totalPerSharePnl: 0, meanPerSharePnl: 0, wins: 0, losses: 0, sampleSize: 0 };
+      row.count += 1;
+      row.totalPerSharePnl += pnl;
+      row.sampleSize += 1;
+      if (pnl > 0) row.wins += 1;
+      else if (pnl < 0) row.losses += 1;
+      row.meanPerSharePnl = row.totalPerSharePnl / row.sampleSize;
+      groups.set(key, row);
+    }
+    return [...groups.values()].sort((a, b) => a.key.localeCompare(b.key));
   }
 
   /** Returns all settled signals in the rolling window, for export/debugging. */
