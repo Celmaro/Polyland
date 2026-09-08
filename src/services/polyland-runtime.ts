@@ -11,6 +11,8 @@ import { signalAuditStore, SignalAuditStore, setBonferroniGroups } from './signa
 import { AntiSniperGuard } from '../utils/anti-sniper.js';
 import { ChainlinkTwapOracle } from './chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './clob-market-ws.js';
+import { reconcileDryRunOrders } from './reconciliation.js';
+import type { OrderLifecycleRecord } from './state-store.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
 import { TradeDetector, FileSeenTradeLedger } from './trade-detector.js';
@@ -27,7 +29,7 @@ export interface PolylandRuntimeConfig {
   basketRisk?: import('./basket-risk.js').BasketRiskConfig;
   paperExploration?: boolean;
 }
-export interface RuntimeStateSnapshot { startTime: number; dailyPnL: number; totalPnL: number; monthlyPnL: number; consecutiveLosses: number; consecutiveWins: number; currentCapital: number; peakCapital: number; currentDrawdown: number; permanentlyHalted: boolean; isPaused: boolean; }
+export interface RuntimeStateSnapshot { startTime: number; dailyPnL: number; totalPnL: number; monthlyPnL: number; consecutiveLosses: number; consecutiveWins: number; currentCapital: number; peakCapital: number; currentDrawdown: number; permanentlyHalted: boolean; isPaused: boolean; reconciled: boolean; }
 type ScreeningConfig = Record<string, unknown>;
 export class PolylandRuntime {
   private quorum: BasketQuorumService | null = null;
@@ -45,7 +47,7 @@ export class PolylandRuntime {
   private readonly startedAt = Date.now();
   private readonly snapshot: RuntimeStateSnapshot;
   constructor(private readonly sdk: PolymarketSDK, private readonly config: PolylandRuntimeConfig, private readonly screeningConfig: ScreeningConfig, private readonly quorumConfig: BasketQuorumConfig, private readonly onSettledTrade?: (pnl: number) => void) {
-    this.snapshot = { startTime: this.startedAt, dailyPnL: 0, totalPnL: 0, monthlyPnL: 0, consecutiveLosses: 0, consecutiveWins: 0, currentCapital: config.capital.totalUsd, peakCapital: config.capital.totalUsd, currentDrawdown: 0, permanentlyHalted: false, isPaused: false };
+    this.snapshot = { startTime: this.startedAt, dailyPnL: 0, totalPnL: 0, monthlyPnL: 0, consecutiveLosses: 0, consecutiveWins: 0, currentCapital: config.capital.totalUsd, peakCapital: config.capital.totalUsd, currentDrawdown: 0, permanentlyHalted: false, isPaused: false, reconciled: false };
   }
   async start(): Promise<void> {
     if (!this.config.smartMoney.enabled) return;
@@ -71,6 +73,33 @@ export class PolylandRuntime {
     this.tradeDetector = new TradeDetector(this.tradeSeen, { minNotional: 1 });
     this.quorum = new BasketQuorumService(this.sdk.tradingService, this.quorumConfig); this.quorum.setRiskManager(this.risk); if (this.config.botMetrics) this.quorum.setBotMetrics(this.config.botMetrics); if (this.config.independence) this.quorum.setIndependenceSettings(this.config.independence); if (this.config.basketRisk) this.quorum.setBasketRiskConfig(this.config.basketRisk); this.quorum.setPaperExplorationMode(this.config.paperExploration ?? false); this.quorum.setGammaApi(this.sdk.gammaApi); this.quorum.setDecisionLedger(this.ledger); this.quorum.setSpecializationThresholds(Number(this.screeningConfig.minCategoryTrades ?? 3), Number(this.screeningConfig.minCategoryWinRate ?? 0.58)); this.quorum.startExitLadder(); this.quorum.onSettledTrade = p => { this.recordSettled(p); this.onSettledTrade?.(p); };
     if (process.env.ANTI_SNIPER_ENABLED === 'true') this.quorum.setAntiSniper(new AntiSniperGuard(null));
+    // ---- P0-5/P0-7: restart recovery + reconciliation gate ----
+    // Restore open positions from the durable snapshot so the exit ladder
+    // resumes them, then reconcile durable order records. Copy decisions stay
+    // blocked (no baskets seeded, execution gate armed) until reconciliation
+    // succeeds — the audit's settled-vs-risk restart desync bug class.
+    this.quorum.onPositionsSnapshot = (records) => {
+      void this.stateStore?.save({ positions: records as never }).catch((err: unknown) => {
+        console.warn('[PolylandRuntime] positions snapshot persist failed:', err instanceof Error ? err.message : err);
+      });
+    };
+    const persistedState = await this.stateStore.load();
+    const restoredPositions = (Array.isArray(persistedState?.positions) ? persistedState.positions : []) as Array<Record<string, unknown>>;
+    this.quorum.restoreOpenPositions(restoredPositions as never[]);
+    const orders = (Array.isArray(persistedState?.orders) ? persistedState.orders : []) as OrderLifecycleRecord[];
+    const reconciliation = reconcileDryRunOrders({
+      orders,
+      positionIds: new Set(restoredPositions.map((p) => String((p as Record<string, unknown>).tokenId))),
+    });
+    if (reconciliation.resolved.length > 0) {
+      void this.stateStore?.save({ orders: reconciliation.resolved as never }).catch(() => undefined);
+    }
+    this.quorum.setReconciled(reconciliation.ok);
+    this.snapshot.reconciled = reconciliation.ok;
+    if (!reconciliation.ok) {
+      console.warn(`[PolylandRuntime] RECONCILIATION BLOCKED: ${reconciliation.error} — no copy decisions until resolved`);
+    }
+
     if (process.env.TWAP_ENABLED === 'true') { const twap = new ChainlinkTwapOracle({ autoReconnect: true, reconnectDelayMs: 3000, pingIntervalMs: 5000, maxStalenessMs: 30000 }); this.quorum.setTwapOracle(twap); void twap.connect(); }
     const buffer: SmartMoneyTrade[] = []; this.tradeSub = this.sdk.smartMoney.subscribeSmartMoneyTrades(t => {
       // Replacement detection layer: durable identity dedup + provenance gate.
@@ -92,7 +121,13 @@ export class PolylandRuntime {
     let screened: any[] | null = null; try { const cached = JSON.parse(await readFile('./data/wallet-screening.json', 'utf8')); if (cached.cacheKey === key && Date.now() - cached.savedAt < 21600000) screened = cached.screened; } catch {}
     const persisted = await this.stateStore.load(); if (!screened && Array.isArray(persisted?.walletUniverse)) screened = persisted.walletUniverse as any[];
     if (!screened) screened = await screening.score(candidates);
-    await this.seed(screened, key); for (const t of buffer) this.quorum.onTrade(t); buffer.length = 0;
+    // P0-7: do not seed baskets (and thus do not process buffered copy
+    // candidates) until startup reconciliation has succeeded.
+    if (this.snapshot.reconciled) {
+      await this.seed(screened, key); for (const t of buffer) this.quorum.onTrade(t); buffer.length = 0;
+    } else {
+      console.warn(`[PolylandRuntime] HOLDING ${buffer.length} buffered trade(s) — reconciliation required before copy decisions resume`);
+    }
     this.funnelTimer = setInterval(() => {
       this.quorum?.logFunnel();
       const metrics = this.config.botMetrics;
@@ -132,6 +167,8 @@ export class PolylandRuntime {
       if (settledCount > 0) console.log(`[PolylandRuntime] snapshot rebuilt from ${settledCount} settled audit signals (streak ${this.snapshot.consecutiveWins}W/${this.snapshot.consecutiveLosses}L)`);
     }
     getFunnelStats(): QuorumStats | null { return this.quorum?.getStats() ?? null; } getAuditStats() { return signalAuditStore.getStats(); } getStateSnapshot(): RuntimeStateSnapshot { return { ...this.snapshot, permanentlyHalted: this.risk ? !this.risk.canTrade() : false }; }
+    /** P0-7: current reconciliation state (true = copy decisions allowed). */
+    isReconciled(): boolean { return this.snapshot.reconciled; }
     /** Phase 5 gate: operator-facing go-live readiness from settled paper signals. */
     getGoLiveReport(): GoLiveReport {
       const settled = signalAuditStore.getSettledSignals().map((s) => ({

@@ -949,6 +949,54 @@ export class BasketQuorumService {
   private exitTimer: ReturnType<typeof setInterval> | null = null;
   /** Replacement exit layer: position lifecycle state machine. */
   private readonly posMachine = new PositionStateMachine();
+  /** P0-7: copy decisions stay blocked until startup reconciliation succeeds. */
+  private reconciled = false;
+  /** P0-5: called with the current open-position records whenever they change. */
+  onPositionsSnapshot?: (records: unknown[]) => void;
+
+  /** P0-7: gate copy decisions on startup reconciliation success. */
+  setReconciled(ok: boolean): void {
+    this.reconciled = ok;
+    if (!ok) console.warn('[BasketQuorum] RECONCILIATION PENDING — copy decisions blocked');
+    else console.log('[BasketQuorum] reconciliation OK — copy decisions enabled');
+  }
+
+  isReconciled(): boolean { return this.reconciled; }
+
+  /**
+   * Serialize open copy positions for durable restore (P0-5). Each record
+   * carries everything trackOpenPosition needs to resume the lifecycle.
+   */
+  getOpenPositionRecords(): Array<{
+    tokenId: string; usdc: number; size: number; entryPrice: number;
+    marketSlug: string; outcome: string; conditionId: string;
+    basketName: string; basketCategory: MarketCategory;
+    signalId?: string; quorumWallets?: string[];
+  }> {
+    return [...this.openPositions.entries()].map(([tokenId, p]) => ({ ...p, tokenId }));
+  }
+
+  /** Restore open positions from durable records (P0-5) before copying resumes. */
+  restoreOpenPositions(records: Array<{
+    tokenId: string; usdc: number; size: number; entryPrice: number;
+    marketSlug: string; outcome: string; conditionId: string;
+    basketName: string; basketCategory: MarketCategory;
+    signalId?: string; quorumWallets?: string[];
+  }>): number {
+    let restored = 0;
+    for (const rec of records) {
+      if (!rec || typeof rec.tokenId !== 'string' || !(rec.size > 0) || !rec.conditionId) continue;
+      try {
+        this.trackOpenPosition(rec.tokenId, rec.usdc ?? 0, rec.size, rec.entryPrice, rec.marketSlug, rec.outcome, rec.conditionId, rec.basketName, (rec.basketCategory ?? 'other') as MarketCategory, rec.signalId, rec.quorumWallets);
+        restored++;
+      } catch (e) {
+        console.warn(`[BasketQuorum][restore] failed for ${rec.tokenId}:`, e instanceof Error ? e.message : e);
+      }
+    }
+    if (restored > 0) console.log(`[BasketQuorum][restore] recovered ${restored} open position(s) from durable state`);
+    return restored;
+  }
+
   /** Start the exit ladder loop (15s). Idempotent. */
   startExitLadder(): void {
     if (this.exitTimer) return;
@@ -987,6 +1035,7 @@ export class BasketQuorumService {
     } catch (e) {
       console.warn('[BasketQuorum][exit] posMachine open failed:', e instanceof Error ? e.message : e);
     }
+    try { this.onPositionsSnapshot?.(this.getOpenPositionRecords()); } catch { /* non-fatal */ }
   }
   /**
    * Unified exit pass — items 1–5 of the exit rework.
@@ -1074,7 +1123,7 @@ export class BasketQuorumService {
         const reason = (exitDecision.reason ?? 'EXIT').toUpperCase();
         // ------------------------------------------------------------------------
         const sellSize = exitDecision.quantity;
-        if (sellSize <= 0) { this.openPositions.delete(tokenId); continue; }
+        if (sellSize <= 0) { this.openPositions.delete(tokenId); try { this.onPositionsSnapshot?.(this.getOpenPositionRecords()); } catch { /* non-fatal */ } continue; }
         const pnl = (bestBid - pos.entryPrice) * sellSize;
         if (this.config.dryRun) {
           console.log(
@@ -1130,6 +1179,7 @@ export class BasketQuorumService {
         }
         signalAuditStore.markExited(pos.conditionId, bestBid, reason, pos.outcome);
         this.openPositions.delete(tokenId);
+        try { this.onPositionsSnapshot?.(this.getOpenPositionRecords()); } catch { /* non-fatal */ }
         // Release the cost basis back to the basket slice (same as resolution).
         const spent = this.basketSpend.get(pos.basketCategory) ?? 0;
         this.basketSpend.set(pos.basketCategory, Math.max(0, spent - pos.usdc));
@@ -1392,6 +1442,12 @@ export class BasketQuorumService {
     // Fee rate: fetch-and-cache per conditionId before any edge math. Without
     // this the cache defaults to 0 and every edge/exit calculation runs
     // fee-free (systematically optimistic by the full taker fee).
+    if (!this.reconciled) {
+      this.stats.quorumSkippedRiskHalt = (this.stats.quorumSkippedRiskHalt ?? 0) + 1;
+      console.warn(`[BasketQuorum] SKIP reconcile-gate: ${signal.marketSlug} — startup reconciliation incomplete`);
+      this.planDecision(this.ledgerDecision(trade, 'execution', false, 'reconcile'));
+      return;
+    }
     if (signal.conditionId && !this.feeRateCache.has(signal.conditionId)) {
       try {
         const bps = await this.tradingService.getMarketFeeRateBps(signal.conditionId);
