@@ -4,7 +4,7 @@ export type RejectReason =
   | 'stale' | 'thin' | 'cooldown' | 'restart_dedup' | 'risk'
   | 'bankroll' | 'anti_sniper' | 'twap' | 'drift' | 'edge'
   | 'liquidity' | 'min_size' | 'execution_failed' | 'quorum_near_miss'
-  | 'quorum_reached' | 'executed';
+  | 'quorum_reached' | 'executed' | 'stale_quote';
 export interface CandidateDecision {
   id: string;
   wallet: string;
@@ -69,6 +69,8 @@ export interface ConsensusSignal {
   winRate: number;
   /** Token ID used to fetch the live CLOB book for follow-up telemetry. */
   tokenId?: string;
+  /** Timestamp (unix ms) when the consensus quote was observed; gates stale-quote rejection. */
+  observedAt?: number;
 }
 export interface ExecutionDecision {
   signal: ConsensusSignal;

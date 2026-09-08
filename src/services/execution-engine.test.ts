@@ -1,7 +1,7 @@
 /**
  * ExecutionEngine unit tests — the typed post-consensus execution boundary.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ExecutionEngine, type ExecutionEngineConfig, type ExecutionEngineDeps } from './execution-engine.js';
 import type { ConsensusSignal, ExecutionDecision, PipelineDecision } from './pipeline-types.js';
 import type { TradingService } from './trading-service.js';
@@ -133,5 +133,60 @@ describe('ExecutionEngine', () => {
     const second = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
     expect(second.ok).toBe(true);
     expect(calls).toBe(2);
+  });
+});
+
+describe('ExecutionEngine stale-quote gating (P1)', () => {
+  const T0 = 1_700_000_000_000;
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('rejects a signal whose observed quote is older than maxQuoteAgeMs', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const engine = new ExecutionEngine(makeTrading(), null, makeDeps(), { ...CONFIG, maxQuoteAgeMs: 30_000 });
+    const stale: ConsensusSignal = { ...SIGNAL, observedAt: T0 - 60_000 };
+    const decision = await engine.evaluate(stale, TRADE, BASKET);
+    expect(decision.accepted).toBe(false);
+    if (!decision.accepted) expect(decision.reason).toBe('stale_quote');
+  });
+
+  it('accepts a signal observed within the quote TTL', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const engine = new ExecutionEngine(makeTrading(), null, makeDeps(), { ...CONFIG, maxQuoteAgeMs: 30_000 });
+    const fresh: ConsensusSignal = { ...SIGNAL, observedAt: T0 - 5_000 };
+    const decision = await engine.evaluate(fresh, TRADE, BASKET);
+    expect(decision.accepted).toBe(true);
+  });
+
+  it('treats signals without observedAt as legacy-fresh (no false block)', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    const engine = new ExecutionEngine(makeTrading(), null, makeDeps(), { ...CONFIG, maxQuoteAgeMs: 30_000 });
+    const decision = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(decision.accepted).toBe(true);
+  });
+
+  it('execute() on a stale signal does not reserve/spend and returns ok:false', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    let spent = 0;
+    let opened = 0;
+    const deps = makeDeps({
+      basketSpendAdd: (_c, amount) => { spent += amount; },
+      onPositionOpened: () => { opened++; },
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, maxQuoteAgeMs: 30_000 });
+    const stale: ConsensusSignal = { ...SIGNAL, observedAt: T0 - 60_000 };
+    const decision = await engine.evaluate(stale, TRADE, BASKET);
+    expect(decision.accepted).toBe(false);
+    // Direct execute() must also fail closed (defense in depth) — even when
+    // the decision object predates the staleness check.
+    const forced = { accepted: true, reason: 'edge', value: { signal: stale, amountUsd: 100, price: 0.6, dryRun: true } } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>;
+    const result = await engine.execute(forced, TRADE, BASKET);
+    expect(result.ok).toBe(false);
+    expect(spent).toBe(0);
+    expect(opened).toBe(0);
+    expect(engine.failed).toBe(1);
   });
 });

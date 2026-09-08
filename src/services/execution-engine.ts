@@ -14,6 +14,8 @@ export interface ExecutionEngineConfig {
   /** Absolute upper bound on entry price (0-1). Rejects buying near-certain
    * tickets (e.g. >0.85) where risk/reward is structurally bad. */
   maxEntryPrice?: number;
+  /** Max age (ms) of the consensus quote before it is stale-cancelled. Default 30s. */
+  maxQuoteAgeMs?: number;
 }
 export interface ExecutionEngineDeps {
   tickSizeFor: (conditionId: string) => number;
@@ -43,6 +45,10 @@ export class ExecutionEngine {
 
   async evaluate(signal: ConsensusSignal, trade: SmartMoneyTrade, basket: BasketConfig): Promise<PipelineDecision<ExecutionDecision>> {
     if (this.riskManager && (!this.riskManager.canTrade() || this.riskManager.isBasketKilled(basket.name))) return { accepted: false, reason: 'risk' };
+    const maxQuoteAge = this.config.maxQuoteAgeMs ?? 30_000;
+    if (signal.observedAt !== undefined && Date.now() - signal.observedAt > maxQuoteAge) {
+      return { accepted: false, reason: 'stale_quote', detail: `quote_age_ms=${Date.now() - signal.observedAt}` };
+    }
     const category = basket.category;
     const spent = this.deps.basketSpendGet(category);
     let amount = Math.min(signal.totalSize * this.config.sizeScale * signal.consensusPrice, this.config.maxSizePerTrade);
@@ -80,6 +86,14 @@ export class ExecutionEngine {
   async execute(decision: Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, trade?: SmartMoneyTrade, basket?: BasketConfig): Promise<{ ok: boolean; orderId?: string }> {
     const { signal, amountUsd, price } = decision.value;
     const category = basket?.category ?? signal.category;
+    // Stale-quote cancellation: never reserve/route on an expired quote
+    // even if evaluate() predates this call (defense in depth).
+    const maxQuoteAge = this.config.maxQuoteAgeMs ?? 30_000;
+    if (signal.observedAt !== undefined && Date.now() - signal.observedAt > maxQuoteAge) {
+      this.failed++;
+      console.warn(`[ExecutionEngine] SKIP stale quote: ${signal.marketSlug} age_ms=${Date.now() - signal.observedAt}`);
+      return { ok: false };
+    }
     const release = this.ledger.reserve(category, amountUsd, this.deps.basketSpendGet(category));
     if (!release) {
       // Bankroll saturation: make the invisible failure visible. The audit

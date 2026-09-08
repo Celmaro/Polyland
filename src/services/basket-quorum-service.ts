@@ -1316,6 +1316,7 @@ export class BasketQuorumService {
             side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
             totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
             tokenId: trade.tokenId,
+            observedAt: now,
           };
     // Schedule 1h and 24h follow-up price checks (whalewatch-style validation loop)
     this._scheduleFollowup(signal);
