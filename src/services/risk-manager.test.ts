@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -202,5 +202,99 @@ describe('RiskConfig startup validation (P2)', () => {
     expect(problems.some((p) => p.includes('maxConsecutiveLosses'))).toBe(true);
     expect(problems.some((p) => p.includes('lossSizingReduction'))).toBe(true);
     expect(problems.some((p) => p.includes('basketKillMinSamples'))).toBe(true);
+  });
+});
+
+describe('RiskManager time-bounded market/category locks (P1)', () => {
+  let risk: RiskManager;
+  const T0 = 1_700_000_000_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    risk = new RiskManager({}, 1000);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('registers a market lock with reason and expiry; expires after TTL', () => {
+    risk.lock('market', '0x123456', 'spike_reject', 60_000);
+    expect(risk.isLocked('market', '0x123456')).toBe(true);
+    vi.setSystemTime(T0 + 59_999);
+    expect(risk.isLocked('market', '0x123456')).toBe(true);
+    vi.setSystemTime(T0 + 60_001);
+    expect(risk.isLocked('market', '0x123456')).toBe(false);
+  });
+
+  it('is idempotent: duplicate lock of same scope/key/reason keeps one entry and extends expiry', () => {
+    risk.lock('category', 'crypto', 'spike_reject', 60_000);
+    vi.setSystemTime(T0 + 30_000);
+    risk.lock('category', 'crypto', 'spike_reject', 60_000);
+    expect(risk.activeLocks()).toHaveLength(1);
+    // expiry extended from the second lock's creation time
+    expect(risk.isLocked('category', 'crypto')).toBe(true);
+    vi.setSystemTime(T0 + 60_001);
+    expect(risk.isLocked('category', 'crypto')).toBe(true);
+    vi.setSystemTime(T0 + 90_001);
+    expect(risk.isLocked('category', 'crypto')).toBe(false);
+  });
+
+  it('unlock is idempotent and removes only the targeted lock', () => {
+    risk.lock('market', 'm1', 'a', 60_000);
+    risk.lock('market', 'm2', 'b', 60_000);
+    risk.unlock('market', 'm1');
+    risk.unlock('market', 'm1'); // no-op, must not throw
+    expect(risk.isLocked('market', 'm1')).toBe(false);
+    expect(risk.isLocked('market', 'm2')).toBe(true);
+  });
+
+  it('prunes expired locks lazily on query', () => {
+    risk.lock('market', 'old', 'stale', 1_000);
+    vi.setSystemTime(T0 + 5_000);
+    risk.isLocked('market', 'old'); // triggers lazy prune
+    expect(risk.activeLocks()).toHaveLength(0);
+  });
+
+  it('keeps market/category/wallet scopes independent for the same key', () => {
+    risk.lock('market', 'crypto', 'a', 60_000);
+    risk.lock('category', 'crypto', 'b', 60_000);
+    risk.lock('wallet', 'crypto', 'c', 60_000);
+    expect(risk.activeLocks()).toHaveLength(3);
+    risk.unlock('market', 'crypto');
+    expect(risk.isLocked('category', 'crypto')).toBe(true);
+    expect(risk.isLocked('wallet', 'crypto')).toBe(true);
+  });
+
+  it('persists locks across restart and drops expired ones on restore', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'risk-lock-'));
+    try {
+      const stateFile = path.join(tmpDir, 'risk-state.json');
+      RiskManager.enablePersistence(stateFile);
+      const session1 = new RiskManager({}, 1000);
+      session1.lock('market', 'keep', 'reason', 60_000);
+      session1.lock('market', 'drop', 'reason', 1_000); // expired by restart time
+      session1.persistState();
+
+      vi.setSystemTime(T0 + 10_000);
+      const session2 = new RiskManager({}, 1000);
+      session2.loadPersistedState();
+      expect(session2.isLocked('market', 'keep')).toBe(true);
+      expect(session2.isLocked('market', 'drop')).toBe(false);
+      expect(session2.activeLocks()).toHaveLength(1);
+    } finally {
+      RiskManager.enablePersistence('');
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports active locks as a snapshot with reason and expiry', () => {
+    risk.lock('category', 'sports', 'adverse_market', 30_000);
+    const locks = risk.activeLocks();
+    expect(locks).toHaveLength(1);
+    expect(locks[0]).toMatchObject({
+      scope: 'category', key: 'sports', reason: 'adverse_market',
+      createdAt: T0, expiresAt: T0 + 30_000,
+    });
   });
 });

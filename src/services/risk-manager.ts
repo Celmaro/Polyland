@@ -190,6 +190,22 @@ export interface RiskSnapshot {
   consecutiveWins: number;
 }
 
+
+// ============================================================================
+// Time-bounded market/category/wallet locks (P1)
+// ============================================================================
+
+export type LockScope = 'market' | 'category' | 'wallet';
+
+/** A named, expiring lock. Always has a reason and an absolute expiry. */
+export interface RiskLock {
+  scope: LockScope;
+  key: string;
+  reason: string;
+  createdAt: number;   // unix ms
+  expiresAt: number;   // unix ms — after this the lock is inert (lazy-pruned)
+}
+
 // ============================================================================
 // RiskManager
 // ============================================================================
@@ -216,6 +232,8 @@ export class RiskManager {
   private _consecutiveWins = 0;
   private _sizeMultiplier = 1.0;
   private _haltedUntilMs: number | null = null;
+  /** Expiring market/category/wallet locks, keyed by `${scope}:${key}`. */
+  private locks = new Map<string, RiskLock>();
 
   // Session persistence (P6): survive restarts so a redeploy can't wipe a
   // daily-loss halt (KaustubhPatange/polymarket-trade-engine early-bird
@@ -313,6 +331,27 @@ export class RiskManager {
         }
       }
 
+
+      // Restore expiring locks; drop already-expired entries so a stale
+      // lock cannot resurrect across a restart.
+      if (Array.isArray(raw.locks)) {
+        const now = Date.now();
+        for (const l of raw.locks as RiskLock[]) {
+          if (
+            l && typeof l === 'object'
+            && (l.scope === 'market' || l.scope === 'category' || l.scope === 'wallet')
+            && typeof l.key === 'string' && typeof l.expiresAt === 'number'
+            && l.expiresAt > now
+          ) {
+            this.locks.set(`${l.scope}:${l.key}`, {
+              scope: l.scope, key: l.key,
+              reason: typeof l.reason === 'string' ? l.reason : 'restored',
+              createdAt: typeof l.createdAt === 'number' ? l.createdAt : now,
+              expiresAt: l.expiresAt,
+            });
+          }
+        }
+      }
       console.log(
         `[RiskManager] restored session state: realizedPnl=${this._realizedPnl.toFixed(2)} ` +
         `peak=${this._peakCapital.toFixed(2)} consecLosses=${this._consecutiveLosses} ` +
@@ -342,6 +381,7 @@ export class RiskManager {
         // Basket kill-switch state — a kill must survive restart.
         basketOutcomes: [...this.basketOutcomes.entries()].map(([k, v]) => [k, v.slice(-500)]),
         killedBaskets: [...this.killedBaskets],
+        locks: [...this.locks.values()],
       });
       const tmp = path + '.tmp';
       fs.writeFileSync(tmp, payload, 'utf8');
@@ -355,6 +395,58 @@ export class RiskManager {
   // ------------------------------------------------------------------------
   // Public API
   // ------------------------------------------------------------------------
+
+
+  // ------------------------------------------------------------------------
+  // Time-bounded locks (P1)
+  // ------------------------------------------------------------------------
+
+  /**
+   * Register (or refresh) an expiring lock for scope/key. Idempotent: a
+   * duplicate lock of the same scope+key updates the existing entry (expiry
+   * moves to `now + ttlMs`, reason overwritten). Never silently blacklists —
+   * the lock expires and the caller must hold evidence/reason.
+   */
+  lock(scope: LockScope, key: string, reason: string, ttlMs: number, now: number = Date.now()): void {
+    const mapKey = `${scope}:${key}`;
+    const existing = this.locks.get(mapKey);
+    if (existing) {
+      existing.reason = reason;
+      existing.expiresAt = Math.max(existing.expiresAt, now + ttlMs);
+      return;
+    }
+    this.locks.set(mapKey, { scope, key, reason, createdAt: now, expiresAt: now + ttlMs });
+    this.persistState();
+  }
+
+  /** Remove a lock. Idempotent — missing lock is a no-op. */
+  unlock(scope: LockScope, key: string): void {
+    if (this.locks.delete(`${scope}:${key}`)) this.persistState();
+  }
+
+  /** True while an unexpired lock exists for scope/key (lazy-prunes on read). */
+  isLocked(scope: LockScope, key: string, now: number = Date.now()): boolean {
+    const entry = this.locks.get(`${scope}:${key}`);
+    if (!entry) return false;
+    if (entry.expiresAt <= now) {
+      this.locks.delete(`${scope}:${key}`);
+      return false;
+    }
+    return true;
+  }
+
+  /** Drop all expired locks (called by queries; safe to call directly). */
+  pruneExpiredLocks(now: number = Date.now()): void {
+    for (const [key, entry] of this.locks) {
+      if (entry.expiresAt <= now) this.locks.delete(key);
+    }
+  }
+
+  /** Snapshot of currently-active (unexpired) locks, for logs/dashboard. */
+  activeLocks(now: number = Date.now()): RiskLock[] {
+    this.pruneExpiredLocks(now);
+    return [...this.locks.values()].map((l) => ({ ...l }));
+  }
 
   /**
    * Returns true if the bot is allowed to place a trade right now.
