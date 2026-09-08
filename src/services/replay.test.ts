@@ -5,7 +5,7 @@
  * new exit logic better than last week's?"
  */
 import { describe, it, expect } from 'vitest';
-import { replaySettlements, type ReplayConfig } from './replay.js';
+import { replaySettlements, REPLAY_DIAGNOSTIC_MODE, type ReplayConfig } from './replay.js';
 import type { FiredSignal } from './signal-audit-store.js';
 
 function sig(p: Partial<FiredSignal>): FiredSignal {
@@ -67,5 +67,13 @@ describe('replaySettlements', () => {
     const r = replaySettlements(sigs, { exitConfig: 'aggressive' } as ReplayConfig);
     // aggressive: tp=0.03 → simulated 0.03*10 = 0.3; recorded 1.5; delta = -1.2 (>0.05*10=0.5).
     expect(r.entries[0].slippageFlag).toBe(true);
+  });
+});
+
+describe('replay.ts quarantine (P0-2)', () => {
+  it('declares the diagnostic-only mode marker', () => {
+    // The naive replay must be explicitly labeled non-evidence so operators
+    // and tooling can never mistake its output for go-live evidence.
+    expect(REPLAY_DIAGNOSTIC_MODE).toBe('DIAGNOSTIC_ONLY');
   });
 });

@@ -15,7 +15,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { replaySettlements, type ReplayConfig } from './replay.js';
+import { replaySettlements, REPLAY_DIAGNOSTIC_MODE, type ReplayConfig } from './replay.js';
 import { replayFingerprint, ReplayFileCache } from './replay-cache.js';
 import type { FiredSignal } from './signal-audit-store.js';
 

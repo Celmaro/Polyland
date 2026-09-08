@@ -1,4 +1,22 @@
 /**
+ * ============================================================================
+ * QUARANTINED — DIAGNOSTIC ONLY. NOT GO-LIVE EVIDENCE.
+ * ============================================================================
+ * This module is the NAIVE diagnostic replay: it invents exit prices from
+ * entry price + final resolution (won ? entry+takeProfit : entry-stopLoss) and
+ * has no historical book path. It must NEVER feed the go-live gate.
+ *
+ * The go-live evidence path is: SignalAuditStore.getSettledSignals() ->
+ * computeGoLiveReport() in go-live-gate.ts (real fills, fees, partials).
+ * The trustworthy replay path is ReplayEvaluator (replay-evaluator.ts),
+ * which prices fills from decision-time books through the shared fill-engine.
+ *
+ * Only the diagnostic CLI (replay-cli.ts) imports this module. Do not import
+ * it from the runtime, the gate, or any evidence-producing path.
+ * ============================================================================
+ */
+export const REPLAY_DIAGNOSTIC_MODE = 'DIAGNOSTIC_ONLY' as const;
+/**
  * replay.ts — backtest-replay over historical fired signals.
  *
  * Why: the audit identified 60%+ of losses as basket-design / exit-design
