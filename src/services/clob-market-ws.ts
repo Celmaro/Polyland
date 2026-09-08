@@ -74,6 +74,8 @@ interface ClobSubscribeMessage {
 
 interface ClobBookUpdate {
   asset_id: string;
+  sequence?: unknown;
+  seq?: unknown;
   // The CLOB has emitted both tuple levels and object levels across message
   // versions: [price, size] or { price, size }.
   bids?: Array<[string, string] | { price: string; size: string }>;
@@ -135,11 +137,26 @@ export class ClobMarketWsService {
   private sequenceGaps = 0;
   private resyncs = 0;
   private invalidBooks = 0;
+  /** Last seen sequence per asset (P0-6 gap detection). */
+  private sequenceByAsset = new Map<string, number>();
+  /** Assets whose feed has EVER carried a sequence (feeds without it are never false-invalidated). */
+  private sequencedAssets = new Set<string>();
   /** Overridable buffered amount for tests; fallback reads the live socket. */
   private bufferedAmountBytes = 0;
 
   constructor(options: ClobMarketWsOptions = {}) {
     this.options = options;
+  }
+
+  /** Clear an asset's book state and request a fresh snapshot (P0-6). */
+  invalidateBook(assetId: string, reason: BookInvalidationReason, expected?: number, received?: number): void {
+    this.bookLevels.delete(assetId);
+    this.bookMids.delete(assetId);
+    this.sequenceByAsset.delete(assetId);
+    this.invalidBooks = Math.min(Number.MAX_SAFE_INTEGER, this.invalidBooks + 1);
+    this.resyncs = Math.min(Number.MAX_SAFE_INTEGER, this.resyncs + 1);
+    try { this.options.onResync?.({ assetId, reason, expected, received }); }
+    catch (err) { console.error('[ClobMarketWs] resync observer error', err); }
   }
 
   /**
@@ -503,8 +520,33 @@ export class ClobMarketWsService {
     }
   }
 
-  private handleBookUpdate(b: ClobBookUpdate): void {
+  handleBookUpdate(b: ClobBookUpdate): void {
     const { asset_id, bids, asks } = b;
+    // ---- P0-6 sequence-gap detection (safe semantics) ----
+    const rawSequence = b.sequence ?? b.seq;
+    let sequence: number | null = null;
+    if (typeof rawSequence === 'number' && Number.isSafeInteger(rawSequence) && rawSequence >= 0) {
+      sequence = rawSequence;
+    } else if (typeof rawSequence === 'string' && /^\d+$/.test(rawSequence)) {
+      sequence = Number(rawSequence);
+    }
+    if (sequence !== null) {
+      this.sequencedAssets.add(asset_id);
+      const previous = this.sequenceByAsset.get(asset_id);
+      let invalidated = false;
+      if (previous !== undefined && sequence !== previous + 1) {
+        this.sequenceGaps = Math.min(Number.MAX_SAFE_INTEGER, this.sequenceGaps + 1);
+        this.invalidateBook(asset_id, 'sequence_gap', previous + 1, sequence);
+        invalidated = true;
+      }
+      // Do NOT re-seed the baseline from a gapped message: the book was
+      // invalidated and the next valid update must re-establish it.
+      if (!invalidated) this.sequenceByAsset.set(asset_id, sequence);
+    } else if (this.sequencedAssets.has(asset_id)) {
+      // This asset previously carried sequences; a missing/malformed one is a
+      // feed-integrity break -> invalidate conservatively.
+      this.invalidateBook(asset_id, rawSequence === undefined ? 'missing_sequence' : 'malformed_sequence');
+    }
     const levels = this.bookLevels.get(asset_id) ?? { bids: new Map<number, number>(), asks: new Map<number, number>() };
     this.bookLevels.set(asset_id, levels);
     const applyLevels = (
