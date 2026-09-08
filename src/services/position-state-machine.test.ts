@@ -181,3 +181,40 @@ describe('transition validation', () => {
     expect(transition('OPEN', { type: 'CANCEL' })).toEqual({ ok: true, state: 'PLANNED' });
   });
 });
+
+describe('PositionStateMachine idempotent lifecycle (P0-4)', () => {
+  it('treats a duplicate FILL delivery with the same eventId as a no-op', () => {
+    const m = new PositionStateMachine();
+    m.open(pos({ id: 'p1', shares: 100 })); // PLANNED 100
+    const first = m.apply('p1', { type: 'FILL', shares: 40, state: 'partial', eventId: 'ev-1' });
+    expect(first).toBe('PARTIAL');
+    // FILL adds filled shares to the planned baseline: 100 + 40.
+    expect(m.get('p1')!.shares).toBe(140);
+    // Same event delivered again (at-least-once transport replay) → no-op.
+    expect(() => m.apply('p1', { type: 'FILL', shares: 40, state: 'partial', eventId: 'ev-1' })).not.toThrow();
+    expect(m.get('p1')!.shares).toBe(140);
+  });
+
+  it('applies distinct eventIds even with identical payloads', () => {
+    const m = new PositionStateMachine();
+    m.open(pos({ id: 'p1', shares: 100 }));
+    m.apply('p1', { type: 'FILL', shares: 40, state: 'partial', eventId: 'ev-1' });
+    m.apply('p1', { type: 'FILL', shares: 20, state: 'partial', eventId: 'ev-2' });
+    expect(m.get('p1')!.shares).toBe(160);
+    expect(m.get('p1')!.state).toBe('PARTIAL');
+  });
+
+  it('restores positions and exposes a snapshot for durable recovery', () => {
+    const m = new PositionStateMachine();
+    m.open(pos({ id: 'p1', shares: 100 }));
+    m.apply('p1', { type: 'FILL', shares: 100, state: 'full', eventId: 'ev-1' });
+    expect(m.get('p1')!.state).toBe('OPEN'); // full fill from PLANNED
+    const snap = m.all();
+    expect(snap).toHaveLength(1);
+
+    const m2 = new PositionStateMachine();
+    m2.restore(snap);
+    expect(m2.get('p1')!.state).toBe('OPEN');
+    expect(m2.get('p1')!.shares).toBe(200);
+  });
+});

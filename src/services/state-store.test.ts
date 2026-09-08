@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { JsonStateStore } from './state-store.js';
+import { JsonStateStore , mergeOrderLifecycle } from './state-store.js';
 
 describe('JsonStateStore', () => {
   it('round-trips namespaced state across instances', async () => {
@@ -49,5 +49,28 @@ describe('JsonStateStore', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('OrderLifecycleRecord merge (P0-4 durable idempotency)', () => {
+  it('keeps the newer record for the same order id', () => {
+    const merged = mergeOrderLifecycle([
+      { id: 'o1', positionId: 'p1', status: 'PENDING', updatedAt: 100 },
+    ], { id: 'o1', positionId: 'p1', status: 'FILLED', updatedAt: 200 });
+    expect(merged).toHaveLength(1);
+    expect(merged[0].status).toBe('FILLED');
+  });
+  it('ignores an older or equal-timestamp update (idempotent replay)', () => {
+    const merged = mergeOrderLifecycle([
+      { id: 'o1', positionId: 'p1', status: 'FILLED', updatedAt: 200 },
+    ], { id: 'o1', positionId: 'p1', status: 'PENDING', updatedAt: 100 });
+    expect(merged[0].status).toBe('FILLED');
+    const sameTs = mergeOrderLifecycle([merged[0]], { id: 'o1', positionId: 'p1', status: 'CANCELLED', updatedAt: 200 });
+    expect(sameTs[0].status).toBe('CANCELLED'); // >= keeps incoming on tie
+  });
+  it('appends distinct orders', () => {
+    const merged = mergeOrderLifecycle([], { id: 'o1', positionId: 'p1', status: 'UNKNOWN', updatedAt: 100 });
+    const merged2 = mergeOrderLifecycle(merged, { id: 'o2', positionId: 'p2', status: 'FILLED', updatedAt: 100 });
+    expect(merged2.map(o => o.id).sort()).toEqual(['o1', 'o2']);
   });
 });

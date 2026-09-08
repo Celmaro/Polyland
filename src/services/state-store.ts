@@ -13,13 +13,38 @@ export interface PolylandState {
   quorum?: unknown;
   risk?: unknown;
   positions?: unknown;
+  /** Durable order lifecycle records, keyed by client/order id. */
+  orders?: unknown;
   screening?: unknown;
   audit?: unknown;
+}
+
+export interface OrderLifecycleRecord {
+  id: string;
+  positionId: string;
+  status: 'PENDING' | 'FILLED' | 'PARTIAL' | 'CANCELLED' | 'UNKNOWN' | 'RECONCILIATION_REQUIRED';
+  updatedAt: number;
+  clientOrderId?: string;
+}
+
+export interface ReconciliationResult {
+  ok: boolean;
+  checkedAt: number;
+  positions: number;
+  pendingOrders: number;
+  error?: string;
 }
 
 export interface StateStore {
   load(): Promise<PolylandState | null>;
   save(patch: Partial<Omit<PolylandState, 'version' | 'updatedAt'>>): Promise<void>;
+}
+
+export function mergeOrderLifecycle(existing: OrderLifecycleRecord[] = [], incoming: OrderLifecycleRecord): OrderLifecycleRecord[] {
+  const map = new Map(existing.map(order => [order.id, order]));
+  const prior = map.get(incoming.id);
+  if (!prior || incoming.updatedAt >= prior.updatedAt) map.set(incoming.id, incoming);
+  return [...map.values()];
 }
 
 export class JsonStateStore implements StateStore {

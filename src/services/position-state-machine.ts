@@ -47,14 +47,14 @@ export interface Position {
 }
 
 export type ExitEvent =
-  | { type: 'OPENED'; shares: number; price: number; time: number }
-  | { type: 'FILL'; shares?: number; state?: 'partial' | 'full' | 'failed' | 'unknown' }
-  | { type: 'EXIT'; shares: number; reason: string; time: number }
-  | { type: 'LEADER_EXIT'; leaderShares: number; time: number }
-  | { type: 'RESOLVED'; winningTokenId: string; time: number }
-  | { type: 'REDEEMED'; time: number }
-  | { type: 'RISK_HALT'; reason: string; time: number }
-  | { type: 'CANCEL' };
+  | { type: 'OPENED'; shares: number; price: number; time: number; eventId?: string }
+  | { type: 'FILL'; shares?: number; state?: 'partial' | 'full' | 'failed' | 'unknown'; eventId?: string }
+  | { type: 'EXIT'; shares: number; reason: string; time: number; eventId?: string }
+  | { type: 'LEADER_EXIT'; leaderShares: number; time: number; eventId?: string }
+  | { type: 'RESOLVED'; winningTokenId: string; time: number; eventId?: string }
+  | { type: 'REDEEMED'; time: number; eventId?: string }
+  | { type: 'RISK_HALT'; reason: string; time: number; eventId?: string }
+  | { type: 'CANCEL'; eventId?: string };
 
 export type TransitionResult =
   | { ok: true; state: PositionState }
@@ -205,20 +205,30 @@ export function evaluateExit(input: ExitEvaluationInput): ExitAction {
 
 /** State machine over one copied position. */
 export class PositionStateMachine {
+  /** Upper bound on the in-memory dedup set (bounded cardinality). */
+  private static readonly MAX_APPLIED_EVENTS = 50_000;
+  private readonly appliedEvents = new Set<string>();
   constructor(private readonly positions = new Map<string, Position>()) {}
 
   get(id: string): Position | undefined {
     return this.positions.get(id);
   }
 
+  all(): Position[] { return [...this.positions.values()].map(p => ({ ...p })); }
+
+  restore(positions: Position[]): void {
+    for (const p of positions) this.positions.set(p.id, { ...p });
+  }
+
   open(position: Position): void {
     this.positions.set(position.id, { ...position, state: 'PLANNED' });
   }
 
-  /** Apply an event; returns the new state or throws on invalid transition. */
+  /** Apply an event idempotently; duplicate lifecycle deliveries are no-ops. */
   apply(id: string, event: ExitEvent): PositionState {
     const p = this.positions.get(id);
     if (!p) throw new Error(`position ${id} not found`);
+    if (event.eventId && this.appliedEvents.has(event.eventId)) return p.state;
     const t = transition(p.state, event);
     if (!t.ok) throw new Error(`invalid transition on ${id}: ${t.error}`);
     const next: Position = { ...p, state: t.state };
@@ -239,6 +249,12 @@ export class PositionStateMachine {
       if (next.shares <= 0 && (p.state === 'EXIT_REQUESTED' || p.state === 'EXIT_PARTIAL')) next.state = 'CLOSED';
     }
     this.positions.set(id, next);
+    if (event.eventId) {
+      this.appliedEvents.add(event.eventId);
+      // Bounded dedup memory: beyond the cap, drop the set (older duplicates
+      // may re-apply once, which the durable order records still reconcile).
+      if (this.appliedEvents.size > PositionStateMachine.MAX_APPLIED_EVENTS) this.appliedEvents.clear();
+    }
     return next.state;
   }
 }
