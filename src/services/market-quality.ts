@@ -16,6 +16,7 @@
  * is the gate; sizeMultiplier() is the chop-based execution risk modifier.
  */
 import type { FillBook } from './fill-engine.js';
+import { scoreTimeframes } from './intensity-scoring.js';
 
 export interface QualityFeatures {
   tickCount: number;
@@ -32,6 +33,16 @@ export interface QualityFeatures {
   depthUsd: number;
   /** Top-of-book imbalance (bidUsd − askUsd)/(bidUsd + askUsd), -1..1. */
   imbalance: number | null;
+  /** Depth-N imbalance (1/3/5 levels) + target-size slippage (P21, marketlens). */
+  imbalance1: number | null;
+  imbalance3: number | null;
+  imbalance5: number | null;
+  /** bps slippage to fill 15 shares (BUY vs mid); null when depth insufficient. */
+  slippageBpsForSize15: number | null;
+  /** Tremor-style multi-timeframe intensity (5m/1h/24h); null when sparse. */
+  intensity5m: number | null;
+  intensity1h: number | null;
+  intensity24h: number | null;
 }
 
 export interface QualityOptions {
@@ -113,6 +124,8 @@ export class MarketQualityTracker {
     const bidUsd = book?.bids[0] ? book.bids[0].price * book.bids[0].size : 0;
     const askUsd = book?.asks[0] ? book.asks[0].price * book.asks[0].size : 0;
     const imbalance = bidUsd + askUsd > 0 ? (bidUsd - askUsd) / (bidUsd + askUsd) : null;
+    const bookF = book ? this.bookFeatures(book) : null;
+    const tf = scoreTimeframes(buf.map((t) => ({ price: t.price, ts: t.ts })), now);
     return {
       tickCount: buf.length,
       lastTickAgeMs: Math.max(0, now - last.ts),
@@ -122,7 +135,50 @@ export class MarketQualityTracker {
       spreadBps,
       depthUsd,
       imbalance,
+      imbalance1: bookF?.imbalance1 ?? null,
+      imbalance3: bookF?.imbalance3 ?? null,
+      imbalance5: bookF?.imbalance5 ?? null,
+      slippageBpsForSize15: bookF?.slippageBpsForSize15 ?? null,
+      intensity5m: tf.intensity5m,
+      intensity1h: tf.intensity1h,
+      intensity24h: tf.intensity24h,
     };
+  }
+
+  /**
+   * Depth-N imbalance (1/3/5) and target-size slippage from a book, independent
+   * of the price buffer. `slippageBpsForSize{15}` uses the asks VWAP to fill
+   * 15 shares vs the mid; null when depth is insufficient (thin-market gate).
+   */
+  bookFeatures(book: FillBook): {
+    imbalance1: number | null;
+    imbalance3: number | null;
+    imbalance5: number | null;
+    slippageBpsForSize15: number | null;
+  } {
+    const askDepth = (n: number) => book.asks.slice(0, n).reduce((x, l) => x + l.price * l.size, 0);
+    const bidDepth = (n: number) => book.bids.slice(0, n).reduce((x, l) => x + l.price * l.size, 0);
+    const imb = (n: number) => {
+      const b = bidDepth(n), a = askDepth(n);
+      return b + a > 0 ? (b - a) / (b + a) : null;
+    };
+    const bestAsk = book.asks[0]?.price ?? null;
+    const bestBid = book.bids[0]?.price ?? null;
+    const mid = bestAsk !== null && bestBid !== null ? (bestAsk + bestBid) / 2 : null;
+    let slip: number | null = null;
+    if (bestAsk !== null && mid !== null && mid > 0) {
+      const target = 15;
+      let remaining = target;
+      let cost = 0;
+      for (const l of book.asks) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, l.size);
+        cost += take * l.price;
+        remaining -= take;
+      }
+      if (remaining <= 0) slip = ((cost / target - mid) / mid) * 10_000;
+    }
+    return { imbalance1: imb(1), imbalance3: imb(3), imbalance5: imb(5), slippageBpsForSize15: slip };
   }
 
   /**
@@ -159,6 +215,8 @@ export class MarketQualityTracker {
     return {
       tickCount: 0, lastTickAgeMs: Number.POSITIVE_INFINITY, chop: 0, whiplash: 0,
       signedMove: 0, spreadBps: null, depthUsd: 0, imbalance: null,
+      imbalance1: null, imbalance3: null, imbalance5: null, slippageBpsForSize15: null,
+      intensity5m: null, intensity1h: null, intensity24h: null,
     };
   }
 }

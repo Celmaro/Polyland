@@ -15,6 +15,10 @@ describe('ClobMarketWsService integrity snapshot (P1)', () => {
       lastDataMessageAt: 0,
       bufferedAmount: 0,
       backpressure: false,
+      connectionState: 'disconnected',
+      outageHalted: false,
+      quarantinedFrames: 0,
+      quarantineByReason: {},
     });
   });
   it('reports backpressure when bufferedAmount crosses the threshold', () => {

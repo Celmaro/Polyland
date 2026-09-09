@@ -7,7 +7,8 @@ import type { ConsensusSignal, ExecutionDecision, PipelineDecision, RejectReason
 import { BankrollReservationLedger } from './bankroll-reservation.js';
 import { computeExactSharesAndCost, quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
 import { executeAgainstBook, type FillBook } from './fill-engine.js';
-import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
+import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
+import { classifySubmission } from './submission-pipeline.js';
 import type { MarketQualityTracker } from './market-quality.js';
 
 export interface ExecutionEngineConfig {
@@ -155,7 +156,17 @@ export class ExecutionEngine {
       if (decision.value.dryRun) result = { success: true, orderId: `dry_run_${Date.now()}` };
       else if (!trade?.tokenId) throw new Error('missing tokenId');
       else result = await this.tradingService.createMarketOrder({ tokenId: trade.tokenId, side: 'BUY', amount: amountUsd, price, orderType: this.config.orderType });
-      if (!result.success) { this.failed++; release(); return { ok: false, reason: 'order' }; }
+      const classification = classifySubmission(result);
+      if (classification !== 'accepted') {
+        if (classification === 'unknown') {
+          // Mutation outcome is ambiguous: release local reservation but do NOT
+          // retry; durable order reconciliation must query the venue first.
+          console.warn(`[ExecutionEngine] order outcome UNKNOWN for ${signal.marketSlug} — reconciliation required; no retry`);
+        }
+        this.failed++;
+        release();
+        return { ok: false, reason: 'order', detail: classification };
+      }
       // ---- depth-aware dry-run fill (P1-5): same fill engine as replay ----
       // When enabled, a dry-run order is priced through the live book with the
       // shared executeAgainstBook model: partial fills and executable VWAP are

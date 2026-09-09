@@ -150,6 +150,19 @@ export class BotMetrics {
     'polyland_book_invalidations_total',
     'Order-book invalidations',
   );
+  private readonly cWsReconnects = this.registry.counter(
+    'polyland_clob_reconnects_total',
+    'CLOB WebSocket reconnects',
+  );
+  private readonly cWsQuarantine = this.registry.counter(
+    'polyland_clob_quarantined_frames_total',
+    'CLOB frames quarantined for parse/schema drift',
+    ['reason'],
+  );
+  private readonly gWsOutageHalted = this.registry.gauge(
+    'polyland_clob_outage_halted',
+    'CLOB feed outage exceeded the execution halt threshold',
+  );
   // Realized PnL per share — the histogram that exposes the loss tail.
   private readonly hPnlPerShare = this.registry.histogram(
     'polyland_pnl_per_share',
@@ -312,12 +325,18 @@ export class BotMetrics {
   recordBookResync(): void { this.cResyncs.inc(); }
   recordInvalidBook(): void { this.cInvalidBooks.inc(); }
   /** Mirror the CLOB WebSocket integrity snapshot (bounded, no labels). */
-  mirrorClobIntegrity(state: { bufferedAmount: number; backpressure: boolean; sequenceGaps: number; resyncs: number; invalidBooks: number }): void {
+  mirrorClobIntegrity(state: { bufferedAmount: number; backpressure: boolean; sequenceGaps: number; resyncs: number; invalidBooks: number; connectionState?: string; outageHalted?: boolean; quarantinedFrames?: number; quarantineByReason?: Record<string, number> }): void {
     this.gQueueBytes.set(Math.max(0, state.bufferedAmount));
     this.gQueuePressure.set(state.backpressure ? 1 : 0);
+    this.gWsOutageHalted.set(state.outageHalted ? 1 : 0);
     if (state.sequenceGaps > 0) this.cSeqGaps.inc({}, state.sequenceGaps);
     if (state.resyncs > 0) this.cResyncs.inc({}, state.resyncs);
     if (state.invalidBooks > 0) this.cInvalidBooks.inc({}, state.invalidBooks);
+    if (state.quarantineByReason) {
+      for (const [reason, n] of Object.entries(state.quarantineByReason)) {
+        if (n > 0) this.cWsQuarantine.inc({ reason: this.label('reason', reason) }, n);
+      }
+    }
   }
   setBankrollUtil(category: string, ratio: number): void {
     this.gBankrollUtil.set({ category: this.label('category', category) }, Math.max(0, Math.min(1, ratio)));

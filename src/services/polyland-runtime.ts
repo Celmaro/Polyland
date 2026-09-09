@@ -64,7 +64,21 @@ export class PolylandRuntime {
     this.stateStore = made.store;
     const riskConfig = { dailyMaxLossPct: 0.05, monthlyMaxLossPct: 0.15, maxDrawdownFromPeak: 0.25, totalMaxLossPct: 0.40, lossSizingReduction: 0.20, winSizingIncrease: 0.10, enableDynamicSizing: true, ...this.config.risk } as any;
     this.risk = new RiskManager(riskConfig, this.config.capital.totalUsd);
-    RiskManager.enablePersistence('./data/risk-state.json'); this.risk.loadPersistedState(); this.risk.setStateStore(this.stateStore);
+        RiskManager.enablePersistence('./data/risk-state.json'); this.risk.loadPersistedState(); this.risk.setStateStore(this.stateStore);
+        // P22 (pmxt auth pattern): never enter LIVE mode with an ambiguous wallet
+        // configuration. Signature discovery must be EXPLICIT, never a silent
+        // EOA/Gnosis fallback. Only enforced when trading for real.
+        if (!this.config.dryRun) {
+          const { assertValidWalletConfig } = await import('./wallet-signature-check.js');
+          assertValidWalletConfig({
+            signerAddress: process.env.SIGNER_ADDRESS,
+            funderAddress: process.env.FUNDER_ADDRESS,
+            signatureType: process.env.SIGNATURE_TYPE !== undefined ? Number(process.env.SIGNATURE_TYPE) : undefined,
+            proxyAddress: process.env.PROXY_ADDRESS,
+            chainId: process.env.CHAIN_ID !== undefined ? Number(process.env.CHAIN_ID) : 137,
+          });
+          console.log('[PolylandRuntime] live wallet config validated (signer/funder/signature-type explicit)');
+        }
     SignalAuditStore.enableJsonl('./data/signal-audit.jsonl'); signalAuditStore.setStateStore(this.stateStore); signalAuditStore.replayJsonl('./data/signal-audit.jsonl');
     this.rebuildSnapshotFromAudit();
     this.ledger = new DecisionLedger();

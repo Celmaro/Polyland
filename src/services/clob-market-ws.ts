@@ -17,6 +17,8 @@
 
 import WebSocket from 'isomorphic-ws';
 import { sanitizeErrorMessage } from '../core/errors.js';
+import { FrameQuarantine, type QuarantineReason } from './ws-frame-quarantine.js';
+import { WsConnectionStateMachine } from './ws-connection-state.js';
 
 // ============================================================================
 // Types
@@ -43,6 +45,13 @@ export interface ClobWsIntegrityState {
   bufferedAmount: number;
   /** True when bufferedAmount >= backpressureBytes threshold. */
   backpressure: boolean;
+  /** Connection state-machine state (P22 reconnect/resync hardening). */
+  connectionState: string;
+  /** True when the feed has been down past the outage halt threshold. */
+  outageHalted: boolean;
+  /** Quarantined raw frames (parse/schema drift) + reason counters. */
+  quarantinedFrames: number;
+  quarantineByReason: Record<string, number>;
 }
 export interface ClobMarketWsOptions {
   /** Bytes at which the socket is considered backpressured. Default 256 KiB. */
@@ -142,7 +151,11 @@ export class ClobMarketWsService {
   /** Assets whose feed has EVER carried a sequence (feeds without it are never false-invalidated). */
   private sequencedAssets = new Set<string>();
   /** Overridable buffered amount for tests; fallback reads the live socket. */
-  private bufferedAmountBytes = 0;
+    private bufferedAmountBytes = 0;
+    /** P22: explicit reconnect/resync state machine (pykalshi/feed + pmxt/ws). */
+    private readonly conn = new WsConnectionStateMachine({ baseBackoffMs: 1000, maxBackoffMs: 30_000, maxOutageMs: 5 * 60_000 });
+    /** P22: bounded quarantine for parse/schema-drift investigation. */
+    readonly quarantine = new FrameQuarantine();
 
   constructor(options: ClobMarketWsOptions = {}) {
     this.options = options;
@@ -175,6 +188,10 @@ export class ClobMarketWsService {
       lastDataMessageAt: this.lastDataMessageAt,
       bufferedAmount: Math.max(0, buffered),
       backpressure: buffered >= threshold,
+      connectionState: this.conn.state,
+      outageHalted: this.conn.outageHalted(),
+      quarantinedFrames: this.quarantine.count,
+      quarantineByReason: { ...this.quarantine.byReason },
     };
   }
 
@@ -292,6 +309,7 @@ export class ClobMarketWsService {
     this.ws = new WebSocket(this.url);
 
     this.ws.onopen = () => {
+      this.conn.onConnected();
       this.reconnectDelayMs = 1_000;
       // Initial subscription message (type: market).
       // Only send if we have assets; an empty list with custom_feature_enabled
@@ -362,23 +380,28 @@ export class ClobMarketWsService {
     };
 
     this.ws.onmessage = (event: WebSocket.MessageEvent) => {
-      try {
-        const raw = typeof event.data === 'string' ? event.data : (event.data as Buffer).toString();
-        // Heartbeat: plain-text "PONG" response.
-        if (raw === 'PONG') {
-          this.pingPongSeenAt = Date.now();
-          return;
-        }
-        // Any other message = real data (price_change/trade/book/etc).
-        this.lastDataMessageAt = Date.now();
-        const data = JSON.parse(raw);
-        this.handleMessage(data as ClobMessage);
-      } catch (err) {
-        // Don't log raw event objects — sanitize message only
-        const msg = err instanceof Error ? sanitizeErrorMessage(err.message) : String(err);
-        console.error(`[ClobMarketWs] parse error: ${msg}`);
-      }
-    };
+          try {
+            const raw = typeof event.data === 'string' ? event.data : (event.data as Buffer).toString();
+            // Heartbeat: plain-text "PONG" response.
+            if (raw === 'PONG') {
+              this.pingPongSeenAt = Date.now();
+              return;
+            }
+            // Any other message = real data (price_change/trade/book/etc).
+            this.lastDataMessageAt = Date.now();
+            this.conn.markStable(); // a live data channel is the true liveness signal
+            const data = JSON.parse(raw);
+            this.handleMessage(data as ClobMessage);
+          } catch (err) {
+            // Quarantine the raw frame (P22) — never silently coerce a malformed
+            // feed event into a valid book/mid update.
+            const raw = typeof event.data === 'string' ? event.data : (event.data as Buffer).toString();
+            this.quarantine.add(raw.slice(0, 4096), 'parse_error');
+            // Don't log raw event objects — sanitize message only
+            const msg = err instanceof Error ? sanitizeErrorMessage(err.message) : String(err);
+            console.error(`[ClobMarketWs] parse error: ${msg} (quarantined)`);
+          }
+        };
 
     this.ws.onerror = (event: WebSocket.ErrorEvent) => {
       // Log sanitized message only — never dump the raw event
@@ -396,9 +419,10 @@ export class ClobMarketWsService {
         this.pingTimer = null;
       }
       if (!this.intentionallyClosed && !this.destroyed) {
-        console.warn(`[ClobMarketWs] disconnected code=${code} reason=${reason || 'unknown'} — reconnecting in ${this.reconnectDelayMs}ms`);
-        this.scheduleReconnect();
-      }
+              this.conn.onDisconnect();
+              console.warn(`[ClobMarketWs] disconnected code=${code} reason=${reason || 'unknown'} — reconnecting in ${this.reconnectDelayMs}ms`);
+              this.scheduleReconnect();
+            }
     };
   }
 
