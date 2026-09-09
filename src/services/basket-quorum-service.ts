@@ -1832,6 +1832,13 @@ export class BasketQuorumService {
     return { ...this.stats };
   }
 
+  /** Per-category deployed USDC (read-only exposure view for rebalancing/health). */
+  getCategorySpend(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [cat, amt] of this.basketSpend) out[cat] = amt;
+    return out;
+  }
+
   /** unix ms of the newest processed feed event (0 = none yet). */
   getLastFeedEventAt(): number {
     return this._lastFeedEventAt;

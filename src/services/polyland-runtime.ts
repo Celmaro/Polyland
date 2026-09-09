@@ -12,6 +12,7 @@ import { AntiSniperGuard } from '../utils/anti-sniper.js';
 import { ChainlinkTwapOracle } from './chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './clob-market-ws.js';
 import { reconcileDryRunOrders } from './reconciliation.js';
+import { BasketWalletManager, evaluateRebalance, computeBasketOverlapHealth, type BasketMembership, type BasketLifecycleConfig } from './basket-lifecycle.js';
 import type { OrderLifecycleRecord } from './state-store.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
@@ -42,6 +43,8 @@ export class PolylandRuntime {
   private tradeDetector: TradeDetector | null = null;
   private tradeSeen: FileSeenTradeLedger | null = null;
   private gamma: GammaResolutionPoller | null = null;
+  private basketLifecycle: BasketWalletManager | null = null;
+  private basketLifecycleCfg: BasketLifecycleConfig = { maxWalletsPerBasket: 10, maxNewWalletsPerRun: 3, minAssignmentScore: 0.5, promotionBuffer: 0.05 };
   private clob: ClobMarketWsService | null = null;
   /** P1 lens #1/#3: market-quality tracker fed by CLOB mids. */
   private marketQuality: MarketQualityTracker | null = null;
@@ -62,6 +65,24 @@ export class PolylandRuntime {
     const votes = new VoteStateStore('./data/quorum-state.json');
     const made = await createStateStore('./data/polyland-state.sqlite', './data/polyland-state.json');
     this.stateStore = made.store;
+    // A1-A5: basket wallet lifecycle — persisted memberships, graduated actions,
+    // churn/capacity bounds, promotion buffer, overlap health, rebalancing.
+    const lifecycleCfg: BasketLifecycleConfig = {
+      maxWalletsPerBasket: Number(this.screeningConfig.maxWalletsPerBasket ?? 10),
+      maxNewWalletsPerRun: Number(this.screeningConfig.maxNewWalletsPerRun ?? 3),
+      minAssignmentScore: Number(this.screeningConfig.minAssignmentScore ?? 0.5),
+      promotionBuffer: Number(this.screeningConfig.promotionBuffer ?? 0.05),
+      targetAllocationByTopic: (this.screeningConfig.targetAllocationByTopic as Record<string, number> | undefined),
+    };
+    this.basketLifecycleCfg = lifecycleCfg;
+    this.basketLifecycle = new BasketWalletManager(lifecycleCfg);
+    this.basketLifecycle.onSave((memberships) => {
+      void this.stateStore?.save({ basketMemberships: memberships as never }).catch(() => undefined);
+    });
+    const persistedLife = await this.stateStore.load();
+    if (Array.isArray(persistedLife?.basketMemberships)) {
+      this.basketLifecycle.restore(persistedLife.basketMemberships as BasketMembership[]);
+    }
     const riskConfig = { dailyMaxLossPct: 0.05, monthlyMaxLossPct: 0.15, maxDrawdownFromPeak: 0.25, totalMaxLossPct: 0.40, lossSizingReduction: 0.20, winSizingIncrease: 0.10, enableDynamicSizing: true, ...this.config.risk } as any;
     this.risk = new RiskManager(riskConfig, this.config.capital.totalUsd);
         RiskManager.enablePersistence('./data/risk-state.json'); this.risk.loadPersistedState(); this.risk.setStateStore(this.stateStore);
@@ -173,7 +194,28 @@ export class PolylandRuntime {
       }
     }, 300000); this.scheduleRefresh(21600000, ingestion, screening, key);
   }
-  private async seed(screened: any[], key: string): Promise<void> { if (!this.quorum) return; const eligible = screened.filter(w => w.tier === 'PRIMARY' || w.tier === 'SATELLITE'); this.quorum.seed(eligible); setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
+  /** A1-A3: feed screened wallets through the basket lifecycle (graduated actions, capacity, promotion buffer). */
+  private feedBasketLifecycle(screened: any[]): void {
+    if (!this.basketLifecycle) return;
+    const assignments = screened
+      .filter((w) => w && typeof w.score === 'number' && typeof w.category === 'string')
+      .map((w) => ({
+        wallet: String(w.wallet ?? w.address ?? ''),
+        topic: String(w.category),
+        score: Number(w.score),
+        confidence: (w.tier === 'PRIMARY' ? 'HIGH' : w.tier === 'SATELLITE' ? 'MEDIUM' : 'LOW') as 'HIGH' | 'MEDIUM' | 'LOW',
+      }))
+      .filter((a) => a.wallet);
+    if (assignments.length > 0) {
+      const actions = this.basketLifecycle.propose(assignments);
+      for (const action of actions) {
+        if (action.action === 'add') this.basketLifecycle.applyAction(action);
+        else if (action.action === 'suspend') this.basketLifecycle.applyAction(action);
+      }
+    }
+  }
+
+  private async seed(screened: any[], key: string): Promise<void> { if (!this.quorum) return; this.feedBasketLifecycle(screened); const eligible = screened.filter(w => w.tier === 'PRIMARY' || w.tier === 'SATELLITE'); this.quorum.seed(eligible); setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
   private scheduleRefresh(delay: number, ingestion: WalletIngestionService, screening: WalletScreeningService, key: string): void { this.refreshTimer = setTimeout(async () => { if (!this.refreshing) { this.refreshing = true; try { const candidates = await ingestion.collect(); const screened = await screening.score(candidates); const nextKey = JSON.stringify({ version: 1, candidates: candidates.map(c => ({ address: c.address, source: c.source, autoRank: c.autoRank })).sort((a,b) => a.address.localeCompare(b.address)), config: this.screeningConfig }); await this.seed(screened, nextKey); } catch (e) { console.warn('[PolylandRuntime] screening refresh failed:', e instanceof Error ? e.message : e); } finally { this.refreshing = false; } } this.scheduleRefresh(21600000, ingestion, screening, key); }, delay); }
   /** Mutate the P&L/streak snapshot for one settled trade (no callback). */
   private applySettled(pnl: number): void { const s = this.snapshot; s.totalPnL += pnl; s.dailyPnL += pnl; s.monthlyPnL += pnl; if (pnl < 0) { s.consecutiveLosses++; s.consecutiveWins = 0; } else { s.consecutiveWins++; s.consecutiveLosses = 0; } s.currentCapital = this.config.capital.totalUsd + s.totalPnL; s.peakCapital = Math.max(s.peakCapital, s.currentCapital); s.currentDrawdown = (s.peakCapital - s.currentCapital) / s.peakCapital; }
@@ -223,6 +265,26 @@ export class PolylandRuntime {
     goLiveStatusLine(): string {
       const report = this.getGoLiveReport();
       return `[gate] ${formatGoLiveReport(report)}`;
+    }
+    /** A5: basket overlap health snapshot (votes per token -> independent-vote overlap). */
+    getBasketOverlapHealth(): { activeTokens: number; overlapPct2: number; overlapPct3: number; overlapPct4: number } {
+      const byToken = new Map<string, Set<string>>();
+      for (const m of this.basketLifecycle?.membershipSnapshot() ?? []) {
+        if (!byToken.has(m.topic)) byToken.set(m.topic, new Set());
+        byToken.get(m.topic)!.add(m.wallet);
+      }
+      const h = computeBasketOverlapHealth(byToken);
+      return { activeTokens: h.activeTokens, overlapPct2: h.overlapPct2, overlapPct3: h.overlapPct3, overlapPct4: h.overlapPct4 };
+    }
+    /** A4: target-allocation rebalance advisory. */
+    getRebalanceAdvisory(): Array<{ topic: string; reason: string }> {
+      if (!this.basketLifecycle) return [];
+      // Exposure = deployed capital per category (empty map when quorum unavailable).
+      const spend = this.quorum?.getCategorySpend() ?? {};
+      const exposure: Record<string, number> = { ...spend };
+      // Reuse the lifecycle config's target allocations.
+      const actions = evaluateRebalance(this.basketLifecycleCfg, exposure);
+      return actions.map((a) => ({ topic: a.topic, reason: a.reason }));
     }
     async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder();
     // Idempotency & cleanup audit: on shutdown in LIVE mode, cancel all open
