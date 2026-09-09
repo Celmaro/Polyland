@@ -13,6 +13,7 @@ import { ChainlinkTwapOracle } from './chainlink-twap-oracle.js';
 import { ClobMarketWsService } from './clob-market-ws.js';
 import { reconcileDryRunOrders } from './reconciliation.js';
 import { BasketWalletManager, evaluateRebalance, computeBasketOverlapHealth, type BasketMembership, type BasketLifecycleConfig } from './basket-lifecycle.js';
+import { WalletIngestor, type WalletRecord } from './wallet-ingestion.js';
 import type { OrderLifecycleRecord } from './state-store.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
@@ -45,6 +46,7 @@ export class PolylandRuntime {
   private gamma: GammaResolutionPoller | null = null;
   private basketLifecycle: BasketWalletManager | null = null;
   private basketLifecycleCfg: BasketLifecycleConfig = { maxWalletsPerBasket: 10, maxNewWalletsPerRun: 3, minAssignmentScore: 0.5, promotionBuffer: 0.05 };
+  private walletIngestor: WalletIngestor | null = null;
   private clob: ClobMarketWsService | null = null;
   /** P1 lens #1/#3: market-quality tracker fed by CLOB mids. */
   private marketQuality: MarketQualityTracker | null = null;
@@ -82,6 +84,20 @@ export class PolylandRuntime {
     const persistedLife = await this.stateStore.load();
     if (Array.isArray(persistedLife?.basketMemberships)) {
       this.basketLifecycle.restore(persistedLife.basketMemberships as BasketMembership[]);
+    }
+    // C1-C4: wallet ingestion registry — multi-source corroboration, probation
+    // lifecycle, behavioral filters, provenance. Persisted across restarts.
+    this.walletIngestor = new WalletIngestor({
+      minScorePromotion: Number(this.screeningConfig.minScorePromotion ?? 0.6),
+      minTradesPromotion: Number(this.screeningConfig.minTradesPromotion ?? 15),
+      maxWeeklyTrades: this.screeningConfig.maxWeeklyTrades ? Number(this.screeningConfig.maxWeeklyTrades) : undefined,
+      maxBurst60s: this.screeningConfig.maxBurst60s ? Number(this.screeningConfig.maxBurst60s) : undefined,
+    });
+    this.walletIngestor.onSave((records) => {
+      void this.stateStore?.save({ walletRegistry: records as never }).catch(() => undefined);
+    });
+    if (Array.isArray(persistedLife?.walletRegistry)) {
+      this.walletIngestor.restore(persistedLife.walletRegistry as WalletRecord[]);
     }
     const riskConfig = { dailyMaxLossPct: 0.05, monthlyMaxLossPct: 0.15, maxDrawdownFromPeak: 0.25, totalMaxLossPct: 0.40, lossSizingReduction: 0.20, winSizingIncrease: 0.10, enableDynamicSizing: true, ...this.config.risk } as any;
     this.risk = new RiskManager(riskConfig, this.config.capital.totalUsd);
@@ -215,7 +231,33 @@ export class PolylandRuntime {
     }
   }
 
-  private async seed(screened: any[], key: string): Promise<void> { if (!this.quorum) return; this.feedBasketLifecycle(screened); const eligible = screened.filter(w => w.tier === 'PRIMARY' || w.tier === 'SATELLITE'); this.quorum.seed(eligible); setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
+  private async seed(screened: any[], key: string): Promise<void> { if (!this.quorum) return; this.feedBasketLifecycle(screened);
+    // C2/C3 two-stage entry: register through the wallet ingestor (probation),
+    // and only wallets that are ACTIVE there AND clear the tier floors reach
+    // the quorum. Protects the basket from a single bad discovery run.
+    for (const w of screened) {
+      if (!w || typeof w.wallet !== 'string') continue;
+      try {
+        this.walletIngestor?.register({
+          wallet: String(w.wallet ?? w.address ?? ''),
+          sources: Array.isArray(w.sources) ? w.sources : ['leaderboard'],
+          score: Number(w.score ?? 0.5),
+          category: String(w.category ?? 'other'),
+          tradeCount: Number(w.tradeCount ?? w.sampleTrades ?? 0),
+          weeklyTrades: Number(w.weeklyTrades ?? 0),
+          peakTrades60s: Number(w.peakTrades60s ?? 0),
+          realizedPnl: Number(w.realizedPnl ?? 0),
+        });
+      } catch { /* non-fatal: keep current screening tier */ }
+    }
+    const eligible = screened.filter((w) => {
+      const t = w.tier;
+      if (t !== 'PRIMARY' && t !== 'SATELLITE') return false;
+      const rec = this.walletIngestor?.get(String(w.wallet ?? ''));
+      if (!rec) return true; // unknown to ingestor -> keep legacy behavior
+      return rec.status === 'active' && (rec.tier === 'PRIMARY' || rec.tier === 'SATELLITE');
+    });
+    this.quorum.seed(eligible); setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
   private scheduleRefresh(delay: number, ingestion: WalletIngestionService, screening: WalletScreeningService, key: string): void { this.refreshTimer = setTimeout(async () => { if (!this.refreshing) { this.refreshing = true; try { const candidates = await ingestion.collect(); const screened = await screening.score(candidates); const nextKey = JSON.stringify({ version: 1, candidates: candidates.map(c => ({ address: c.address, source: c.source, autoRank: c.autoRank })).sort((a,b) => a.address.localeCompare(b.address)), config: this.screeningConfig }); await this.seed(screened, nextKey); } catch (e) { console.warn('[PolylandRuntime] screening refresh failed:', e instanceof Error ? e.message : e); } finally { this.refreshing = false; } } this.scheduleRefresh(21600000, ingestion, screening, key); }, delay); }
   /** Mutate the P&L/streak snapshot for one settled trade (no callback). */
   private applySettled(pnl: number): void { const s = this.snapshot; s.totalPnL += pnl; s.dailyPnL += pnl; s.monthlyPnL += pnl; if (pnl < 0) { s.consecutiveLosses++; s.consecutiveWins = 0; } else { s.consecutiveWins++; s.consecutiveLosses = 0; } s.currentCapital = this.config.capital.totalUsd + s.totalPnL; s.peakCapital = Math.max(s.peakCapital, s.currentCapital); s.currentDrawdown = (s.peakCapital - s.currentCapital) / s.peakCapital; }
