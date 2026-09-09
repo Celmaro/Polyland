@@ -73,6 +73,8 @@ export interface OnchainServiceConfig {
   privateKey: string;
   /** RPC URL (default: Polygon mainnet) */
   rpcUrl?: string;
+  /** Multi-endpoint failover list (RPC failover audit). Overrides rpcUrl. */
+  rpcUrls?: string[];
   /** Chain ID (default: 137 for Polygon) */
   chainId?: number;
   /** Gas price multiplier for CTF operations (default: 1.2) */
@@ -138,16 +140,31 @@ export type {
  */
 export class OnchainService {
   private wallet: ethers.Wallet;
-  private provider: ethers.providers.JsonRpcProvider;
+  private provider: ethers.providers.BaseProvider;
   private ctfClient: CTFClient;
   private authService: AuthorizationService;
   private swapService: SwapService;
 
   constructor(config: OnchainServiceConfig) {
-    const rpcUrl = config.rpcUrl || 'https://polygon-rpc.com';
+    const rpcUrls = config.rpcUrls?.length
+      ? config.rpcUrls
+      : (config.rpcUrl
+          ? [config.rpcUrl]
+          : [
+              'https://polygon-bor-rpc.publicnode.com',
+              'https://polygon.drpc.org',
+              'https://polygon-rpc.com',
+            ]);
+    const rpcUrl = rpcUrls[0];
 
-    // Create shared provider and wallet
-    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+    // Create shared provider and wallet — multi-endpoint FallbackProvider so
+    // a single RPC outage (5-min provider blips are routine) does not take the
+    // on-chain path offline (RPC failover audit). Ethers v5: FallbackProvider
+    // with quorum 1 means any single healthy endpoint serves.
+    this.provider = new ethers.providers.FallbackProvider(
+      rpcUrls.map((url) => new ethers.providers.JsonRpcProvider(url)),
+      1,
+    );
     this.wallet = new ethers.Wallet(config.privateKey, this.provider);
 
     // Initialize CTFClient with config
@@ -603,7 +620,7 @@ export class OnchainService {
   /**
    * Get the shared provider instance
    */
-  getProvider(): ethers.providers.JsonRpcProvider {
+  getProvider(): ethers.providers.BaseProvider {
     return this.provider;
   }
 }

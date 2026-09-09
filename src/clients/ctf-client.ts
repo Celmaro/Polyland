@@ -80,6 +80,8 @@ export interface CTFConfig {
   privateKey: string;
   /** RPC URL (default: Polygon mainnet) */
   rpcUrl?: string;
+  /** Multi-endpoint failover list (RPC failover audit). Overrides rpcUrl. */
+  rpcUrls?: string[];
   /** Chain ID (default: 137 for Polygon) */
   chainId?: number;
   /** Gas price multiplier (default: 1.2) */
@@ -180,7 +182,7 @@ export interface MarketResolution {
 const DEFAULT_MATIC_PRICE = 0.50;
 
 export class CTFClient {
-  private provider: ethers.providers.JsonRpcProvider;
+  private provider: ethers.providers.BaseProvider;
   private wallet: Wallet;
   private ctfContract: Contract;
   private usdcContract: Contract;
@@ -191,8 +193,14 @@ export class CTFClient {
   private maticPriceLastUpdated: number = 0;
 
   constructor(config: CTFConfig) {
-    const rpcUrl = config.rpcUrl || 'https://polygon-rpc.com';
-    this.provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+    const rpcUrls = config.rpcUrls?.length
+      ? config.rpcUrls
+      : [config.rpcUrl || 'https://polygon-rpc.com'];
+    // RPC failover audit: multi-endpoint FallbackProvider (quorum 1) so a
+    // single provider blip does not take on-chain transfers/approvals offline.
+    this.provider = rpcUrls.length > 1
+      ? new ethers.providers.FallbackProvider(rpcUrls.map((u) => new ethers.providers.JsonRpcProvider(u)), 1)
+      : new ethers.providers.JsonRpcProvider(rpcUrls[0]);
     this.wallet = new Wallet(config.privateKey, this.provider);
     this.ctfContract = new Contract(CTF_CONTRACT, CTF_ABI, this.wallet);
     this.usdcContract = new Contract(USDC_CONTRACT, ERC20_ABI, this.wallet);

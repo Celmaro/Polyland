@@ -224,5 +224,20 @@ export class PolylandRuntime {
       const report = this.getGoLiveReport();
       return `[gate] ${formatGoLiveReport(report)}`;
     }
-    async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder(); this.stateStore?.close?.(); await this.ledger?.close(); this.sdk.stop(); }
+    async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder();
+    // Idempotency & cleanup audit: on shutdown in LIVE mode, cancel all open
+    // CLOB orders so no resting/dangling orders are left exposed (mirrors
+    // the systemd drain-then-exit pattern). DRY_RUN skips (no real orders).
+    if (!this.config.dryRun) {
+      try {
+        const cancel = await Promise.race([
+          this.sdk.tradingService.cancelAllOrders(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error('cancelAll timeout')), 10_000)),
+        ]);
+        console.log(`[PolylandRuntime] shutdown: cancelled open orders (success=${cancel.success})`);
+      } catch (err) {
+        console.warn('[PolylandRuntime] shutdown: order cancellation failed:', err instanceof Error ? err.message : err);
+      }
+    }
+    this.stateStore?.close?.(); await this.ledger?.close(); this.sdk.stop(); }
 }

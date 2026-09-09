@@ -298,6 +298,26 @@ export class BasketQuorumService {
   private twapOracle: ChainlinkTwapOracle | null = null;
   /** Per-conditionId fee rate cache (basis points), so we don't refetch. */
   private feeRateCache: Map<string, number> = new Map();
+  /** Anti-honeypot: per-conditionId 24h volume + liquidity, 10-min TTL. */
+  private marketVolumeCache = new Map<string, { vol: number; liq: number; ts: number }>();
+  /** Fetch+cache real 24h volume/liquidity for a market (Gamma), for the
+   *  anti-honeypot floor and truthful feature snapshots. Null on failure. */
+  private async marketVolume24hFor(conditionId: string): Promise<{ volume24hr: number; liquidity: number } | null> {
+    const cached = this.marketVolumeCache.get(conditionId);
+    if (cached && Date.now() - cached.ts < 10 * 60_000) return { volume24hr: cached.vol, liquidity: cached.liq };
+    if (!this.gammaApi) return null;
+    try {
+      const markets = await this.gammaApi.getMarkets({ conditionId });
+      const m = markets?.[0];
+      if (!m) return null;
+      const vol = Number(m.volume24hr ?? m.volume ?? 0);
+      const liq = Number(m.liquidity ?? 0);
+      this.marketVolumeCache.set(conditionId, { vol, liq, ts: Date.now() });
+      return { volume24hr: vol, liquidity: liq };
+    } catch {
+      return null;
+    }
+  }
   /** Per-conditionId tick size cache. */
   private tickSizeCache: Map<string, number> = new Map();
   /** Per-conditionId last TWAP evaluation result (debug + audit). */
@@ -1578,6 +1598,7 @@ export class BasketQuorumService {
       onAntiSniperFire: (tokenId) => this.antiSniper?.recordFire(tokenId),
       onStaleQuoteSkip: () => { this.botMetrics?.staleQuoteCancelled(); },
       quality: this.marketQuality ?? undefined,
+      marketVolume24h: (cid) => this.marketVolume24hFor(cid),
       auditStore: { recordFire: (params) => signalAuditStore.recordFire(params as Parameters<typeof signalAuditStore.recordFire>[0]) },
       bookLookup: async (tokenId) => {
         try {
@@ -1746,13 +1767,16 @@ export class BasketQuorumService {
       if (this.marketSnapshots) {
         const tokenId = trade.tokenId ?? signal.conditionId;
         const qf = this.marketQuality?.features(tokenId);
+        // Real 24h volume/liquidity (anti-honeypot + truthful snapshots); the
+        // cached value is best-effort and non-fatal when unavailable.
+        const volMeta = await this.marketVolume24hFor(signal.conditionId).catch(() => null);
         try {
           void this.marketSnapshots.upsertTick({
             tokenId,
             tsBucket: bucket15m(Date.now()),
             probability: Number(signal.consensusPrice) || 0,
-            liquidity: 0,
-            volume24hr: 0,
+            liquidity: volMeta?.liquidity ?? 0,
+            volume24hr: volMeta?.volume24hr ?? 0,
             spreadBps: qf?.spreadBps ?? null,
             depthUsd: qf?.depthUsd ?? 0,
             chop: qf?.chop ?? 0,

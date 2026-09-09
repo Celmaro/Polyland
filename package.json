@@ -62,5 +62,9 @@
     "tsx": "^4.7.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
+  },
+  "overrides": {
+    "ws": "$ws",
+    "elliptic": "^6.6.1"
   }
 }

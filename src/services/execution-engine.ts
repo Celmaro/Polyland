@@ -39,6 +39,9 @@ export interface ExecutionEngineDeps {
   bookLookup?: (tokenId: string) => Promise<FillBook | null>;
   /** P1 market-quality: chop size modifier + depth gate (lens #1/#3). */
   quality?: MarketQualityTracker;
+  /** Anti-honeypot audit: real 24h volume + liquidity for the market, when
+   *  known. Null when unavailable (market metadata fetch failed). */
+  marketVolume24h?: (conditionId: string) => Promise<{ volume24hr: number; liquidity: number } | null>;
   auditStore: { recordFire: (params: Record<string, unknown>) => unknown };
 }
 
@@ -62,6 +65,10 @@ export class ExecutionEngine {
   public failed = 0;
   /** Fail-closed skips by reason — visible in the funnel, not conflated with failed. */
   public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0, entryCeiling: 0 };
+  /** Idempotency audit: signalIds already executed this process — a duplicate
+   *  execute() for the same signal is rejected BEFORE any reservation/order,
+   *  so a double-dispatch (retry, re-entrancy) can never double-fill. */
+  private readonly executedSignalIds = new Set<string>();
   /** Per-category rate-limit state for bankroll-saturation warnings. */
   private _lastBankrollLogAt = new Map<string, number>();
   constructor(
@@ -123,6 +130,14 @@ export class ExecutionEngine {
   async execute(decision: Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, trade?: SmartMoneyTrade, basket?: BasketConfig): Promise<ExecuteResult> {
     const { signal, amountUsd, price } = decision.value;
     const category = basket?.category ?? signal.category;
+    // Idempotency audit: never execute the same signal twice in-process, even
+    // if the caller double-dispatches (retry/re-entrancy). The signalId is
+    // unique per fire; this guard makes a duplicate fill impossible here.
+    if (signal.signalId && this.executedSignalIds.has(signal.signalId)) {
+      this.skipped.staleQuote++; // counted as a fail-closed skip, not a failure
+      console.warn(`[ExecutionEngine] SKIP duplicate-signal: ${signal.marketSlug} ${signal.signalId} — already executed`);
+      return { ok: false, reason: 'stale_quote', detail: 'duplicate_signal_execution' };
+    }
     // Defense-in-depth: the planner may replace the engine's initial price
     // with executable VWAP. Re-apply the SAME shared ceiling at the final
     // mutation boundary so executed/audited prices can never exceed it.
@@ -140,6 +155,27 @@ export class ExecutionEngine {
       this.deps.onStaleQuoteSkip?.();
       console.warn(`[ExecutionEngine] SKIP stale quote: ${signal.marketSlug} age_ms=${Date.now() - signal.observedAt}`);
       return { ok: false, reason: 'stale_quote', detail: `age_ms=${Date.now() - signal.observedAt}` };
+    }
+    // Anti-honeypot audit: optional 24h-volume floor (MIN_MARKET_VOLUME24H_USD).
+    // Applies to ALL orders (live + dry-run) BEFORE any reservation — markets
+    // below the floor (a wash-traded honeypot or dead book) are skipped.
+    // 0 = disabled; missing metadata is advisory, never blocking.
+    const volFloor = Number(process.env.MIN_MARKET_VOLUME24H_USD ?? 0);
+    if (volFloor > 0 && this.deps.marketVolume24h) {
+      try {
+        const meta = await this.deps.marketVolume24h(signal.conditionId);
+        if (meta !== null) {
+          if (meta.volume24hr < volFloor) {
+            this.skipped.quality++;
+            console.warn(`[ExecutionEngine] SKIP volume24h: ${signal.marketSlug} $${meta.volume24hr.toFixed(0)} < floor $${volFloor}`);
+            return { ok: false, reason: 'quality', detail: `volume24h $${meta.volume24hr} < $${volFloor}` };
+          }
+        } else {
+          console.warn(`[ExecutionEngine] volume24h advisory: ${signal.marketSlug} metadata unavailable — continuing`);
+        }
+      } catch (err) {
+        console.warn(`[ExecutionEngine] volume24h fetch failed (continuing): ${err instanceof Error ? err.message : err}`);
+      }
     }
     const release = this.ledger.reserve(category, amountUsd, this.deps.basketSpendGet(category));
     if (!release) {
@@ -213,10 +249,10 @@ export class ExecutionEngine {
             return { ok: false, reason: 'quality', detail: hardBlocked.join(',') };
           }
           if (q.reasons.length > 0) {
-            console.warn(`[ExecutionEngine] quality advisory: ${signal.marketSlug} ${q.reasons.join(',')} — continuing`);
-          }
-        }
-        // Quantized fill size: use the exact-shares computed in evaluate()
+                      console.warn(`[ExecutionEngine] quality advisory: ${signal.marketSlug} ${q.reasons.join(',')} — continuing`);
+                    }
+                  }
+                  // Quantized fill size: use the exact-shares computed in evaluate()
         // (already tick-quantized) rather than a naive amountUsd/price division.
         const sizeForBook = computeExactSharesAndCost(amountUsd, price, tickSizeToEnum(this.deps.tickSizeFor(signal.conditionId))).shares;
         const fill = executeAgainstBook({ side: 'BUY', size: sizeForBook, maxPrice: price }, book);
@@ -231,9 +267,13 @@ export class ExecutionEngine {
         placedUsd = fill.executableVwap * fill.executableSize;
       }
       this.deps.basketSpendAdd(category, placedUsd);
+      // Idempotency: mark executed ONLY after a successful fill. Every record
+      // carries the unique signalId so downstream audit/PnL reconciliation can
+      // dedup by order (pnl-truthteller pattern: dedup by order id).
+      if (signal.signalId) this.executedSignalIds.add(signal.signalId);
       // Audit pricePaid = the honest executable estimate: consensus when the
       // book is not used, otherwise the true depth-aware fill VWAP.
-      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category });
+      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category, signalId: signal.signalId });
       this.deps.onPositionOpened(trade?.tokenId, placedUsd, auditShares, auditPrice, signal);
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
       if (trade?.tokenId) this.deps.onAntiSniperFire(trade.tokenId);

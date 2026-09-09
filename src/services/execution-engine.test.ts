@@ -181,6 +181,46 @@ describe('ExecutionEngine stale-quote gating (P1)', () => {
     expect(engine.skipped.entryCeiling).toBe(1);
   });
 
+  it('execute() rejects a duplicate signalId (idempotency: no double-fill)', async () => {
+    let spent = 0;
+    const deps = makeDeps({
+      basketSpendAdd: (_c, amount) => { spent += amount; },
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, CONFIG);
+    const decision = {
+      accepted: true,
+      value: { signal: { ...SIGNAL, signalId: 'sig-dup-1', consensusPrice: 0.40 }, amountUsd: 5, price: 0.40, dryRun: true },
+    } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>;
+    const first = await engine.execute(decision, TRADE, BASKET);
+    expect(first.ok).toBe(true);
+    const second = await engine.execute(decision, TRADE, BASKET);
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.reason).toBe('stale_quote'); // counted as fail-closed skip
+    expect(spent).toBeGreaterThan(0); // only the FIRST fill spent
+    const spentAfterFirst = spent;
+    await engine.execute(decision, TRADE, BASKET);
+    expect(spent).toBe(spentAfterFirst); // no third fill
+  });
+
+  it('execute() blocks a market below the 24h-volume anti-honeypot floor', async () => {
+    let spent = 0;
+    process.env.MIN_MARKET_VOLUME24H_USD = '5000';
+    const deps = makeDeps({
+      basketSpendAdd: (_c, amount) => { spent += amount; },
+      marketVolume24h: async () => ({ volume24hr: 800, liquidity: 200 }),
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, CONFIG);
+    const decision = {
+      accepted: true,
+      value: { signal: { ...SIGNAL, consensusPrice: 0.40 }, amountUsd: 5, price: 0.40, dryRun: true },
+    } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>;
+    const result = await engine.execute(decision, TRADE, BASKET);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('quality');
+    expect(spent).toBe(0);
+    delete process.env.MIN_MARKET_VOLUME24H_USD;
+  });
+
   it('execute() on a stale signal does not reserve/spend and returns ok:false', async () => {
       vi.useFakeTimers();
     vi.setSystemTime(T0);
