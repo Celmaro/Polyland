@@ -63,6 +63,7 @@ import { ExecutionEngine } from './execution-engine.js';
 import { CopyPlanner, type CopyBook, type MarketMeta } from './copy-planner.js';
 import { PositionStateMachine, evaluateExit } from './position-state-machine.js';
 import { clusterOf, effectiveContributors, isDiverse, type WalletActionCategory } from './independence-metrics.js';
+import { evaluateConsensusGate, computeWeightedConsensus, computeDominantWalletShare, bayesianConfidence, computeConflictPenalty, classifyMarketRegime } from './quorum-quality.js';
 import { checkExposure, type BasketRiskConfig } from './basket-risk.js';
 function consensusStrength(votes: Map<string, Vote>): number {
   const buys = [...votes.values()].filter(v => v.side === 'BUY');
@@ -191,6 +192,9 @@ export interface QuorumStats {
   quorumSkippedBankroll: number;
   /** Dropped by the anti-sniper guard (mid jump, unstable mid, fill cooldown) */
   quorumSkippedAntiSniper?: number;
+  quorumSkippedCoherence?: number;
+  quorumSkippedWeighted?: number;
+  quorumSkippedDominant?: number;
   /** Dropped by the Chainlink TWAP oracle due to stale data */
   quorumSkippedTwapStale?: number;
   /** Dropped by the Chainlink TWAP oracle due to momentum misalignment */
@@ -1414,8 +1418,47 @@ export class BasketQuorumService {
           this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'quorum_near_miss'));
           return;
         }
-    // Consensus reached. Compute median entry price across all BUY votes.
+    // ---- B1-B5: quorum-quality gates (from official-audit recommendation) ----
+        // Reject a quorum that fires on correlated, thin, or whale-dominated
+        // "consensus". Env-configurable; all fail closed (reject on doubt).
         const buyVotes = [...outcomeVotes.values()].filter((v) => v.side === 'BUY');
+        if (buyVotes.length >= 2) {
+          const aligned = buyVotes.map((v) => ({ wallet: v.wallet, price: v.price, ts: v.timestamp }));
+          const minAligned = Math.max(2, this.quorumFor(basket.category));
+          const coherence = evaluateConsensusGate({
+            aligned,
+            minAligned,
+            maxPriceBand: Number(process.env.B1_MAX_PRICE_BAND ?? 0.15),
+            maxTimeSpreadSec: Number(process.env.B1_MAX_TIME_SPREAD_SEC ?? 3600),
+          });
+          if (!coherence.ok) {
+            this.stats.quorumSkippedCoherence = (this.stats.quorumSkippedCoherence ?? 0) + 1;
+            this.planDecision(this.ledgerDecision(trade, 'quorum', false, coherence.reason ?? 'coherence_gate'));
+            return;
+          }
+          // B2: weighted-size agreement floor (headcount alone insufficient).
+          const weightOf = (w: string) => buyVotes.find((v) => v.wallet === w)?.size ?? 0;
+          const wc = computeWeightedConsensus(
+            aligned.map((a) => a.wallet),
+            aligned.map((a) => a.wallet),
+            weightOf,
+          );
+          const minWeighted = Number(process.env.B2_MIN_WEIGHTED_CONSENSUS ?? 0.0);
+          if (wc.totalWeight > 0 && wc.ratio < minWeighted) {
+            this.stats.quorumSkippedWeighted = (this.stats.quorumSkippedWeighted ?? 0) + 1;
+            this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'below_weighted_consensus'));
+            return;
+          }
+          // B3: dominant-wallet concentration cap.
+          const dominantShare = computeDominantWalletShare(aligned.map((a) => a.wallet), weightOf);
+          const maxDominant = Number(process.env.B3_MAX_DOMINANT_SHARE ?? 1.0);
+          if (dominantShare > maxDominant) {
+            this.stats.quorumSkippedDominant = (this.stats.quorumSkippedDominant ?? 0) + 1;
+            this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'dominant_wallet'));
+            return;
+          }
+        }
+    // Consensus reached. Compute median entry price across all BUY votes.
         const prices = buyVotes.map((v) => v.price).sort((a, b) => a - b);
         const mid = Math.floor(prices.length / 2);
         const consensusPrice =
