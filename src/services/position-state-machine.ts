@@ -1,3 +1,5 @@
+import { effectiveStopLoss, shouldPostEntryInvalidate, trailingExitState } from './execution-quality.js';
+
 /**
  * PositionStateMachine — replacement exit layer for Polyland.
  *
@@ -131,6 +133,12 @@ export interface ExitEvaluationInput {
   bookSpread?: number;
   /** Explicit exit hysteresis per share; defaults to max(2c, halfSpread). */
   exitHysteresisPerShare?: number;
+  /** D3: post-entry microstructure confirmation state. */
+  postEntryInvalidation?: { spreadBps: number; minTopDepth: number | null; maxSpreadBps: number; minTopOfBookShares: number; confirmationTicks: number; tick: number };
+  /** D4: trailing take-profit state inputs. */
+  trailing?: { peakPrice: number; minHoldMs: number; holdMs: number; armProfitPct: number; stage1GivebackPct: number; stage2TriggerPct: number; stage2GivebackPct: number };
+  /** D5: absolute/high-price stop-loss policy. */
+  stopLoss?: { absoluteFloor?: number; highPriceThreshold?: number; highPricePct?: number };
   /** Set when the confirmed leader exit is available. */
   leaderExit?: { leaderShares: number; confirmed: boolean };
   /** Market is resolved and this token won. */
@@ -157,6 +165,18 @@ export function evaluateExit(input: ExitEvaluationInput): ExitAction {
   if (input.riskHalt) return { action: 'RISK_EXIT', quantity: inv, reason: 'risk_halt' };
   if (input.resolvedWinning) return { action: 'RESOLVE', quantity: inv, reason: 'winning_resolved' };
 
+  // D3: confirmed post-entry book deterioration is a fail-fast risk exit.
+  if (input.postEntryInvalidation && shouldPostEntryInvalidate(input.postEntryInvalidation)) {
+    return { action: 'RISK_EXIT', quantity: inv, reason: 'microstructure_invalidation' };
+  }
+  // D4: trailing stop is evaluated before value logic once armed.
+  if (input.trailing && input.entryPrice !== undefined && input.entryPrice > 0) {
+    const trail = trailingExitState({ entry: input.entryPrice as number, current: input.executableBidVwap, peak: input.trailing.peakPrice, ...input.trailing });
+    if (trail.armed && trail.trailingStopPrice !== null && input.executableBidVwap <= trail.trailingStopPrice) {
+      return { action: 'SELL', quantity: inv, reason: 'trailing_stop' };
+    }
+  }
+
   // Bounded adverse-move loss cut. The tolerance shrinks with time remaining:
   // a sub-hour binary has no recovery path, so allow −10% immediately after
   // entry and widen toward the 35% cap only for long-horizon positions
@@ -168,7 +188,14 @@ export function evaluateExit(input: ExitEvaluationInput): ExitAction {
       const scaled = Math.min(maxAdverse, 0.10 + (input.secondsToExpiry / 3600) * 0.25);
       maxAdverse = Math.min(maxAdverse, scaled);
     }
-    if (input.executableBidVwap <= input.entryPrice * (1 - maxAdverse)) {
+    const stop = effectiveStopLoss({
+      entryPrice: input.entryPrice,
+      stopPct: maxAdverse,
+      absoluteFloor: input.stopLoss?.absoluteFloor,
+      highPriceThreshold: input.stopLoss?.highPriceThreshold,
+      highPricePct: input.stopLoss?.highPricePct,
+    });
+    if (input.executableBidVwap <= stop) {
       return { action: 'RISK_EXIT', quantity: inv, reason: 'adverse_move' };
     }
   }

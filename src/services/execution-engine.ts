@@ -7,6 +7,7 @@ import type { ConsensusSignal, ExecutionDecision, PipelineDecision, RejectReason
 import { BankrollReservationLedger } from './bankroll-reservation.js';
 import { computeExactSharesAndCost, quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
 import { executeAgainstBook, type FillBook } from './fill-engine.js';
+import { computeEntryQualityScore, applyRiskAdjustedAmount, effectiveStopLoss } from './execution-quality.js';
 import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 import { classifySubmission } from './submission-pipeline.js';
 import type { MarketQualityTracker } from './market-quality.js';
@@ -21,6 +22,10 @@ export interface ExecutionEngineConfig {
   maxQuoteAgeMs?: number;
   /** Price dry-run fills from live book depth (shared fill-engine). Default true in dry-run. */
   depthAwareFills?: boolean;
+  /** D1 entry-quality gate (opt-in; 0 = disabled). Rejects below the floor. */
+  entryQualityMinScore?: number;
+  /** D2 R-normalized sizing (opt-in): cap so loss-to-stop ≈ target risk. */
+  riskSizing?: { enabled: boolean; targetRiskUsdc: number; stopLossPct: number; absoluteFloor?: number };
 }
 export interface ExecutionEngineDeps {
   tickSizeFor: (conditionId: string) => number;
@@ -123,6 +128,39 @@ export class ExecutionEngine {
     if (signal.consensusPrice > maxEntry) return { accepted: false, reason: 'edge', detail: `price_ceiling ${signal.consensusPrice.toFixed(3)} > ${maxEntry}` };
     const phase = this.deps.phaseEdge(signal);
     if (edge <= phase.minEdge || signal.winRate < phase.minProb) return { accepted: false, reason: 'edge' };
+    // D1: composite entry-quality gate (opt-in). Reject low-quality entries.
+    const eqMin = this.config.entryQualityMinScore ?? 0;
+    if (eqMin > 0) {
+      const ageSeconds = signal.observedAt !== undefined ? (Date.now() - signal.observedAt) / 1000 : 0;
+      const eq = computeEntryQualityScore({
+        signalEdgeBps: edge * 10_000,
+        spreadBps: null,
+        minTopDepth: null,
+        ageSeconds,
+        weights: { edge: 0.4, spread: 0.3, depth: 0.2, freshness: 0.1 },
+      });
+      if (eq.score < eqMin) {
+        this.skipped.quality++;
+        return { accepted: false, reason: 'quality', detail: `entry_quality ${eq.score.toFixed(1)} < ${eqMin}` };
+      }
+    }
+    // D2: R-normalized sizing (opt-in) — cap so loss-to-stop ≈ fixed risk budget.
+    if (this.config.riskSizing?.enabled) {
+      const stopLoss = effectiveStopLoss({
+        entryPrice: signal.consensusPrice,
+        stopPct: this.config.riskSizing.stopLossPct,
+        absoluteFloor: this.config.riskSizing.absoluteFloor,
+      });
+      const r = applyRiskAdjustedAmount({
+        baseUsdc: exact.costUsd,
+        entryPrice: signal.consensusPrice,
+        stopLossPrice: stopLoss,
+        targetRiskUsdc: this.config.riskSizing.targetRiskUsdc,
+      });
+      if (r.adjusted && r.amountUsdc > 0) {
+        exact = computeExactSharesAndCost(r.amountUsdc, price, tick);
+      }
+    }
     if (!this.config.dryRun && trade.tokenId && !(await this.deps.liquidityCheck(trade.tokenId, exact.shares, price))) return { accepted: false, reason: 'liquidity' };
     return { accepted: true, value: { signal, amountUsd: exact.costUsd, price, dryRun: this.config.dryRun } };
   }

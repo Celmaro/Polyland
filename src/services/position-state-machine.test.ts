@@ -218,3 +218,26 @@ describe('PositionStateMachine idempotent lifecycle (P0-4)', () => {
     expect(m2.get('p1')!.shares).toBe(200);
   });
 });
+
+describe('evaluateExit quality exits (D3/D5 wiring)', () => {
+  it('risk-exits on confirmed post-entry microstructure invalidation (D3)', () => {
+    const r = evaluateExit({
+      inventoryShares: 100, entryPrice: 0.5, executableBidVwap: 0.5,
+      sellFeePerShare: 0.001, impactBufferPerShare: 0, fairProb: 0.55,
+      postEntryInvalidation: { spreadBps: 900, minTopDepth: 10, maxSpreadBps: 500, minTopOfBookShares: 100, confirmationTicks: 2, tick: 2 },
+    });
+    expect(r.action).toBe('RISK_EXIT');
+    expect(r.reason).toBe('microstructure_invalidation');
+  });
+
+  it('applies an absolute stop-loss floor (D5)', () => {
+    // With a high absoluteFloor, adverse-move triggers before the relative 35%.
+    const r = evaluateExit({
+      inventoryShares: 100, entryPrice: 1.0, executableBidVwap: 0.70,
+      sellFeePerShare: 0.001, impactBufferPerShare: 0, fairProb: 0.5, maxAdverseMovePct: 0.35,
+      stopLoss: { absoluteFloor: 0.80 },
+    });
+    expect(r.action).toBe('RISK_EXIT');
+    expect(r.reason).toBe('adverse_move');
+  });
+});

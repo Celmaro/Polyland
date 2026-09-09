@@ -4,7 +4,7 @@ export type RejectReason =
   | 'stale' | 'thin' | 'cooldown' | 'restart_dedup' | 'risk'
   | 'bankroll' | 'anti_sniper' | 'twap' | 'drift' | 'edge'
   | 'liquidity' | 'min_size' | 'execution_failed' | 'quorum_near_miss'
-  | 'quorum_reached' | 'executed' | 'stale_quote';
+  | 'quorum_reached' | 'executed' | 'stale_quote' | 'quality';
 export interface CandidateDecision {
   id: string;
   wallet: string;
