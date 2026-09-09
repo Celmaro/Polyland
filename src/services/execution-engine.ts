@@ -200,11 +200,20 @@ export class ExecutionEngine {
         if (this.deps.quality) {
           this.deps.quality.recordBook(trade.tokenId, book);
           const q = this.deps.quality.assess(trade.tokenId, {});
-          if (!q.ok) {
+          // Hard-block ONLY on book-integrity gates (spread/depth) — a thin
+          // market with an insufficient tick history must still be allowed to
+          // fire rather than being permanently locked out (the audit's
+          // min_ticks self-block: fired=0 forever). min_ticks/stale are
+          // advisory and logged, not fatal.
+          const hardBlocked = q.reasons.filter((r) => r === 'spread' || r === 'depth');
+          if (hardBlocked.length > 0) {
             this.skipped.quality++;
             release();
-            console.warn(`[ExecutionEngine] SKIP quality: ${signal.marketSlug} ${q.reasons.join(',')}`);
-            return { ok: false, reason: 'quality', detail: q.reasons.join(',') };
+            console.warn(`[ExecutionEngine] SKIP quality: ${signal.marketSlug} ${hardBlocked.join(',')}`);
+            return { ok: false, reason: 'quality', detail: hardBlocked.join(',') };
+          }
+          if (q.reasons.length > 0) {
+            console.warn(`[ExecutionEngine] quality advisory: ${signal.marketSlug} ${q.reasons.join(',')} — continuing`);
           }
         }
         // Quantized fill size: use the exact-shares computed in evaluate()

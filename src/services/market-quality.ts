@@ -192,10 +192,8 @@ export class MarketQualityTracker {
     const reasons: string[] = [];
     if (features.tickCount < opts.minTicks) reasons.push('min_ticks');
     if (features.lastTickAgeMs > opts.maxTickAgeMs) reasons.push('stale');
-    if (book) {
-      if (opts.maxSpreadBps < Infinity && features.spreadBps !== null && features.spreadBps > opts.maxSpreadBps) reasons.push('spread');
-      if (opts.minDepthUsd > 0 && features.depthUsd < opts.minDepthUsd) reasons.push('depth');
-    }
+    if (book && opts.maxSpreadBps < Infinity && features.spreadBps !== null && features.spreadBps > opts.maxSpreadBps) reasons.push('spread');
+    if (book && opts.minDepthUsd > 0 && features.depthUsd < opts.minDepthUsd) reasons.push('depth');
     return { ok: reasons.length === 0, reasons, features };
   }
 

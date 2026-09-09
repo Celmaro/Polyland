@@ -18,7 +18,8 @@
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { BasketQuorumService } from './basket-quorum-service.js';
 import { fetchWithRetry, shortError } from '../utils/http-client.js';
-import { isTennisMarket, isNonPlainResolutionText } from '../utils/market-classify.js';
+import { isNonPlainResolutionText } from '../utils/market-classify.js';
+import { resolvePayout } from './settlement-matrix.js';
 
 const LOG_INTERVAL = 10;  // log once every N poll cycles
 const CLOB_BASE = 'https://clob.polymarket.com';
@@ -198,15 +199,28 @@ export class GammaResolutionPoller {
       }
       if (winnerIdx >= 0) {
         winningOutcome = tokens[winnerIdx].outcome;
-      } else if (isTennisMarket(marketSlug)) {
-        // CLOB closed on a tennis market without a winner flag: could be a
-        // walkover/retirement (50-50 payout). The slug itself is the hint
-        // (e.g. "atp-2026-final-walkover") — settle HALF conservatively and
-        // leave the signal pending for a real binary resolution.
-        if (isNonPlainResolutionText(marketSlug)) {
-          console.warn(`[ResolutionPoller] tennis non-plain resolution ${marketSlug} — booking 0.5 payout (walkover rule)`);
-          this.quorum.handleMarketResolved(conditionIds[i], undefined, undefined, 0.5);
+      } else {
+        // No winner flag from CLOB — route through the settlement-matrix so
+        // the GENERAL non-plain rules apply (tennis walkover 50-50, stated
+        // payout rules in the slug, conservative hold otherwise). This is the
+        // production wiring the standalone module was missing.
+        const prices: number[] = tokens.map((t) => Number(t.price));
+        const outcomes: string[] = tokens.map((t) => t.outcome);
+        const verdict = resolvePayout({
+          closed: true,
+          prices,
+          outcomes,
+          slug: marketSlug,
+        });
+        if (verdict.kind === 'half_walkover' || verdict.kind === 'void') {
+          console.warn(`[ResolutionPoller] non-plain resolution ${marketSlug} — ${verdict.reason} (payout=${verdict.payout})`);
+          this.quorum.handleMarketResolved(conditionIds[i], undefined, undefined, verdict.payout ?? undefined);
           settled++;
+          continue;
+        }
+        if (verdict.kind === 'unresolved') {
+          // Cannot determine a winner — hold the signal pending (never guess).
+          notResolved++;
           continue;
         }
       }

@@ -19,6 +19,7 @@ import WebSocket from 'isomorphic-ws';
 import { sanitizeErrorMessage } from '../core/errors.js';
 import { FrameQuarantine, type QuarantineReason } from './ws-frame-quarantine.js';
 import { WsConnectionStateMachine } from './ws-connection-state.js';
+import { OrderBookReducer, type BookSide } from './order-book-reducer.js';
 
 // ============================================================================
 // Types
@@ -163,9 +164,9 @@ export class ClobMarketWsService {
 
   /** Clear an asset's book state and request a fresh snapshot (P0-6). */
   invalidateBook(assetId: string, reason: BookInvalidationReason, expected?: number, received?: number): void {
-    this.bookLevels.delete(assetId);
     this.bookMids.delete(assetId);
     this.sequenceByAsset.delete(assetId);
+    this.bookReducers.get(assetId)?.invalidate(reason);
     this.invalidBooks = Math.min(Number.MAX_SAFE_INTEGER, this.invalidBooks + 1);
     this.resyncs = Math.min(Number.MAX_SAFE_INTEGER, this.resyncs + 1);
     try { this.options.onResync?.({ assetId, reason, expected, received }); }
@@ -197,8 +198,10 @@ export class ClobMarketWsService {
 
   /** Book mid price per asset (best bid + best ask) / 2 */
   private bookMids = new Map<string, number>();
-  /** Cumulative book levels; book_update messages may contain deltas, not full books. */
-  private bookLevels = new Map<string, { bids: Map<number, number>; asks: Map<number, number> }>();
+  /** Per-asset book reducers (P22: standalone validated reducer replaces the
+   *  inline bookLevels Map — snapshot/delta semantics, state machine,
+   *  sequence monotonicity, depth/imbalance math). */
+  private readonly bookReducers = new Map<string, OrderBookReducer>();
 
   // ---------------------------------------------------------------------------
   // Public API
@@ -571,27 +574,34 @@ export class ClobMarketWsService {
       // feed-integrity break -> invalidate conservatively.
       this.invalidateBook(asset_id, rawSequence === undefined ? 'missing_sequence' : 'malformed_sequence');
     }
-    const levels = this.bookLevels.get(asset_id) ?? { bids: new Map<number, number>(), asks: new Map<number, number>() };
-    this.bookLevels.set(asset_id, levels);
-    const applyLevels = (
-      incoming: Array<[string, string] | { price: string; size: string }> | undefined,
-      target: Map<number, number>,
-    ): void => {
-      if (!Array.isArray(incoming)) return;
+    let reducer = this.bookReducers.get(asset_id);
+    if (!reducer) { reducer = new OrderBookReducer(); this.bookReducers.set(asset_id, reducer); }
+    // A book_update with both sides is a SNAPSHOT (full replace); a single-side
+    // update is a DELTA. The standalone reducer enforces this + monotonic seq.
+    const hasBids = Array.isArray(bids) && bids.length > 0;
+    const hasAsks = Array.isArray(asks) && asks.length > 0;
+    const parseLevels = (incoming: Array<[string, string] | { price: string; size: string }> | undefined): Array<{ price: number; size: number }> => {
+      if (!Array.isArray(incoming)) return [];
+      const out: Array<{ price: number; size: number }> = [];
       for (const level of incoming) {
         const priceText = Array.isArray(level) ? level[0] : level?.price;
         const sizeText = Array.isArray(level) ? level[1] : level?.size;
         const price = Number(priceText); const size = Number(sizeText);
-        if (!Number.isFinite(price) || price <= 0) continue;
-        if (!Number.isFinite(size) || size <= 0) target.delete(price); else target.set(price, size);
+        if (Number.isFinite(price) && price > 0) out.push({ price, size: Number.isFinite(size) ? size : 0 });
       }
+      return out;
     };
-    applyLevels(bids, levels.bids);
-    applyLevels(asks, levels.asks);
-    const bestBid = Math.max(...levels.bids.keys());
-    const askPrices = [...levels.asks.keys()];
-    const bestAsk = askPrices.length ? Math.min(...askPrices) : NaN;
-    if (!Number.isFinite(bestBid) || !Number.isFinite(bestAsk)) return;
+    if (hasBids && hasAsks) {
+      reducer.applySnapshot('bids', parseLevels(bids), sequence ?? undefined);
+      reducer.applySnapshot('asks', parseLevels(asks), sequence ?? undefined);
+    } else if (hasBids) {
+      for (const l of parseLevels(bids)) reducer.applyDelta('bids', l.price, l.size, sequence ?? undefined);
+    } else if (hasAsks) {
+      for (const l of parseLevels(asks)) reducer.applyDelta('asks', l.price, l.size, sequence ?? undefined);
+    }
+    const bestBid = reducer.bestBid();
+    const bestAsk = reducer.bestAsk();
+    if (bestBid === null || bestAsk === null) return;
     const mid = (bestBid + bestAsk) / 2;
     this.bookMids.set(asset_id, mid);
     this.emitMid({ assetId: asset_id, price: mid, timestamp: Date.now() });
