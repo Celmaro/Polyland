@@ -137,6 +137,12 @@ export interface BasketQuorumConfig {
    */
   bankrollAllocation?: Partial<Record<MarketCategory, number>>;
   /**
+   * Entry-price ceiling (0-1) shared by engine + planner: consensus above
+   * this is rejected (asymmetry guard; default 0.85). Env-tunable via
+   * BASKET_MAX_ENTRY_PRICE in bot-config.
+   */
+  maxEntryPrice?: number;
+  /**
    * Feed-freshness halt: when the newest processed feed event is older than
    * this many ms, copy decisions are skipped (feed_stale) instead of acting
    * on stale consensus. 0 = disabled (default). P1 lens #5.
@@ -1378,36 +1384,39 @@ export class BasketQuorumService {
           return;
         }
     // Consensus reached. Compute median entry price across all BUY votes.
-    const buyVotes = [...outcomeVotes.values()].filter((v) => v.side === 'BUY');
-    const prices = buyVotes.map((v) => v.price).sort((a, b) => a - b);
-    const mid = Math.floor(prices.length / 2);
-    const consensusPrice =
-      prices.length % 2 === 0
-        ? (prices[mid - 1] + prices[mid]) / 2
-        : prices[mid];
-    // Quorum reached: guarantee the token is subscribed before the drift
-    // check runs (markets can jump 1→quorum between votes and never pass
-    // through a near-miss). subscribe() is idempotent + evicts oldest.
-    if (trade.tokenId && this.onMidInterest) this.onMidInterest(trade.tokenId);
-    const signal: ConsensusSignal = {
-      signalId: `${conditionId}-${outcome}-${now}`,
-      conditionId,
-      marketSlug,
-      outcome,
-      category: basket.category,
-      basketName: basket.name,
-      walletCount: primaryCount + satelliteCount,
-      wallets: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').map((v) => v.wallet),
-      consensusPrice,
-      winRate: basket.winRate ?? 0.6,
-            side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
-            totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
-            tokenId: trade.tokenId,
-            observedAt: now,
-          };
-    // Schedule 1h and 24h follow-up price checks (whalewatch-style validation loop)
-    this._scheduleFollowup(signal);
-    this._schedulePersist();
+        const buyVotes = [...outcomeVotes.values()].filter((v) => v.side === 'BUY');
+        const prices = buyVotes.map((v) => v.price).sort((a, b) => a - b);
+        const mid = Math.floor(prices.length / 2);
+        const consensusPrice =
+          prices.length % 2 === 0
+            ? (prices[mid - 1] + prices[mid]) / 2
+            : prices[mid];
+        // Quorum reached: guarantee the token is subscribed before the drift
+        // check runs (markets can jump 1→quorum between votes and never pass
+        // through a near-miss). subscribe() is idempotent + evicts oldest.
+        if (trade.tokenId && this.onMidInterest) this.onMidInterest(trade.tokenId);
+        const signal: ConsensusSignal = {
+          signalId: `${conditionId}-${outcome}-${now}`,
+          conditionId,
+          marketSlug,
+          outcome,
+          category: basket.category,
+          basketName: basket.name,
+          walletCount: primaryCount + satelliteCount,
+          wallets: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').map((v) => v.wallet),
+          consensusPrice,
+          winRate: basket.winRate ?? 0.6,
+                side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
+                totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
+                tokenId: trade.tokenId,
+                observedAt: now,
+              };
+        // NOTE: follow-up [1h]/[24h] telemetry is scheduled ONLY after a
+        // successful execution (inside executeIfInBand's ok branch). Scheduling
+        // it here at quorum-reach printed `entry=0.99` lines for signals the
+        // ceiling/quality gates later REJECTED — the misleading "0.94 entries"
+        // the operator saw in the logs (deep audit 09-09).
+        this._schedulePersist();
     // 7c-pre. Anti-sniper guard (lihanyu81 polymarket_lp_tool pattern):
     //     rejects the fire if the CLOB mid has jumped, the mid hasn't
     //     been stable long enough, or we just filled on this market.
@@ -1582,6 +1591,7 @@ export class BasketQuorumService {
     }, {
       dryRun: this.config.dryRun, orderType: this.config.orderType, maxSlippage: this.config.maxSlippage,
       minTradeSize: this.config.minTradeSize, maxSizePerTrade: this.config.maxSizePerTrade, sizeScale: this.config.sizeScale,
+      maxEntryPrice: this.config.maxEntryPrice,
     });
     this.planDecision(this.ledgerDecision(trade, 'quorum_reached', true, undefined, signal.outcome));
     const decision = await engine.evaluate(signal, trade, basket);
@@ -1618,6 +1628,7 @@ export class BasketQuorumService {
         maxSizeUsd: this.config.maxSizePerTrade,
         reliabilityFloor: 0,
         defaultOrderType: this.config.orderType,
+        maxEntryPrice: this.config.maxEntryPrice,  // planner ceiling syncs with engine (0.85 default)
       });
       const tokenId = trade.tokenId;
       const rawBook = tokenId ? await this.tradingService.getOrderBook(tokenId) : null;
@@ -1710,8 +1721,15 @@ export class BasketQuorumService {
       }
     }
     const result = await engine.execute(decision, trade, basket);
-    if (result.ok) {
-      // P1 lens #4: persist the bucketed feature snapshot for this fire —
+        if (result.ok) {
+          // Schedule 1h and 24h follow-up price checks (whalewatch-style
+          // validation loop) — ONLY for actually-fired signals, so the
+          // `[1h] entry=` telemetry never misleads about rejected signals.
+          // (Deep audit 09-09: follow-ups used to be scheduled at quorum-reach,
+          // before the 0.85 ceiling, so logs showed entry=0.99 for never-bought
+          // signals.)
+          this._scheduleFollowup(signal);
+          // P1 lens #4: persist the bucketed feature snapshot for this fire —
       // probability (consensus), spread/depth/chop from the quality tracker
       // (all that is observable in this path), for replay + gating inputs.
       if (this.marketSnapshots) {
@@ -1766,6 +1784,9 @@ export class BasketQuorumService {
           break;
         case 'quality':
           this.stats.quorumSkippedQuality = (this.stats.quorumSkippedQuality ?? 0) + 1;
+          break;
+        case 'entry_ceiling':
+          this.stats.quorumSkippedNegativeEdge = (this.stats.quorumSkippedNegativeEdge ?? 0) + 1;
           break;
         default:
           this.stats.failed++;

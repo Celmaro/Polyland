@@ -44,7 +44,7 @@ export interface ExecutionEngineDeps {
 
 export type ExecuteResult =
   | { ok: true; orderId?: string }
-  | { ok: false; reason: RejectReason | 'order' | 'depth_unknown' | 'no_depth' | 'quality'; detail?: string };
+  | { ok: false; reason: RejectReason | 'order' | 'depth_unknown' | 'no_depth' | 'quality' | 'entry_ceiling'; detail?: string };
 
 /** Skip/failure taxonomy — the audit's failed=N conflation fix. */
 export interface ExecutionSkips {
@@ -53,6 +53,7 @@ export interface ExecutionSkips {
   depthUnknown: number;
   noDepth: number;
   quality: number;
+  entryCeiling: number;
 }
 
 export class ExecutionEngine {
@@ -60,7 +61,7 @@ export class ExecutionEngine {
   /** Genuine order failures ONLY (venue reject / throw). Skips are not failures. */
   public failed = 0;
   /** Fail-closed skips by reason — visible in the funnel, not conflated with failed. */
-  public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0 };
+  public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0, entryCeiling: 0 };
   /** Per-category rate-limit state for bankroll-saturation warnings. */
   private _lastBankrollLogAt = new Map<string, number>();
   constructor(
@@ -122,6 +123,15 @@ export class ExecutionEngine {
   async execute(decision: Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, trade?: SmartMoneyTrade, basket?: BasketConfig): Promise<ExecuteResult> {
     const { signal, amountUsd, price } = decision.value;
     const category = basket?.category ?? signal.category;
+    // Defense-in-depth: the planner may replace the engine's initial price
+    // with executable VWAP. Re-apply the SAME shared ceiling at the final
+    // mutation boundary so executed/audited prices can never exceed it.
+    const maxEntry = this.config.maxEntryPrice ?? 0.85;
+    if (price > maxEntry) {
+      this.skipped.entryCeiling++;
+      console.warn(`[ExecutionEngine] SKIP entry-ceiling: ${signal.marketSlug} final_price=${price.toFixed(3)} > max=${maxEntry.toFixed(3)}`);
+      return { ok: false, reason: 'entry_ceiling', detail: `final_price=${price} max=${maxEntry}` };
+    }
     // Stale-quote cancellation: never reserve/route on an expired quote
     // even if evaluate() predates this call (defense in depth).
     const maxQuoteAge = this.config.maxQuoteAgeMs ?? 30_000;

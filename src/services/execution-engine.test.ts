@@ -167,8 +167,22 @@ describe('ExecutionEngine stale-quote gating (P1)', () => {
     expect(decision.accepted).toBe(true);
   });
 
+  it('execute() rejects a final planner price above the shared entry ceiling', async () => {
+    const deps = makeDeps();
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, maxEntryPrice: 0.85 });
+    const forced = {
+      accepted: true,
+      value: { signal: { ...SIGNAL, consensusPrice: 0.80 }, amountUsd: 5, price: 0.90, dryRun: true },
+    } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>;
+    const result = await engine.execute(forced, TRADE, BASKET);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('entry_ceiling');
+    expect(engine.failed).toBe(0);
+    expect(engine.skipped.entryCeiling).toBe(1);
+  });
+
   it('execute() on a stale signal does not reserve/spend and returns ok:false', async () => {
-    vi.useFakeTimers();
+      vi.useFakeTimers();
     vi.setSystemTime(T0);
     let spent = 0;
     let opened = 0;

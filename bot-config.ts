@@ -52,6 +52,12 @@ const CONFIG = {
       maxSizePerTrade: 15,
       maxSlippage: 0.03,
       minTradeSize: 5,
+      // 🔴 ENTRY CEILING: never buy consensus above this price (asymmetry guard).
+      // 0.85 default — the audit's 0.90-0.95 top-buy loss driver. Now env-tunable
+      // via BASKET_MAX_ENTRY_PRICE so the cap is actually CONFIGURABLE (it was a
+      // hardcoded engine/planner default before; the effective executed price
+      // could still reach 0.90 via the CopyPlanner VWAP adoption).
+      maxEntryPrice: parseFloat(process.env.BASKET_MAX_ENTRY_PRICE ?? '0.85'),
       delay: 500,
       // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
       customWallets: [
@@ -159,6 +165,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
   orderType: 'FOK',
   minTradeSize: CONFIG.smartMoney.minTradeSize,
   dryRun: CONFIG.dryRun,
+  /** Entry-price ceiling (0-1): reject consensus above this. 0.85 default. */
+  maxEntryPrice: CONFIG.smartMoney.maxEntryPrice,
   bankrollAllocation: {
     crypto: 0.35,
     sports: 0.10,
@@ -277,7 +285,7 @@ function displayStatus(runtime: PolylandRuntime) {
   const lines: string[] = [`[status] t=${runtimeMinutes}m mode=${CONFIG.dryRun ? 'DRY RUN' : 'LIVE'} ${status}`];
   if (f) {
     const conversion = f.quorumFired === 0 ? 0 : (f.executed / f.quorumFired * 100).toFixed(1);
-    lines.push(`[quorum] received=${f.feedReceived} ignored=${f.ignoredNoBasket + f.ignoredNotMember + f.ignoredUnsupportedSide + f.ignoredInvalidMarket} recorded=${f.votesRecorded} filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket} fired=${f.quorumFired} risk=${f.quorumSkippedRiskHalt} bankroll=${f.quorumSkippedBankroll} drift=${f.quorumSkippedDrift} antiSniper=${f.quorumSkippedAntiSniper ?? 0} twap=${f.quorumSkippedTwapStale ?? 0}/${f.quorumSkippedTwapMisaligned ?? 0} liq=${f.quorumSkippedThinLiquidity ?? 0} negEdge=${f.quorumSkippedNegativeEdge ?? 0} executed=${f.executed} failed=${f.failed} conv=${conversion}%`);
+    lines.push(`[quorum] received=${f.feedReceived} ignored=${f.ignoredNoBasket + f.ignoredNotMember + f.ignoredUnsupportedSide + f.ignoredInvalidMarket} recorded=${f.votesRecorded} filtered=${f.quorumSkippedThinEdge + f.quorumSkippedStaleMarket} fired=${f.quorumFired} risk=${f.quorumSkippedRiskHalt} bankroll=${f.quorumSkippedBankroll} drift=${f.quorumSkippedDrift} antiSniper=${f.quorumSkippedAntiSniper ?? 0} twap=${f.quorumSkippedTwapStale ?? 0}/${f.quorumSkippedTwapMisaligned ?? 0} liq=${f.quorumSkippedThinLiquidity ?? 0} negEdge=${f.quorumSkippedNegativeEdge ?? 0} execSkips=${f.quorumSkippedStaleQuote ?? 0}/${f.quorumSkippedFeedStale ?? 0}/${f.quorumSkippedQuality ?? 0} nearMiss=${f.quorumNearMissIndependence ?? 0}/${f.quorumNearMissConsensus ?? 0}/${f.quorumNearMissExecution ?? 0} executed=${f.executed} failed=${f.failed} conv=${conversion}%`);
   }
   lines.push(e.signalsSettled > 0 ? `[edge] exp=${e.meanExpectedEdge.toFixed(4)} real=${e.meanRealizedEdge.toFixed(4)} alpha=${e.edgeAlpha.toFixed(4)} sig=${e.isSignificant} (n=${e.signalsSettled} settled/${e.signalsFired} fired)` : `[edge] no settled signals yet (fired=${e.signalsFired})`);
     lines.push(runtime.goLiveStatusLine());
