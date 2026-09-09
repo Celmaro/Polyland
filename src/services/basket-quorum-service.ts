@@ -841,9 +841,20 @@ export class BasketQuorumService {
     // 2. Only count wallets that are members of this basket.
     const traderKey = trade.traderAddress.toLowerCase();
     if (!basket.wallets.includes(traderKey)) {
-      this.stats.ignoredNotMember++;
-      this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'not_member'));
-      return;
+      // PAPER-FIRE WINDOW (fork a): in DRY_RUN with PAPER_BROADEN_MEMBERSHIP,
+      // any screened-eligible wallet (PRIMARY/SATELLITE tier) counts toward
+      // quorum even when not seeded into this basket's wallet list. This lets
+      // consensus actually form in paper mode so the downstream pipeline
+      // (ceiling, quality gate, follow-ups, settlement) gets exercised and
+      // shows real behavior — instead of fired=0 forever.
+      const paperBroaden = this.paperExploration &&
+        process.env.PAPER_BROADEN_MEMBERSHIP === 'true' &&
+        this.walletTierMap.has(traderKey);
+      if (!paperBroaden) {
+        this.stats.ignoredNotMember++;
+        this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'not_member'));
+        return;
+      }
     }
     // 3. Only BUY votes contribute to a buy-consensus we act on. (SELL votes
     //    are recorded but not counted toward firing, so we can see counter-flow.)

@@ -42,7 +42,14 @@ export type MarketCategory =
   | 'crypto'
   | 'politics'
   | 'sports'
+  | 'football'
+  | 'basketball'
+  | 'tennis'
+  | 'motorsports'
+  | 'boxing_ufc'
   | 'esports'
+  | 'baseball'
+  | 'cricket'
   | 'entertainment'
   | 'economics'
   | 'science'
@@ -58,12 +65,19 @@ export type MarketCategory =
 export const CATEGORY_KEYWORDS: Record<MarketCategory, RegExp> = {
   crypto: /\b(btc|bitcoin|eth|ethereum|sol|solana|xrp|crypto|doge|ada|matic|cardano|polkadot|avax|toncoin|ton|stablecoin|usdc|usdt|altcoin|defi|dex|swap|halving|airdrop|staking|yield)\b/i,
   politics: /\b(trump|biden|election|president|senate|congress|vote|political|maga|democrat|republican|governor|mayor|polls|primary|caucus|impeach|pelosi|gop|dnc|rnc|ballot|cabinet|legislat|amendment|partisan)\b/i,
-  sports: /\b(nfl|nba|mlb|nhl|super bowl|world cup|championship|game|match|ufc|soccer|football|basketball|baseball|tennis|atp|wta|wimbledon|us open|french open|australian open|f1|formula 1|grand prix|golf|pga|boxing|mma|olympics|ncaa|premier league|la liga|bundesliga|serie a|ligue 1|champions league|epl|copa|del rey|fa cup|stanley cup|playoff|quarterback|touchdown|hat trick|cricket|ipl|t20|handball|volleyball|rugby|cycling|tour de france|darts|snooker|skiing|biathlon|swimming|athletics|marathon)\b/i,
+  sports: /\b(super bowl|world cup|championship|game|match|olympics|playoff|quarterback|touchdown|hat trick|tour de france|darts|snooker|skiing|biathlon|swimming|athletics|marathon|nhl|hockey|golf|pga|cycling|volleyball|handball|rugby)\b/i,
+  football: /\b(nfl|soccer|football|premier league|la liga|bundesliga|serie a|ligue 1|champions league|epl|copa|del rey|fa cup|world cup|euro 202|uefa|ncaa football|super bowl|quarterback|touchdown|hat trick)\b/i,
+  basketball: /\b(nba|wnba|basketball|ncaa basketball|ncaab|ncaa m|euroleague|nbl|slam dunk|three pointer|final four|march madness)\b/i,
+  tennis: /\b(tennis|atp|wta|itf|wimbledon|us open|french open|australian open|roland garros|grand slam|challenger|hard court|clay court|tiebreak|set point|match point)\b/i,
+  motorsports: /\b(f1|formula 1|formula one|grand prix|motogp|nascar|indycar|indy 500|le mans|wec|f2|f3|rally|wrc|supercars|monaco gp|monza|silverstone|spa)\b/i,
+  boxing_ufc: /\b(ufc|boxing|boxer|mma|mma fight|heavyweight|lightweight|featherweight|bantamweight|title fight|knockout|ko win|decision win|bjj|grappling|p4p|champ|belal|jon jones|makhachev|pantoja|dana white)\b/i,
   esports: /\b(esports|e-sports|valorant|csgo|cs2|counter-strike|counter strike|lol|league of legends|dota|dota 2|overwatch|apex legends|fortnite|call of duty|cod|warzone|rocket league|hearthstone|starcraft|pubg|rainbow six|r6|twitch|gaming|gamer|pro league|grand final|the international)\b/i,
+  baseball: /\b(mlb|baseball|world series|american league|national league|home run|no-hitter|perfect game|dodgers|yankees|red sox|cubs|braves|astros|phillies|padres|mets|guardians|orioles|rangers)\b/i,
+  cricket: /\b(cricket|ipl|t20|bbl|cpl|ashes|test match|one day|odi|wpl|bazball|stumps|wicket|bowler|batsman|century|50 over|world cup cricket)\b/i,
   economics: /\b(fed|interest rate|inflation|gdp|recession|economic|unemployment|cpi|powell|taper|rate hike|rate cut|jobs report|nfp|nonfarm|consumer price|treasury|bond yield|yield curve|housing starts|wage growth|consumer confidence|pmi|ism|fomc)\b/i,
   entertainment: /\b(oscar|grammy|movie|film|twitter|celebrity|entertainment|netflix|spotify|disney|marvel|dc|emmy|tony award|album|artist|actor|actress|box office|theater|premiere|streaming|tiktok|youtube|reality tv|kardashian)\b/i,
   science: /\b(spacex|nasa|ai|openai|google|apple|tesla|tech|technology|science|chatgpt|gpt|llm|anthropic|claude|gemini|deepmind|quantum|nvidia|amd|chip|semiconductor|robot|space|rocket|mars|climate|carbon|emission|gene|crispr|vaccine|fda|drug|trial)\b/i,
-  other: /.*/, // Matches everything as fallback
+  other: /.*/,
 };
 
 /**
@@ -88,11 +102,16 @@ export function categorizeMarket(title: string): MarketCategory {
   // both 'us open' and 'us-open' match.
   const lowerTitle = title.toLowerCase().replace(/[-_]+/g, ' ');
 
-  // Check each category in priority order. Esports is checked BEFORE
-  // entertainment because 'league' alone is ambiguous but 'league of
-  // legends' must hit esports.
+  // Check specific sports sub-baskets BEFORE broad sports fallback.
   if (CATEGORY_KEYWORDS.crypto.test(lowerTitle)) return 'crypto';
   if (CATEGORY_KEYWORDS.politics.test(lowerTitle)) return 'politics';
+  if (CATEGORY_KEYWORDS.football.test(lowerTitle)) return 'football';
+  if (CATEGORY_KEYWORDS.basketball.test(lowerTitle)) return 'basketball';
+  if (CATEGORY_KEYWORDS.tennis.test(lowerTitle)) return 'tennis';
+  if (CATEGORY_KEYWORDS.motorsports.test(lowerTitle)) return 'motorsports';
+  if (CATEGORY_KEYWORDS.boxing_ufc.test(lowerTitle)) return 'boxing_ufc';
+  if (CATEGORY_KEYWORDS.baseball.test(lowerTitle)) return 'baseball';
+  if (CATEGORY_KEYWORDS.cricket.test(lowerTitle)) return 'cricket';
   if (CATEGORY_KEYWORDS.sports.test(lowerTitle)) return 'sports';
   if (CATEGORY_KEYWORDS.esports.test(lowerTitle)) return 'esports';
   if (CATEGORY_KEYWORDS.economics.test(lowerTitle)) return 'economics';
@@ -376,7 +395,14 @@ export const CATEGORY_COLORS: Record<MarketCategory, string> = {
   crypto: '#f7931a',      // Bitcoin orange
   politics: '#3b82f6',    // Blue
   sports: '#22c55e',      // Green
+  football: '#10b981',    // Emerald
+  basketball: '#f97316',  // Orange
+  tennis: '#a3e635',      // Lime
+  motorsports: '#ef4444', // Red
+  boxing_ufc: '#8b5cf6',  // Violet
   esports: '#ec4899',     // Pink/magenta — distinct from entertainment
+  baseball: '#f59e0b',    // Amber
+  cricket: '#14b8a6',     // Teal
   entertainment: '#a855f7', // Purple
   economics: '#eab308',   // Yellow
   science: '#06b6d4',     // Cyan
@@ -390,7 +416,14 @@ export const CATEGORY_LABELS: Record<MarketCategory, string> = {
   crypto: 'Crypto',
   politics: 'Politics',
   sports: 'Sports',
+  football: 'Football',
+  basketball: 'Basketball',
+  tennis: 'Tennis',
+  motorsports: 'Motorsports',
+  boxing_ufc: 'Boxing/UFC',
   esports: 'Esports',
+  baseball: 'Baseball',
+  cricket: 'Cricket',
   entertainment: 'Entertainment',
   economics: 'Economics',
   science: 'Science',

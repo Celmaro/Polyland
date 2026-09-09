@@ -22,7 +22,7 @@ import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { Counter, Gauge, Histogram, Summary, MetricRegistry, POLYLAND_BUCKETS } from './metrics.js';
 
 export const LABEL_VOCABULARY = {
-  category: ['crypto', 'politics', 'sports', 'esports', 'entertainment', 'economics', 'science', 'other'],
+  category: ['crypto', 'politics', 'sports', 'football', 'basketball', 'tennis', 'motorsports', 'boxing_ufc', 'esports', 'baseball', 'cricket', 'entertainment', 'economics', 'science', 'other'],
   outcome: ['won', 'lost', 'pending'],
   side: ['BUY', 'SELL'],
   tier: ['PRIMARY', 'SATELLITE', 'WATCHLIST', 'all'],

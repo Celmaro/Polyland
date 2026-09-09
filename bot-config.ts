@@ -38,10 +38,11 @@ const CONFIG = {
   },
   smartMoney: {
       enabled: true,  // basket-quorum copy trading — do NOT disable
-      topN: 50,        // 50 per category × 5 categories ≈ 200+ candidates after dedup
-      // 🔴 FIXED: Stricter criteria
-      minWinRate: 0.60,  // Up from 0.50 to 60%
-      minPnl: 500,       // Up from 100 to $500
+      topN: Number(process.env.SMART_MONEY_TOP_N ?? 100), // expanded candidate pool for quality-basket discovery
+      // Screening thresholds remain strict by default; paper mode can widen
+      // discovery without enabling live risk by setting SMART_MONEY_MIN_PNL.
+      minWinRate: 0.60,
+      minPnl: Number(process.env.SMART_MONEY_MIN_PNL ?? 500),  // paper mode can lower via env
       minTrades: 30,     // Up from 20 to 30
       // 🔴 NEW: Quality filters
       minProfitFactor: 1.5,  // Total wins / total losses >= 1.5x
@@ -168,17 +169,24 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
   /** Entry-price ceiling (0-1): reject consensus above this. 0.85 default. */
   maxEntryPrice: CONFIG.smartMoney.maxEntryPrice,
   bankrollAllocation: {
-    crypto: 0.35,
-    sports: 0.10,
+    crypto: 0.20,
     politics: 0.10,
+    sports: 0.03,
+    football: 0.06,
+    basketball: 0.06,
+    tennis: 0.02,
+    motorsports: 0.04,
+    boxing_ufc: 0.05,
     esports: 0.05,
-    economics: 0.05,
-    entertainment: 0.05,
-    science: 0.05,
-    other: 0.05,
-    // remainder (0.20) = reserve, unallocated.
+    baseball: 0.04,
+    cricket: 0.03,
+    economics: 0.04,
+    entertainment: 0.04,
+    science: 0.04,
+    other: 0.02,
+    // remainder (0.18) = reserve, unallocated.
     // NOTE: every category MUST be listed — seed() rebuilds baskets for all
-    // 8 categories from wallet data, and an unlisted category defaults to a
+    // 15 categories from wallet data, and an unlisted category defaults to a
     // 100%-of-capital slice (observed: other=107 wallets got the full bankroll).
   },
   baskets: [
@@ -197,6 +205,69 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       enabled: true,
       wallets: [],
       quorum: 3,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.52,
+    },
+    {
+      name: 'Football Quorum',
+      category: 'football',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.52,
+    },
+    {
+      name: 'Basketball Quorum',
+      category: 'basketball',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.52,
+    },
+    {
+      name: 'Tennis Quorum',
+      category: 'tennis',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.5,
+    },
+    {
+      name: 'Motorsports Quorum',
+      category: 'motorsports',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.52,
+    },
+    {
+      name: 'Boxing/UFC Quorum',
+      category: 'boxing_ufc',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.52,
+    },
+    {
+      name: 'Baseball Quorum',
+      category: 'baseball',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
+      windowMs: 30 * 60 * 1000,
+      winRate: 0.52,
+    },
+    {
+      name: 'Cricket Quorum',
+      category: 'cricket',
+      enabled: true,
+      wallets: [],
+      quorum: 2,
       windowMs: 30 * 60 * 1000,
       winRate: 0.52,
     },
@@ -331,6 +402,9 @@ async function main() {
       risk: CONFIG.risk,
       smartMoney: CONFIG.smartMoney,
       botMetrics, // wire the parallel Prometheus surface
+      // Paper-fire window: broaden basket membership so consensus can form
+      // and exercise the full pipeline in DRY_RUN (PAPER_BROADEN_MEMBERSHIP=true).
+      paperExploration: process.env.PAPER_BROADEN_MEMBERSHIP === 'true',
     },
     screeningConfig,
     BASKET_QUORUM_CONFIG,
