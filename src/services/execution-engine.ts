@@ -8,6 +8,7 @@ import { BankrollReservationLedger } from './bankroll-reservation.js';
 import { computeExactSharesAndCost, quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
 import { executeAgainstBook, type FillBook } from './fill-engine.js';
 import { takerFeePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
+import type { MarketQualityTracker } from './market-quality.js';
 
 export interface ExecutionEngineConfig {
   dryRun: boolean; orderType: 'FOK' | 'FAK'; maxSlippage: number;
@@ -35,12 +36,30 @@ export interface ExecutionEngineDeps {
   onStaleQuoteSkip?: () => void;
   /** P1-5: live book lookup so dry-run fills use the SAME depth model as replay. */
   bookLookup?: (tokenId: string) => Promise<FillBook | null>;
+  /** P1 market-quality: chop size modifier + depth gate (lens #1/#3). */
+  quality?: MarketQualityTracker;
   auditStore: { recordFire: (params: Record<string, unknown>) => unknown };
+}
+
+export type ExecuteResult =
+  | { ok: true; orderId?: string }
+  | { ok: false; reason: RejectReason | 'order' | 'depth_unknown' | 'no_depth' | 'quality'; detail?: string };
+
+/** Skip/failure taxonomy — the audit's failed=N conflation fix. */
+export interface ExecutionSkips {
+  staleQuote: number;
+  bankroll: number;
+  depthUnknown: number;
+  noDepth: number;
+  quality: number;
 }
 
 export class ExecutionEngine {
   private readonly ledger: BankrollReservationLedger<string>;
+  /** Genuine order failures ONLY (venue reject / throw). Skips are not failures. */
   public failed = 0;
+  /** Fail-closed skips by reason — visible in the funnel, not conflated with failed. */
+  public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0 };
   /** Per-category rate-limit state for bankroll-saturation warnings. */
   private _lastBankrollLogAt = new Map<string, number>();
   constructor(
@@ -62,6 +81,14 @@ export class ExecutionEngine {
     let amount = Math.min(signal.totalSize * this.config.sizeScale * signal.consensusPrice, this.config.maxSizePerTrade);
     if (this.riskManager) amount = this.riskManager.sizeOrder(amount);
     amount = Math.min(amount, Math.max(0, this.deps.bankrollFor(category) - spent));
+    // P1 lens #3: chop-based size reduction — a churning thin market trades
+    // smaller, never full size. Applied BEFORE quantization so the reduced
+    // notional flows through the exact-shares math.
+    if (this.deps.quality && amount > 0) {
+      const assetId = trade.tokenId ?? signal.conditionId;
+      const mul = this.deps.quality.sizeMultiplier(assetId);
+      if (mul < 1) amount = amount * mul;
+    }
     const tick = tickSizeToEnum(this.deps.tickSizeFor(signal.conditionId));
     const price = quantizeBuyPrice(signal.consensusPrice * (1 + this.config.maxSlippage), tick);
     let exact = computeExactSharesAndCost(amount, price, tick);
@@ -91,24 +118,24 @@ export class ExecutionEngine {
     return { accepted: true, value: { signal, amountUsd: exact.costUsd, price, dryRun: this.config.dryRun } };
   }
 
-  async execute(decision: Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, trade?: SmartMoneyTrade, basket?: BasketConfig): Promise<{ ok: boolean; orderId?: string }> {
+  async execute(decision: Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, trade?: SmartMoneyTrade, basket?: BasketConfig): Promise<ExecuteResult> {
     const { signal, amountUsd, price } = decision.value;
     const category = basket?.category ?? signal.category;
     // Stale-quote cancellation: never reserve/route on an expired quote
     // even if evaluate() predates this call (defense in depth).
     const maxQuoteAge = this.config.maxQuoteAgeMs ?? 30_000;
     if (signal.observedAt !== undefined && Date.now() - signal.observedAt > maxQuoteAge) {
-      this.failed++;
+      this.skipped.staleQuote++;
       this.deps.onStaleQuoteSkip?.();
       console.warn(`[ExecutionEngine] SKIP stale quote: ${signal.marketSlug} age_ms=${Date.now() - signal.observedAt}`);
-      return { ok: false };
+      return { ok: false, reason: 'stale_quote', detail: `age_ms=${Date.now() - signal.observedAt}` };
     }
     const release = this.ledger.reserve(category, amountUsd, this.deps.basketSpendGet(category));
     if (!release) {
       // Bankroll saturation: make the invisible failure visible. The audit
       // (09-07) showed failed=52 vs executed=24 (68% rejection) with zero
       // operator-visible reason. Rate-limited to one line per 60s per category.
-      this.failed++;
+      this.skipped.bankroll++;
       const now = Date.now();
       const last = this._lastBankrollLogAt.get(category) ?? 0;
       if (now - last >= 60_000) {
@@ -121,14 +148,14 @@ export class ExecutionEngine {
           `(${(spent * 100 / Math.max(limit, 1)).toFixed(0)}%), wanted $${amountUsd.toFixed(2)} for ${signal.marketSlug}`
         );
       }
-      return { ok: false };
+      return { ok: false, reason: 'bankroll' };
     }
     try {
       let result: OrderResult;
       if (decision.value.dryRun) result = { success: true, orderId: `dry_run_${Date.now()}` };
       else if (!trade?.tokenId) throw new Error('missing tokenId');
       else result = await this.tradingService.createMarketOrder({ tokenId: trade.tokenId, side: 'BUY', amount: amountUsd, price, orderType: this.config.orderType });
-      if (!result.success) { this.failed++; release(); return { ok: false }; }
+      if (!result.success) { this.failed++; release(); return { ok: false, reason: 'order' }; }
       // ---- depth-aware dry-run fill (P1-5): same fill engine as replay ----
       // When enabled, a dry-run order is priced through the live book with the
       // shared executeAgainstBook model: partial fills and executable VWAP are
@@ -140,15 +167,34 @@ export class ExecutionEngine {
       if (depthAware && decision.value.dryRun && trade?.tokenId && this.deps.bookLookup) {
         const book = await this.deps.bookLookup(trade.tokenId);
         if (!book) {
-          this.failed++; release();
+          this.skipped.depthUnknown++;
+          release();
           console.warn(`[ExecutionEngine] SKIP depth-unknown: no live book for ${trade.tokenId}`);
-          return { ok: false };
+          return { ok: false, reason: 'depth_unknown' };
         }
-        const fill = executeAgainstBook({ side: 'BUY', size: amountUsd / price, maxPrice: price }, book);
+        // P1 lens #1: market-quality gate on the live book BEFORE filling —
+        // thin/churning markets (tennis/ITF) are rejected at execution, not
+        // after the reservation. Record the book into the tracker too, so
+        // features stay fresh for the next review pass.
+        if (this.deps.quality) {
+          this.deps.quality.recordBook(trade.tokenId, book);
+          const q = this.deps.quality.assess(trade.tokenId, {});
+          if (!q.ok) {
+            this.skipped.quality++;
+            release();
+            console.warn(`[ExecutionEngine] SKIP quality: ${signal.marketSlug} ${q.reasons.join(',')}`);
+            return { ok: false, reason: 'quality', detail: q.reasons.join(',') };
+          }
+        }
+        // Quantized fill size: use the exact-shares computed in evaluate()
+        // (already tick-quantized) rather than a naive amountUsd/price division.
+        const sizeForBook = computeExactSharesAndCost(amountUsd, price, tickSizeToEnum(this.deps.tickSizeFor(signal.conditionId))).shares;
+        const fill = executeAgainstBook({ side: 'BUY', size: sizeForBook, maxPrice: price }, book);
         if (fill.verdict !== 'filled' || fill.executableSize <= 0) {
-          this.failed++; release();
+          this.skipped.noDepth++;
+          release();
           console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} has no executable level`);
-          return { ok: false };
+          return { ok: false, reason: 'no_depth' };
         }
         auditPrice = fill.executableVwap;
         auditShares = fill.executableSize;
@@ -162,6 +208,10 @@ export class ExecutionEngine {
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
       if (trade?.tokenId) this.deps.onAntiSniperFire(trade.tokenId);
       return { ok: true, orderId: result.orderId };
-    } catch { this.failed++; release(); return { ok: false }; }
+    } catch {
+      this.failed++;
+      release();
+      return { ok: false, reason: 'order' };
+    }
   }
 }

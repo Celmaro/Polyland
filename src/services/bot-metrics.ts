@@ -59,6 +59,14 @@ export interface FunnelStatsSnapshot {
   realizedEdgePerShare?: number;
   firedCategory?: string;
   firedSide?: 'BUY' | 'SELL';
+  // Audit 09-09 skip taxonomy (fail-closed gates counted separately from
+  // real order failures) + quorum near-miss rollups.
+  skippedStaleQuote?: number;
+  skippedFeedStale?: number;
+  skippedQuality?: number;
+  nearMissInd?: number;
+  nearMissCons?: number;
+  nearMissExec?: number;
 }
 
 // ============================================================================
@@ -92,6 +100,18 @@ export class BotMetrics {
     'polyland_funnel_skipped_total',
     'Fires skipped at a pre-execution gate',
     ['reason', 'category'],
+  );
+  // Fail-closed execution gates + quorum near-miss rollups (audit 09-09):
+  // these used to vanish into stats.failed; now each is its own counter.
+  private readonly cExecGate = this.registry.counter(
+    'polyland_funnel_exec_gate_total',
+    'Fail-closed execution gates by gate type',
+    ['gate', 'category'],
+  );
+  private readonly cNearMiss = this.registry.counter(
+    'polyland_funnel_near_miss_total',
+    'Quorum reached but blocked at a downstream gate',
+    ['gate', 'category'],
   );
   private readonly cLabelViolations = this.registry.counter(
     'polyland_metric_label_violations_total',
@@ -226,6 +246,27 @@ export class BotMetrics {
         const d = cur >= last ? cur - last : cur;
         if (d !== 0) this.cSkipped.inc({ reason: this.label('reason', reason), category: cat }, d);
       }
+    }
+    // Dedicated counters make fail-closed execution gates and quorum
+    // near-misses visible instead of inflating `failed`.
+    const gateDeltas: Array<[string, number | undefined]> = [
+      ['stale_quote', s.skippedStaleQuote],
+      ['feed_stale', s.skippedFeedStale],
+      ['quality', s.skippedQuality],
+    ];
+    const previous = prev ?? {};
+    for (const [gate, value] of gateDeltas) {
+      const d = delta(value ?? 0, gate as keyof FunnelStatsSnapshot);
+      if (d) this.cExecGate.inc({ gate, category: cat }, d);
+    }
+    const nearDeltas: Array<[string, number | undefined]> = [
+      ['independence', s.nearMissInd],
+      ['consensus', s.nearMissCons],
+      ['execution', s.nearMissExec],
+    ];
+    for (const [gate, value] of nearDeltas) {
+      const d = delta(value ?? 0, gate as keyof FunnelStatsSnapshot);
+      if (d) this.cNearMiss.inc({ gate, category: cat }, d);
     }
   }
 

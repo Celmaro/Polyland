@@ -17,6 +17,8 @@
 
 import { GammaApiClient } from '../clients/gamma-api.js';
 import { BasketQuorumService } from './basket-quorum-service.js';
+import { fetchWithRetry, shortError } from '../utils/http-client.js';
+import { isTennisMarket, isNonPlainResolutionText } from '../utils/market-classify.js';
 
 const LOG_INTERVAL = 10;  // log once every N poll cycles
 const CLOB_BASE = 'https://clob.polymarket.com';
@@ -91,10 +93,12 @@ export class GammaResolutionPoller {
   private async fetchClobMarket(conditionId: string): Promise<ClobMarketResponse | null> {
     try {
       const url = `${CLOB_BASE}/markets/${conditionId}`;
-      const res = await fetch(url, {
+      // Shared resilient HTTP layer (polyledger pattern): jittered backoff,
+      // Retry-After honored, 5xx/429 retried — the 09-09 Gamma DNS outage
+      // flooded logs with raw undici stack dumps instead of one-liners.
+      const res = await fetchWithRetry(url, {
         headers: { 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(10_000),
-      });
+      }, { timeoutMs: 10_000, retries: 2 });
       if (!res.ok) {
         if (res.status === 404) return null;
         throw new Error(`CLOB ${res.status}: ${await res.text()}`);
@@ -137,7 +141,7 @@ export class GammaResolutionPoller {
       const result = results[i];
       if (result.status !== 'fulfilled') {
         errors++;
-        console.warn(`[ResolutionPoller] fetch failed for ${conditionIds[i].slice(0, 10)}: ${result.reason}`);
+        console.warn(`[ResolutionPoller] fetch failed for ${conditionIds[i].slice(0, 10)}: ${shortError(result.reason)}`);
         continue;
       }
       if (!result.value) {
@@ -194,6 +198,17 @@ export class GammaResolutionPoller {
       }
       if (winnerIdx >= 0) {
         winningOutcome = tokens[winnerIdx].outcome;
+      } else if (isTennisMarket(marketSlug)) {
+        // CLOB closed on a tennis market without a winner flag: could be a
+        // walkover/retirement (50-50 payout). The slug itself is the hint
+        // (e.g. "atp-2026-final-walkover") — settle HALF conservatively and
+        // leave the signal pending for a real binary resolution.
+        if (isNonPlainResolutionText(marketSlug)) {
+          console.warn(`[ResolutionPoller] tennis non-plain resolution ${marketSlug} — booking 0.5 payout (walkover rule)`);
+          this.quorum.handleMarketResolved(conditionIds[i], undefined, undefined, 0.5);
+          settled++;
+          continue;
+        }
       }
 
       // Build price array matching outcomes order for handleMarketResolved

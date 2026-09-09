@@ -53,7 +53,9 @@ import { GammaApiClient } from '../clients/gamma-api.js';
 import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 import { AntiSniperGuard, DEFAULT_ANTI_SNIPER_CONFIG } from '../utils/anti-sniper.js';
 import { buildOrderBookSummary } from '../utils/liquidity-check.js';
+import { shortError } from '../utils/http-client.js';
 import { ChainlinkTwapOracle, type CryptoSymbol, type TwapSignalEvaluation } from './chainlink-twap-oracle.js';
+import { bucket15m } from './market-snapshot-store.js';
 import { quantizeBuyPrice, roundAmount, roundSize, tickSizeToEnum } from '../utils/price-utils.js';
 import type { ConsensusSignal, WalletAction, PipelineDecision, LedgerRecord, RejectReason } from './pipeline-types.js';
 import { DecisionLedger } from './decision-ledger.js';
@@ -134,6 +136,12 @@ export interface BasketQuorumConfig {
    * bot-config.ts and PredictEngine's per-strategy capital isolation.
    */
   bankrollAllocation?: Partial<Record<MarketCategory, number>>;
+  /**
+   * Feed-freshness halt: when the newest processed feed event is older than
+   * this many ms, copy decisions are skipped (feed_stale) instead of acting
+   * on stale consensus. 0 = disabled (default). P1 lens #5.
+   */
+  maxFeedAgeMs?: number;
 }
 // ============================================================================
 // Types
@@ -196,6 +204,14 @@ export interface QuorumStats {
   quorumNearMissIndependence?: number;
   quorumNearMissExecution?: number;
   quorumNearMissConsensus?: number;
+  /** Quorum reached but the market failed the quality gate (lens #1/#3). */
+  quorumNearMissQuality?: number;
+  /** Execution blocked by the market-quality gate (thin/churning). */
+  quorumSkippedQuality?: number;
+  /** Consensus quote stale at execution (fail-closed stale-quote cancellation). */
+  quorumSkippedStaleQuote?: number;
+  /** Feed older than maxFeedAgeMs — copy decisions halted on staleness. */
+  quorumSkippedFeedStale?: number;
   shadowSignals?: number;
 }
 // ============================================================================
@@ -257,7 +273,11 @@ export class BasketQuorumService {
   /** Optional VoteStateStore — persists votes + lastFired across restarts. */
   private stateStore: VoteStateStore | null = null;
   /** Optional BotMetrics — when set, parallel Prometheus histograms are fed. */
-  private botMetrics: import('./bot-metrics.js').BotMetrics | null = null;
+    private botMetrics: import('./bot-metrics.js').BotMetrics | null = null;
+    /** P1 lens #1/#3: market-quality tracker (chop, spread, depth gates). */
+    private marketQuality: import('./market-quality.js').MarketQualityTracker | null = null;
+    /** P1 lens #4: bucketed feature-snapshot store (replay/gating input). */
+    private marketSnapshots: import('./market-snapshot-store.js').MarketSnapshotStore | null = null;
   /** Per-basket spend tracker (USDC spent on this basket) */
   private basketSpend: Map<MarketCategory, number> = new Map();
   /** Debounce timer for state persistence */
@@ -334,8 +354,22 @@ export class BasketQuorumService {
    * parallel metrics surface.
    */
   setBotMetrics(metrics: import('./bot-metrics.js').BotMetrics | null): void {
-    this.botMetrics = metrics;
-  }
+      this.botMetrics = metrics;
+    }
+    /**
+     * Wire the market-quality tracker (lens #1/#3): chop-based size modifier,
+     * spread/depth gates, freshness floors before execution. Optional.
+     */
+    setMarketQuality(tracker: import('./market-quality.js').MarketQualityTracker | null): void {
+      this.marketQuality = tracker;
+    }
+    /**
+     * Wire the bucketed feature-snapshot store (lens #4): per-15min-bucket
+     * probability/spread/depth/chop snapshots persisted for replay + gating.
+     */
+    setMarketSnapshots(store: import('./market-snapshot-store.js').MarketSnapshotStore | null): void {
+      this.marketSnapshots = store;
+    }
   /**
    * Set the per-category specialization thresholds used by seed() to route
    * wallets into baskets. Should match WalletScreeningConfig so the screen
@@ -484,7 +518,7 @@ export class BasketQuorumService {
               `favorable=${movedFavorably}`
           );
         } catch (err) {
-          console.warn(`[BasketQuorum][${label}] ${id}: price check failed`, err);
+          console.warn(`[BasketQuorum][${label}] ${id}: price check failed: ${shortError(err)}`);
         }
       }, delayMs);
       return timer;
@@ -1523,6 +1557,7 @@ export class BasketQuorumService {
       onDedupFire: (dedupKey, timestamp) => { this._lastProcessedFire.set(dedupKey, timestamp); },
       onAntiSniperFire: (tokenId) => this.antiSniper?.recordFire(tokenId),
       onStaleQuoteSkip: () => { this.botMetrics?.staleQuoteCancelled(); },
+      quality: this.marketQuality ?? undefined,
       auditStore: { recordFire: (params) => signalAuditStore.recordFire(params as Parameters<typeof signalAuditStore.recordFire>[0]) },
       bookLookup: async (tokenId) => {
         try {
@@ -1662,8 +1697,40 @@ export class BasketQuorumService {
     }
     this.lastFired.set(key, Date.now());
     this._schedulePersist();
+    // P1 lens #5: feed-freshness halt — never copy from a stale feed even
+    // when consensus is fresh; the whole signal stack is only as good as
+    // the newest raw event it derived from.
+    if (this.config.maxFeedAgeMs && this.config.maxFeedAgeMs > 0) {
+      const feedAge = Date.now() - this.getLastFeedEventAt();
+      if (feedAge > this.config.maxFeedAgeMs) {
+        this.stats.quorumSkippedFeedStale = (this.stats.quorumSkippedFeedStale ?? 0) + 1;
+        console.warn(`[BasketQuorum] SKIP feed-stale: ${signal.marketSlug} — newest feed event ${(feedAge / 1000).toFixed(0)}s old (max ${(this.config.maxFeedAgeMs / 1000).toFixed(0)}s)`);
+        this.planDecision(this.ledgerDecision(trade, 'execution', false, 'stale'));
+        return;
+      }
+    }
     const result = await engine.execute(decision, trade, basket);
     if (result.ok) {
+      // P1 lens #4: persist the bucketed feature snapshot for this fire —
+      // probability (consensus), spread/depth/chop from the quality tracker
+      // (all that is observable in this path), for replay + gating inputs.
+      if (this.marketSnapshots) {
+        const tokenId = trade.tokenId ?? signal.conditionId;
+        const qf = this.marketQuality?.features(tokenId);
+        try {
+          void this.marketSnapshots.upsertTick({
+            tokenId,
+            tsBucket: bucket15m(Date.now()),
+            probability: Number(signal.consensusPrice) || 0,
+            liquidity: 0,
+            volume24hr: 0,
+            spreadBps: qf?.spreadBps ?? null,
+            depthUsd: qf?.depthUsd ?? 0,
+            chop: qf?.chop ?? 0,
+            fetchedAt: Date.now(),
+          }).catch(() => undefined);
+        } catch { /* persistence must never break trading */ }
+      }
       this.planDecision(this.ledgerDecision(trade, 'executed', true, undefined, signal.outcome));
       this.stats.quorumFired++;
       this.stats.executed++;
@@ -1679,7 +1746,30 @@ export class BasketQuorumService {
         );
       }
     } else {
-      this.stats.failed++;
+      // Skip/failure taxonomy (audit 09-09 failed=6 conflation): only a real
+      // order failure increments `failed`; fail-closed gates (stale quote,
+      // bankroll, depth, quality) are counted separately so the funnel shows
+      // WHY orders didn't land instead of lumping everything into failed.
+      switch (result.reason) {
+        case 'order':
+          this.stats.failed++;
+          break;
+        case 'stale_quote':
+          this.stats.quorumSkippedStaleQuote = (this.stats.quorumSkippedStaleQuote ?? 0) + 1;
+          break;
+        case 'bankroll':
+          this.stats.quorumSkippedBankroll++;
+          break;
+        case 'depth_unknown':
+        case 'no_depth':
+          this.stats.quorumSkippedThinLiquidity = (this.stats.quorumSkippedThinLiquidity ?? 0) + 1;
+          break;
+        case 'quality':
+          this.stats.quorumSkippedQuality = (this.stats.quorumSkippedQuality ?? 0) + 1;
+          break;
+        default:
+          this.stats.failed++;
+      }
     }
   }
   getStats(): QuorumStats {
@@ -1754,10 +1844,19 @@ export class BasketQuorumService {
       skipped_thin_liquidity: s.quorumSkippedThinLiquidity ?? 0,
       skipped_negative_edge: s.quorumSkippedNegativeEdge ?? 0,
       skipped_min_size: s.quorumSkippedMinSize ?? 0,
+      // Audit 09-09 skip taxonomy: fail-closed gates counted separately from
+      // real order failures (failed=6 was actually 6× no-depth liquidity skips).
+      skipped_stale_quote: s.quorumSkippedStaleQuote ?? 0,
+      skipped_feed_stale: s.quorumSkippedFeedStale ?? 0,
+      skipped_quality: s.quorumSkippedQuality ?? 0,
+      near_miss_ind: s.quorumNearMissIndependence ?? 0,
+      near_miss_cons: s.quorumNearMissConsensus ?? 0,
+      near_miss_exec: s.quorumNearMissExecution ?? 0,
       executed: s.executed,
       failed: s.failed,
       conversion_pct: Math.round(conversion * 100) / 100,
       accounted_pct: filteredPct,
+      feed_age_ms: Math.max(0, Date.now() - this.getLastFeedEventAt()),
     };
     const edgeStats = signalAuditStore.getStats();
     // Compact anti-sniper reason breakdown, e.g. "no_mid_observations:1200/mid_unstable:300"
@@ -1777,7 +1876,10 @@ export class BasketQuorumService {
         `twap=${funnel.skipped_twap_stale}/${funnel.skipped_twap_misaligned} ` +
         `liq=${funnel.skipped_thin_liquidity} negEdge=${funnel.skipped_negative_edge} ` +
         `minSize=${funnel.skipped_min_size} ` +
+        `execSkips=${funnel.skipped_stale_quote}/${funnel.skipped_feed_stale}/${funnel.skipped_quality} ` +
+        `nearMiss=${funnel.near_miss_ind}/${funnel.near_miss_cons}/${funnel.near_miss_exec} ` +
         `executed=${funnel.executed} failed=${funnel.failed} ` +
+        `feedAge=${(funnel.feed_age_ms / 1000).toFixed(0)}s ` +
         `conversion=${funnel.conversion_pct}% accounted=${funnel.accounted_pct}%` +
         (edgeStats.signalsSettled > 0
           ? ` | edge: exp=${edgeStats.meanExpectedEdge.toFixed(4)} ` +
@@ -1801,6 +1903,12 @@ export class BasketQuorumService {
         executed: funnel.executed,
         failed: funnel.failed,
         byReason: s.antiSniperReasons ?? {},
+        skippedStaleQuote: funnel.skipped_stale_quote,
+        skippedFeedStale: funnel.skipped_feed_stale,
+        skippedQuality: funnel.skipped_quality,
+        nearMissInd: funnel.near_miss_ind,
+        nearMissCons: funnel.near_miss_cons,
+        nearMissExec: funnel.near_miss_exec,
       });
     }
     return funnel;
@@ -1911,6 +2019,11 @@ export class BasketQuorumService {
     conditionId: string,
     winningOutcome?: string,
     outcomePrices?: number[],
+    /** Uniform payout override (e.g. 0.5 for a tennis walkover — 50-50 rule).
+     *  When set, every unsettled signal books PnL at `payout − pricePaid`
+     *  but is NOT marked resolved 1/0 (the audit taxonomy keeps walkovers
+     *  conservatively pending until a real binary resolution exists). */
+    payout?: number,
   ): void {
     // Determine resolution per-signal: a signal on the winning outcome
     // resolves 1; a signal on the losing outcome resolves 0.
@@ -1925,6 +2038,23 @@ export class BasketQuorumService {
     let anySettled = false;
     for (const sig of signals) {
       if (sig.settledAt !== undefined) continue; // already settled
+      // Uniform-payout path first (walkover / non-plain resolution): book the
+      // PnL now, keep the signal pending — a 0.5 payout is neither won nor lost.
+      if (payout !== undefined) {
+        const pnlPerShare = (payout - sig.pricePaid) - (sig.feePerShare ?? 0);
+        this.recordSettledTrade(pnlPerShare * sig.size, Date.now(), sig.side);
+        if (this.botMetrics && typeof sig.pricePaid === 'number' && sig.pricePaid > 0) {
+          this.botMetrics.observePnl({
+            category: String(sig.basket ?? 'unknown'),
+            outcome: 'pending',
+            side: sig.side,
+            pnlPerShare,
+          });
+        }
+        console.log(`[BasketQuorum] half-payout settlement ${conditionId.slice(0, 10)}: payout=${payout} pnlPerShare=${pnlPerShare.toFixed(4)} (walkover/non-plain; signal stays pending)`);
+        anySettled = true;
+        continue;
+      }
       let sigResolved: 0 | 1;
       if (winningOutcome) {
         sigResolved = sig.outcome === winningOutcome ? 1 : 0;
@@ -1952,9 +2082,10 @@ export class BasketQuorumService {
       if (this.botMetrics && typeof sig.pricePaid === 'number' && sig.pricePaid > 0) {
         const won = sigResolved === 1;
         const entryPrice = sig.pricePaid;
-        const pnlPerShare = sig.side === 'BUY'
-          ? (won ? 1 - entryPrice : -entryPrice)
-          : (won ? entryPrice - 1 : entryPrice);
+        // Value model: a winning share pays $1, a losing share pays $0 —
+        // for BOTH sides (BUY = long YES, SELL = long NO). The old SELL
+        // branch (entryPrice − 1 / entryPrice) inverted the sign of NO exits.
+        const pnlPerShare = won ? 1 - entryPrice : -entryPrice;
         this.botMetrics.observePnl({
           category: String(sig.basket ?? 'unknown'),
           outcome: won ? 'won' : 'lost',

@@ -18,6 +18,8 @@ import type { SmartMoneyTrade } from './smart-money-service.js';
 import { TradeDetector, FileSeenTradeLedger } from './trade-detector.js';
 import { DecisionLedger } from './decision-ledger.js';
 import { computeGoLiveReport, DEFAULT_GO_LIVE_CRITERIA, formatGoLiveReport, type GoLiveReport } from './go-live-gate.js';
+import { MarketQualityTracker } from './market-quality.js';
+import { MarketSnapshotStore } from './market-snapshot-store.js';
 export interface PolylandRuntimeConfig {
   dryRun: boolean;
   capital: { totalUsd: number };
@@ -41,6 +43,10 @@ export class PolylandRuntime {
   private tradeSeen: FileSeenTradeLedger | null = null;
   private gamma: GammaResolutionPoller | null = null;
   private clob: ClobMarketWsService | null = null;
+  /** P1 lens #1/#3: market-quality tracker fed by CLOB mids. */
+  private marketQuality: MarketQualityTracker | null = null;
+  /** P1 lens #4: bucketed feature snapshots for replay/gating. */
+  private marketSnapshots: MarketSnapshotStore | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private funnelTimer: ReturnType<typeof setInterval> | null = null;
   private refreshing = false;
@@ -72,6 +78,17 @@ export class PolylandRuntime {
     this.tradeSeen.start();
     this.tradeDetector = new TradeDetector(this.tradeSeen, { minNotional: 1 });
     this.quorum = new BasketQuorumService(this.sdk.tradingService, this.quorumConfig); this.quorum.setRiskManager(this.risk); if (this.config.botMetrics) this.quorum.setBotMetrics(this.config.botMetrics); if (this.config.independence) this.quorum.setIndependenceSettings(this.config.independence); if (this.config.basketRisk) this.quorum.setBasketRiskConfig(this.config.basketRisk); this.quorum.setPaperExplorationMode(this.config.paperExploration ?? false); this.quorum.setGammaApi(this.sdk.gammaApi); this.quorum.setDecisionLedger(this.ledger); this.quorum.setSpecializationThresholds(Number(this.screeningConfig.minCategoryTrades ?? 3), Number(this.screeningConfig.minCategoryWinRate ?? 0.58)); this.quorum.startExitLadder(); this.quorum.onSettledTrade = p => { this.recordSettled(p); this.onSettledTrade?.(p); };
+    // P1 lens #1/#4: wire the market-quality tracker (chop/spread/depth gates)
+    // and the bucketed feature-snapshot store. Both are optional — a throw
+    // here must not prevent the bot from booting.
+    try {
+      this.marketQuality = new MarketQualityTracker();
+      this.marketSnapshots = new MarketSnapshotStore('./data/market-ticks.sqlite');
+      this.quorum.setMarketQuality(this.marketQuality);
+      this.quorum.setMarketSnapshots(this.marketSnapshots);
+    } catch (err) {
+      console.warn('[PolylandRuntime] market-quality wiring failed (continuing without):', err instanceof Error ? err.message : err);
+    }
     if (process.env.ANTI_SNIPER_ENABLED === 'true') this.quorum.setAntiSniper(new AntiSniperGuard(null));
     // ---- P0-5/P0-7: restart recovery + reconciliation gate ----
     // Restore open positions from the durable snapshot so the exit ladder
@@ -112,7 +129,12 @@ export class PolylandRuntime {
     }, { filterAddresses: [], smartMoneyOnly: false });
     this.gamma = new GammaResolutionPoller(this.sdk.gammaApi, this.quorum, 300000); this.gamma.start();
     this.clob = new ClobMarketWsService();
-    this.clob.onMid(({ assetId, price }) => this.quorum?.observeMid(assetId, price));
+        this.clob.onMid(({ assetId, price }) => {
+          this.quorum?.observeMid(assetId, price);
+          // Feed the market-quality tracker continuously (chop/signed-move need a
+          // price stream, not just the on-fire book snapshot).
+          this.marketQuality?.record(assetId, price);
+        });
     // Subscribe only when quorum has a near-miss or an enabled anti-sniper
     // guard requests a token; an unfiltered CLOB subscription causes slow-
     // consumer disconnects and was the old mid-feed failure mode.

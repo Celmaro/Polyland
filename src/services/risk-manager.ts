@@ -408,16 +408,19 @@ export class RiskManager {
    * the lock expires and the caller must hold evidence/reason.
    */
   lock(scope: LockScope, key: string, reason: string, ttlMs: number, now: number = Date.now()): void {
-    const mapKey = `${scope}:${key}`;
-    const existing = this.locks.get(mapKey);
-    if (existing) {
-      existing.reason = reason;
-      existing.expiresAt = Math.max(existing.expiresAt, now + ttlMs);
-      return;
+      const mapKey = `${scope}:${key}`;
+      const existing = this.locks.get(mapKey);
+      if (existing) {
+        existing.reason = reason;
+        existing.expiresAt = Math.max(existing.expiresAt, now + ttlMs);
+        // Refresh must survive a restart too (the audit's P3: a short refresh
+        // was lost on restart because only the CREATE path persisted).
+        this.persistState();
+        return;
+      }
+      this.locks.set(mapKey, { scope, key, reason, createdAt: now, expiresAt: now + ttlMs });
+      this.persistState();
     }
-    this.locks.set(mapKey, { scope, key, reason, createdAt: now, expiresAt: now + ttlMs });
-    this.persistState();
-  }
 
   /** Remove a lock. Idempotent — missing lock is a no-op. */
   unlock(scope: LockScope, key: string): void {

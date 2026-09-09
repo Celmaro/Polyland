@@ -30,40 +30,43 @@ export interface DryRunReconciliation extends ReconciliationResult {
 export function reconcileDryRunOrders(input: ReconcileDryRunInput): DryRunReconciliation {
   const now = input.now ?? Date.now();
   const resolved: OrderLifecycleRecord[] = [];
-  let pending = 0; // remaining unresolved AFTER the sweep (0 = clean)
+    let pending = 0; // remaining unresolved AFTER the sweep — updated below (was dead)
 
   for (const record of input.orders) {
-    const hasPosition = input.positionIds.has(record.positionId);
-    switch (record.status) {
-      case 'PENDING':
-      case 'UNKNOWN': {
-        // Deterministic dry-run sweep: position match → FILLED, else CANCELLED.
-        resolved.push({
-          ...record,
-          status: hasPosition ? 'FILLED' : 'CANCELLED',
-          updatedAt: now,
-        });
-        break;
-      }
-      case 'PARTIAL':
-        if (!hasPosition) {
-          // Cannot safely auto-resolve a partial fill to no position.
-          return {
-            ok: false,
-            checkedAt: now,
-            positions: input.positionIds.size,
-            pendingOrders: pending,
-            resolved,
-            error: `PARTIAL order ${record.id} (position ${record.positionId}) has no matching position — requires operator/venue reconciliation`,
-          };
+      const hasPosition = input.positionIds.has(record.positionId);
+      switch (record.status) {
+        case 'PENDING':
+        case 'UNKNOWN': {
+          // Deterministic dry-run sweep: position match → FILLED, else CANCELLED.
+          resolved.push({
+            ...record,
+            status: hasPosition ? 'FILLED' : 'CANCELLED',
+            updatedAt: now,
+          });
+          if (!hasPosition) pending++; // PENDING/UNKNOWN resolved to CANCELLED
+          break;
         }
-        resolved.push(record);
-        break;
-      default:
-        // FILLED / CANCELLED / RECONCILIATION_REQUIRED: terminal, keep as-is.
-        resolved.push(record);
+        case 'PARTIAL':
+          if (!hasPosition) {
+            pending++;
+            // Cannot safely auto-resolve a partial fill to no position.
+            return {
+              ok: false,
+              checkedAt: now,
+              positions: input.positionIds.size,
+              pendingOrders: pending,
+              resolved,
+              error: `PARTIAL order ${record.id} (position ${record.positionId}) has no matching position — requires operator/venue reconciliation`,
+            };
+          }
+          resolved.push(record);
+          break;
+        default:
+          // FILLED / CANCELLED / RECONCILIATION_REQUIRED: terminal, keep as-is.
+          if (record.status === 'RECONCILIATION_REQUIRED') pending++;
+          resolved.push(record);
+      }
     }
-  }
 
   return {
     ok: true,

@@ -107,11 +107,11 @@ describe('ExecutionEngine', () => {
     const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
     expect(evaluated.accepted).toBe(true);
     const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
-    expect(result.ok).toBe(true);
-    expect(result.orderId).toMatch(/^dry_run_/);
-    expect(opened).toBe(1);
-    expect(spent).toBeGreaterThan(0);
-  });
+        expect(result.ok).toBe(true);
+        if (result.ok) expect(result.orderId).toMatch(/^dry_run_/);
+        expect(opened).toBe(1);
+        expect(spent).toBeGreaterThan(0);
+      });
 
   it('execute failure releases the reservation (a later execute can still reserve)', async () => {
     let calls = 0;
@@ -185,9 +185,12 @@ describe('ExecutionEngine stale-quote gating (P1)', () => {
     const forced = { accepted: true, reason: 'edge', value: { signal: stale, amountUsd: 100, price: 0.6, dryRun: true } } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>;
     const result = await engine.execute(forced, TRADE, BASKET);
     expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('stale_quote');
     expect(spent).toBe(0);
     expect(opened).toBe(0);
-    expect(engine.failed).toBe(1);
+    // Stale-quote cancellation is a skip (fail-closed), not an order failure.
+    expect(engine.failed).toBe(0);
+    expect(engine.skipped.staleQuote).toBe(1);
   });
 });
 
@@ -229,7 +232,11 @@ describe('ExecutionEngine depth-aware dry-run fills (P1-5 shared fill engine)', 
     expect(evaluated.accepted).toBe(true);
     const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
     expect(result.ok).toBe(false);
-    expect(engine.failed).toBe(1);
+    // A missing live book is a LIQUIDITY skip, not an order failure — the
+    // audit's failed=6 conflation fixed: `failed` counts only real order
+    // failures, liquidity issues count separately. (execution-engine.ts:143)
+    expect(engine.failed).toBe(0);
+    expect(engine.skipped.depthUnknown).toBe(1);
     expect(spent).toBe(0);
   });
 
