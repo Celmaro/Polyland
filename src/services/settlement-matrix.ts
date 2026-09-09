@@ -1,18 +1,47 @@
 /**
- * settlement-matrix.ts — non-plain resolution handling (tennis first).
+ * settlement-matrix.ts — non-plain resolution handling for ALL markets.
  *
- * Adopted pattern (livetennisapi/polymarket-tennis settlement-rules.md):
- *   - a pre-start walkover resolves 50-50 on Polymarket (BOTH sides pay
- *     $0.50), NOT a hard 1/0;
- *   - retirements/walkovers/withdrawals/abandonments must never be
- *     settled as plain win/loss — mark them conservatively;
- *   - "unresolved" is a real answer; guessing 1/0 is the bug.
+ * Adopted pattern (livetennisapi/polymarket-tennis settlement-rules.md),
+ * generalized: the walkover 50-50 rule is ONE instance of a general
+ * Polymarket fact — every market's description defines its resolution
+ * rules. So instead of hard-coding tennis hints, we scan rule language on
+ * EVERY market:
+ *   - a closed market with non-pure prices + non-plain text (walkover /
+ *     retired / withdrew / abandoned / default) is NEVER settled as a hard
+ *     1/0 — hold conservatively (unresolved);
+ *   - if the description states a specific zero-payout / uniform-payout
+ *     rule (e.g. "resolves 50-50", "resolves to 0"), apply it;
+ *   - plain binary markets (winner-take-all, prices [1,0]) are unaffected.
  *
- * Plain binary markets (winner-take-all, prices [1,0]) are unaffected.
+ * "Unresolved" is a real answer; guessing 1/0 is the bug.
  */
 import { isTennisMarket, isNonPlainResolutionText } from '../utils/market-classify.js';
 
-export type SettlementKind = 'plain' | 'half_walkover' | 'unresolved';
+export type SettlementKind = 'plain' | 'half_walkover' | 'void' | 'unresolved';
+
+/** A per-market resolution rule stated in the description. */
+export interface PayoutRule {
+  /** Regex matched against the market description/question. */
+  pattern: RegExp;
+  /** Uniform payout to apply when the rule fires (e.g. 0.5, 0). */
+  payout: 0 | 0.5;
+  /** Why this rule exists (for the audit trail). */
+  label: string;
+}
+
+/** Built-in rule set: the well-known Polymarket "no clear winner" texts. */
+export const DEFAULT_PAYOUT_RULES: PayoutRule[] = [
+  {
+    pattern: /(?:50-50|50\/50|fifty|split(?:s|ted)? (?:the )?(?:payout|pot)|no (?:clear|official) winner)/i,
+    payout: 0.5,
+    label: 'stated 50-50 payout',
+  },
+  {
+    pattern: /(?:resolves? (?:to )?no|void|no winner|cancelled|invalidate)/i,
+    payout: 0,
+    label: 'stated no-payout / void',
+  },
+];
 
 export interface SettlementInput {
   /** Market closed (Gamma `closed === true` or CLOB closed). */
@@ -25,6 +54,8 @@ export interface SettlementInput {
   slug?: string;
   /** Free-text hints: market question/description/outcome strings. */
   textHints?: string[];
+  /** Extra resolution rules beyond the built-ins (per-market overrides). */
+  extraRules?: PayoutRule[];
 }
 
 export interface SettlementVerdict {
@@ -43,10 +74,12 @@ export interface SettlementVerdict {
  * Rules (in order):
  *  1. Not closed → unresolved.
  *  2. Closed + pure prices (max ≥ 0.99) → plain winner-take-all.
- *  3. Closed + tennis slug + non-pure prices + non-plain text hint
- *     (walkover/retired/withdrew/abandoned/default) → HALF (0.5) for all
- *     outcomes — the 50-50 Polymarket walkover rule.
- *  4. Anything else → unresolved (never invent a winner).
+ *  3. Closed + non-pure prices + non-plain resolution text:
+ *       - tennis (walkover/retirement) → HALF (0.5) — the 50-50 rule;
+ *       - any market whose description states a payout rule (50-50, void)
+ *         → that uniform payout;
+ *       - otherwise → unresolved (never invent a winner).
+ *  4. Anything else → unresolved.
  */
 export function resolvePayout(input: SettlementInput): SettlementVerdict {
   const { closed, prices = [], outcomes = [], slug = '', textHints = [] } = input;
@@ -65,19 +98,30 @@ export function resolvePayout(input: SettlementInput): SettlementVerdict {
       reason: `plain winner-take-all (winner=${outcomes[winnerIdx] ?? 'unknown'})`,
     };
   }
-  // Non-pure prices on a closed market: only a tennis market with a
-  // non-plain text hint gets the conservative 0.5 treatment.
+  // Non-pure prices on a closed market: the market did not resolve cleanly.
+  // A stated resolution rule in the description is authoritative (applies to
+  // EVERY market, tennis or not); otherwise treat a non-plain hint as a
+  // conservative hold.
   const hints = [slug, ...textHints].filter(Boolean);
   const tennis = isTennisMarket(slug);
   const nonPlain = hints.some((h) => isNonPlainResolutionText(h));
-  if (tennis && nonPlain) {
-    const payoutByOutcome: Record<string, 0 | 0.5 | 1> = {};
-    outcomes.forEach((o) => { payoutByOutcome[o] = 0.5; });
+  const rules = [...DEFAULT_PAYOUT_RULES, ...(input.extraRules ?? [])];
+  const rule = rules.find((r) => hints.some((h) => r.pattern.test(h)));
+  if (rule) {
+    return uniformPayout(outcomes, rule.payout, `stated rule (${rule.label}) → ${rule.payout === 0.5 ? '50-50' : 'void'} payout`);
+  }
+  if (nonPlain) {
+    // Tennis rule (Polymarket settlement-rules.md): a pre-start walkover
+    // pays 50-50; an in-play retirement pays the advance-win outcome. Without
+    // a listed-outcome signal we settle HALF conservatively.
+    if (tennis) {
+      return uniformPayout(outcomes, 0.5, 'tennis non-plain resolution (walkover/retirement) → 50-50 payout');
+    }
     return {
-      kind: 'half_walkover',
-      payoutByOutcome,
-      payout: 0.5,
-      reason: 'tennis non-plain resolution (walkover/retirement) → 50-50 payout',
+      kind: 'unresolved',
+      payoutByOutcome: null,
+      payout: null,
+      reason: `non-plain resolution text detected (${hints[0]}) and no stated payout rule — holding (never guess)`,
     };
   }
   return {
@@ -87,5 +131,21 @@ export function resolvePayout(input: SettlementInput): SettlementVerdict {
     reason: tennis
       ? 'closed tennis with ambiguous prices and no non-plain hint — holding (never guess)'
       : 'closed market with non-pure prices — holding (never guess)',
+  };
+}
+
+/** Build a uniform-payout verdict (0.5 → half_walkover kind; 0 → void). */
+function uniformPayout(
+  outcomes: string[],
+  payout: 0 | 0.5,
+  reason: string,
+): SettlementVerdict {
+  const payoutByOutcome: Record<string, 0 | 0.5 | 1> = {};
+  outcomes.forEach((o) => { payoutByOutcome[o] = payout; });
+  return {
+    kind: payout === 0.5 ? 'half_walkover' : 'void',
+    payoutByOutcome,
+    payout,
+    reason,
   };
 }

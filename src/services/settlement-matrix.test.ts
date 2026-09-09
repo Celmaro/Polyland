@@ -47,3 +47,55 @@ describe('resolvePayout', () => {
     expect(r.kind).toBe('unresolved');
   });
 });
+
+describe('resolvePayout generalized to all markets (description-rule scanning)', () => {
+  it('politics: candidate withdrawal + stated 50-50 rule → half payout', () => {
+    const r = resolvePayout({
+      closed: true, prices: [0.48, 0.52], outcomes: ['Yes', 'No'],
+      slug: 'who-wins-the-2028-presidential-election',
+      textHints: ['If a candidate withdraws before the election, this market resolves 50-50'],
+    });
+    expect(r.kind).toBe('half_walkover');
+    if (r.kind === 'half_walkover') expect(r.payoutByOutcome!.Yes).toBe(0.5);
+  });
+
+  it('politics: candidate withdrawal WITHOUT a stated rule → unresolved (never guess)', () => {
+    const r = resolvePayout({
+      closed: true, prices: [0.55, 0.45], outcomes: ['Yes', 'No'],
+      slug: 'who-wins-the-2028-presidential-election',
+      textHints: ['candidate withdrew from the race'],
+    });
+    expect(r.kind).toBe('unresolved');
+    expect(r.payout).toBeNull();
+  });
+
+  it('sports: abandoned match with stated void rule → void (payout 0)', () => {
+    const r = resolvePayout({
+      closed: true, prices: [0.5, 0.5], outcomes: ['Team A', 'Team B'],
+      slug: 'lakers-vs-celtics',
+      textHints: ['Match cancelled — market resolves to no, positions void'],
+    });
+    expect(r.kind).toBe('void');
+    if (r.kind === 'void') expect(r.payout).toBe(0);
+  });
+
+  it('crypto: oracle no-price + stated split rule → half via extraRules', () => {
+    const r = resolvePayout({
+      closed: true, prices: [0.49, 0.51], outcomes: ['Yes', 'No'],
+      slug: 'btc-up-or-down-september-8-2026-9pm-et',
+      textHints: ['If no reference price is published, the pot is split'],
+      extraRules: [{ pattern: /pot is split/i, payout: 0.5, label: 'split pot' }],
+    });
+    expect(r.kind).toBe('half_walkover');
+    if (r.kind === 'half_walkover') expect(r.payoutByOutcome!.No).toBe(0.5);
+  });
+
+  it('non-tennis non-plain text with no rule and non-pure prices → unresolved', () => {
+    const r = resolvePayout({
+      closed: true, prices: [0.6, 0.4], outcomes: ['Yes', 'No'],
+      slug: 'will-tame-impala-be-the-2-us-song-this-week-20260911',
+      textHints: ['default'],
+    });
+    expect(r.kind).toBe('unresolved');
+  });
+});

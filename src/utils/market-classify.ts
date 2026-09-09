@@ -31,7 +31,35 @@ export function isTennisMarket(slug: string): boolean {
   return classifyTennisTour(slug) !== 'other';
 }
 
-const NON_PLAIN_RE = /walkover|retired|withdrew|abandoned|(?:^|[\s-])default(?:[\s-]|$)/i;
+// ============================================================================
+// Market archetype (generalization of the tennis tour classifier)
+// ============================================================================
+
+export type MarketArchetype = 'updown' | 'tennis' | 'sports_match' | 'election' | 'time_bound' | 'other';
+
+/** Slugs that pin a market to a time-bound resolution (trailing epoch). */
+const EPOCH_RE = /(?:^|[-_])\d{10}$/;
+
+/**
+ * Widest market-shape classification from the slug. Tennis is a leaf of it
+ * (the tour regex rolled in); the archetype is the hook for per-family risk
+ * tiers and market-quality thresholds (the ITF gate generalizing to
+ * "updown low depth-floor + tight freshness", "sports_match mid floor", ...).
+ * Order matters: updown beats time_bound (a slug can be both); sports vs
+ * tennis: tennis first (tour markers are more specific than 'vs').
+ */
+export function classifyMarketArchetype(slug: string): MarketArchetype {
+  const s = (slug ?? '').toLowerCase().replace(/_/g, '-');
+  if (!s) return 'other';
+  if (isTennisMarket(s)) return 'tennis';
+  if (/up-or-down|updown/.test(s)) return 'updown';
+  if (/\b(vs|v)\b/.test(s)) return 'sports_match';
+  if (/election|presidential|senate|primary/.test(s)) return 'election';
+  if (EPOCH_RE.test(s)) return 'time_bound';
+  return 'other';
+}
+
+const NON_PLAIN_RE = /walkover|retired|withdrew|withdraw|abandoned|cancelled|canceled|(?:^|[\s-])default(?:[\s-]|$)/i;
 
 /**
  * True when a title/description/outcome text hints at a non-plain
