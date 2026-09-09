@@ -31,4 +31,4 @@ coverage/
 # Cache
 .cache/
 *.tsbuildinfo
-.mcp.json
+.mcp.jsonzeabur_audit.jsonl
