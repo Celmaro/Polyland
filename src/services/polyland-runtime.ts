@@ -88,11 +88,11 @@ export class PolylandRuntime {
     // C1-C4: wallet ingestion registry — multi-source corroboration, probation
     // lifecycle, behavioral filters, provenance. Persisted across restarts.
     this.walletIngestor = new WalletIngestor({
-      minScorePromotion: Number(this.screeningConfig.minScorePromotion ?? 0.6),
-      minTradesPromotion: Number(this.screeningConfig.minTradesPromotion ?? 15),
-      maxWeeklyTrades: this.screeningConfig.maxWeeklyTrades ? Number(this.screeningConfig.maxWeeklyTrades) : undefined,
-      maxBurst60s: this.screeningConfig.maxBurst60s ? Number(this.screeningConfig.maxBurst60s) : undefined,
-    });
+          minScorePromotion: Number(this.screeningConfig.minScorePromotion ?? 0.5),
+          minTradesPromotion: Number(this.screeningConfig.minTradesPromotion ?? 5),
+          maxWeeklyTrades: this.screeningConfig.maxWeeklyTrades ? Number(this.screeningConfig.maxWeeklyTrades) : undefined,
+          maxBurst60s: this.screeningConfig.maxBurst60s ? Number(this.screeningConfig.maxBurst60s) : undefined,
+        });
     this.walletIngestor.onSave((records) => {
       void this.stateStore?.save({ walletRegistry: records as never }).catch(() => undefined);
     });
@@ -258,7 +258,11 @@ export class PolylandRuntime {
             realizedPnl: Number(w.realizedPnl ?? 0),
           });
           if (rec) { ingested++; if (rec.status === 'active') ingActive++; else if (rec.status === 'probation') ingProbation++; else ingRejected++; }
-        } catch { /* non-fatal: keep current screening tier */ }
+                  } catch (e) {
+                    // Diagnostic: surface why register() throws so we know if it's a
+                    // sources shape issue, address shape issue, or anything else.
+                    console.warn(`[PolylandRuntime] INGEST FAIL: ${w?.wallet ?? w?.address ?? '?'} ${e instanceof Error ? e.message : e}`);
+                  }
       }
     const eligible = screened.filter((w) => {
       const t = w.tier;
