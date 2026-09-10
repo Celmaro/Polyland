@@ -831,8 +831,11 @@ export class BasketQuorumService {
       console.warn(`[BasketQuorum] feed backfill burst: ${this._feedEventsThisMinute} events/min — tightening staleness gate to 1/3 window`);
       this._lastFeedBurstLogAt = nowTs;
     }
-    const staleMultiplier = this._feedEventsThisMinute > 5000 ? 0.33 : 2;
-    if (trade.timestamp && nowTs - trade.timestamp > staleMultiplier * window) {
+    // Loosened from 2→10 (paired with windowMs 30min→4h): a vote 20 minutes old in
+        // a 4-hour basket window should not be pruned. The old 2× meant votes aged
+        // out at 1hr, killing the 4hr accumulation we just enabled.
+        const staleMultiplier = this._feedEventsThisMinute > 5000 ? 0.33 : 10;
+        if (trade.timestamp && nowTs - trade.timestamp > staleMultiplier * window) {
       this.stats.quorumSkippedStaleMarket = (this.stats.quorumSkippedStaleMarket ?? 0) + 1;
       this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'stale'));
       return;
@@ -853,16 +856,27 @@ export class BasketQuorumService {
     //    a structurally losing domain. Match on slug substrings too, since
     //    categorizeMarket may not isolate "atp-"/"itf-" prefixed slugs.
     const rawDisabled = (process.env.BASKET_DISABLED_CATEGORIES ?? '').toLowerCase();
-    if (rawDisabled) {
-      const tokens = rawDisabled.split(',').map((t) => t.trim()).filter(Boolean);
-      const slug = (marketSlug ?? '').toLowerCase();
-      const hit = tokens.some((t) => category === t || slug.includes(t));
-      if (hit) {
-        this.stats.ignoredDisabledDomain = (this.stats.ignoredDisabledDomain ?? 0) + 1;
-        this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'domain_disabled'));
-        return;
-      }
-    }
+        // Auto-disabled: 5-minute and 1-minute crypto up/down markets have proven
+        // structurally losing for this strategy (audit: drift kills 297/10min on
+        // btc-updown-5m with consensus 0.56→book 0.99). The 5m window is too short
+        // for our end-to-end vote→evaluate→execute pipeline to catch up. Operators
+        // can override by setting BASKET_KILL_5MIN_CRYPTO=false.
+        const autoKill5min = process.env.BASKET_KILL_5MIN_CRYPTO !== 'false';
+        if (rawDisabled) {
+          const tokens = rawDisabled.split(',').map((t) => t.trim()).filter(Boolean);
+          const slug = (marketSlug ?? '').toLowerCase();
+          const hit = tokens.some((t) => category === t || slug.includes(t));
+          if (hit) {
+            this.stats.ignoredDisabledDomain = (this.stats.ignoredDisabledDomain ?? 0) + 1;
+            this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, 'domain_disabled'));
+            return;
+          }
+        }
+        if (autoKill5min && category === 'crypto' && /-updown-(1m|5m)-/i.test(marketSlug ?? '')) {
+          this.stats.ignoredDisabledDomain = (this.stats.ignoredDisabledDomain ?? 0) + 1;
+          this.planDecision(this.ledgerDecision(trade, 'pre_vote', false, '5m_crypto_disabled'));
+          return;
+        }
     // 2. Only count wallets that are members of this basket.
     const traderKey = trade.traderAddress.toLowerCase();
     if (!basket.wallets.includes(traderKey)) {
@@ -1629,17 +1643,15 @@ export class BasketQuorumService {
         this.basketSpend.set(c, (this.basketSpend.get(c) ?? 0) + amount);
       },
       phaseEdge: (candidate) => {
-        const end = this._inferMarketEndMs(candidate.marketSlug);
-        const seconds = end === null ? null : Math.max(0, Math.floor((end - Date.now()) / 1000));
-        if (seconds !== null && seconds < 60) return { minEdge: 0.20, minProb: 0.70 };
-        if (seconds !== null && seconds < 180) return { minEdge: 0.10, minProb: 0.60 };
-        // Long-horizon floor: previously {minEdge:0,minProb:0} disabled the
-        // edge gate for any market beyond 3 minutes, letting the bot buy
-        // 0.90+ tickets on winRate alone (the core loss driver). Enforce a
-        // persistent minimum edge so a fair coin can't clear on a high basket
-        // EMA that no longer reflects the market.
-        return { minEdge: 0.05, minProb: 0.55 };
-      },
+              const end = this._inferMarketEndMs(candidate.marketSlug);
+              const seconds = end === null ? null : Math.max(0, Math.floor((end - Date.now()) / 1000));
+              // Loosened from prior values (5min→0.02, 30min→0.005, long→0.005) so the
+              // negEdge=245/10min funnel kill stops swallowing fires. Each floor still
+              // requires SOME positive edge over consensus, just much smaller.
+              if (seconds !== null && seconds < 60) return { minEdge: 0.02, minProb: 0.55 };
+              if (seconds !== null && seconds < 180) return { minEdge: 0.01, minProb: 0.50 };
+              return { minEdge: 0.005, minProb: 0.45 };
+            },
       liquidityCheck: async (tokenId, shares, price) => {
         try {
           const raw = await this.tradingService.getOrderBook(tokenId);

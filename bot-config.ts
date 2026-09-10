@@ -50,9 +50,9 @@ const CONFIG = {
       maxSingleTradeExposure: 0.3,  // Max 30% of PnL from one trade
       checkLastNTrades: 10,  // Analyze last 10 trades for consistency
       sizeScale: 0.2,
-      maxSizePerTrade: 15,
-      maxSlippage: 0.03,
-      minTradeSize: 5,
+            maxSizePerTrade: 15,
+            maxSlippage: 0.03,
+            minTradeSize: 1,
       // 🔴 ENTRY CEILING: never buy consensus above this price (asymmetry guard).
       // 0.85 default — the audit's 0.90-0.95 top-buy loss driver. Now env-tunable
       // via BASKET_MAX_ENTRY_PRICE so the cap is actually CONFIGURABLE (it was a
@@ -157,14 +157,14 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
   // consensus (still "two independent experts agreed", not one wallet's luck).
   // Raise to 3+ if the candidate pool grows.
   defaultQuorum: 2,
-  defaultWindowMs: 30 * 60 * 1000,       // 30-minute rolling window
-  maxPriceDrift: 0.05,
-  fireCooldownMs: 10 * 60 * 1000,
-  sizeScale: CONFIG.smartMoney.sizeScale,
-  maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
-  maxSlippage: CONFIG.smartMoney.maxSlippage,
-  orderType: 'FOK',
-  minTradeSize: CONFIG.smartMoney.minTradeSize,
+    defaultWindowMs: 4 * 60 * 60 * 1000,   // 4-hour rolling window — accumulate more votes
+    maxPriceDrift: 0.30,                   // loosened from 0.05 — drift=297/10min was the #1 kill
+    fireCooldownMs: 10 * 60 * 1000,
+    sizeScale: CONFIG.smartMoney.sizeScale,
+    maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
+    maxSlippage: CONFIG.smartMoney.maxSlippage,
+    orderType: 'FOK',
+    minTradeSize: CONFIG.smartMoney.minTradeSize,
   dryRun: CONFIG.dryRun,
   /** Entry-price ceiling (0-1): reject consensus above this. 0.85 default. */
   maxEntryPrice: CONFIG.smartMoney.maxEntryPrice,
@@ -195,8 +195,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'crypto',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -204,8 +204,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'sports',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -213,8 +213,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'football',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -222,8 +222,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'basketball',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -231,8 +231,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'tennis',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.5,
     },
     {
@@ -240,8 +240,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'motorsports',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -249,8 +249,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'boxing_ufc',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -258,8 +258,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'baseball',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -267,8 +267,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'cricket',
       enabled: true,
       wallets: [],
-      quorum: 2,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -276,8 +276,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'politics',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.5,
     },
     {
@@ -285,8 +285,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'esports',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.52,
     },
     {
@@ -294,8 +294,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'economics',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.5,
     },
     {
@@ -303,8 +303,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'entertainment',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.5,
     },
     {
@@ -312,8 +312,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'science',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.5,
     },
     {
@@ -321,8 +321,8 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
       category: 'other',
       enabled: true,
       wallets: [],
-      quorum: 3,
-      windowMs: 30 * 60 * 1000,
+      quorum: 1,
+      windowMs: 4 * 60 * 60 * 1000,
       winRate: 0.5,
     },
   ],
