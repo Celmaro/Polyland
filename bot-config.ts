@@ -51,7 +51,7 @@ const CONFIG = {
       checkLastNTrades: 10,  // Analyze last 10 trades for consistency
       sizeScale: 0.2,
             maxSizePerTrade: 15,
-            maxSlippage: 0.03,
+            maxSlippage: 0.10,
             minTradeSize: 1,
       // 🔴 ENTRY CEILING: never buy consensus above this price (asymmetry guard).
       // 0.85 default — the audit's 0.90-0.95 top-buy loss driver. Now env-tunable
