@@ -245,18 +245,20 @@ export class PolylandRuntime {
       // the quorum. Protects the basket from a single bad discovery run.
       let ingested = 0, ingProbation = 0, ingActive = 0, ingRejected = 0;
       for (const w of screened) {
-        if (!w || typeof w.wallet !== 'string') continue;
-        try {
-          const rec = this.walletIngestor?.register({
-            wallet: String(w.wallet ?? w.address ?? ''),
-            sources: Array.isArray(w.sources) ? w.sources : ['leaderboard'],
-            score: Number(w.score ?? 0.5),
-            category: String(w.category ?? 'other'),
-            tradeCount: Number(w.tradeCount ?? w.sampleTrades ?? 0),
-            weeklyTrades: Number(w.weeklyTrades ?? 0),
-            peakTrades60s: Number(w.peakTrades60s ?? 0),
-            realizedPnl: Number(w.realizedPnl ?? 0),
-          });
+              if (!w) continue;
+              const wAddr = String(w.wallet ?? w.address ?? '');
+              if (!wAddr) continue;
+              try {
+                const rec = this.walletIngestor?.register({
+                  wallet: wAddr,
+                  sources: Array.isArray(w.sources) ? w.sources : ['leaderboard'],
+                  score: Number(w.score ?? 0.5),
+                  category: String(w.category ?? 'other'),
+                  tradeCount: Number(w.tradeCount ?? w.sampleTrades ?? 0),
+                  weeklyTrades: Number(w.weeklyTrades ?? 0),
+                  peakTrades60s: Number(w.peakTrades60s ?? 0),
+                  realizedPnl: Number(w.realizedPnl ?? 0),
+                });
           if (rec) { ingested++; if (rec.status === 'active') ingActive++; else if (rec.status === 'probation') ingProbation++; else ingRejected++; }
                   } catch (e) {
                     // Diagnostic: surface why register() throws so we know if it's a
@@ -265,12 +267,13 @@ export class PolylandRuntime {
                   }
       }
     const eligible = screened.filter((w) => {
-      const t = w.tier;
-      if (t !== 'PRIMARY' && t !== 'SATELLITE') return false;
-      const rec = this.walletIngestor?.get(String(w.wallet ?? ''));
-      if (!rec) return true; // unknown to ingestor -> keep legacy behavior
-      return rec.status === 'active' && (rec.tier === 'PRIMARY' || rec.tier === 'SATELLITE');
-    });
+          const t = w.tier;
+          if (t !== 'PRIMARY' && t !== 'SATELLITE') return false;
+          const wAddr = String(w.wallet ?? w.address ?? '');
+          const rec = wAddr ? this.walletIngestor?.get(wAddr) : undefined;
+          if (!rec) return true; // unknown to ingestor -> keep legacy behavior
+          return rec.status === 'active' && (rec.tier === 'PRIMARY' || rec.tier === 'SATELLITE');
+        });
     this.quorum.seed(eligible);
     console.log(`[PolylandRuntime] SEED: screened=${screened.length} ingested=${ingested} (active=${ingActive} probation=${ingProbation} rejected=${ingRejected}) eligible_for_quorum=${eligible.length}`);
     setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
