@@ -64,6 +64,7 @@ import { CopyPlanner, type CopyBook, type MarketMeta } from './copy-planner.js';
 import { PositionStateMachine, evaluateExit } from './position-state-machine.js';
 import { clusterOf, effectiveContributors, isDiverse, type WalletActionCategory } from './independence-metrics.js';
 import { evaluateConsensusGate, computeWeightedConsensus, computeDominantWalletShare, bayesianConfidence, computeConflictPenalty, classifyMarketRegime } from './quorum-quality.js';
+import { computeEntryQualityScore, resolveEdgeSizeMultiplier, applyRiskAdjustedAmount, shouldPostEntryInvalidate } from './execution-quality.js';
 import { checkExposure, type BasketRiskConfig } from './basket-risk.js';
 function consensusStrength(votes: Map<string, Vote>): number {
   const buys = [...votes.values()].filter(v => v.side === 'BUY');
@@ -1432,33 +1433,47 @@ export class BasketQuorumService {
             maxTimeSpreadSec: Number(process.env.B1_MAX_TIME_SPREAD_SEC ?? 3600),
           });
           if (!coherence.ok) {
-            this.stats.quorumSkippedCoherence = (this.stats.quorumSkippedCoherence ?? 0) + 1;
-            this.planDecision(this.ledgerDecision(trade, 'quorum', false, coherence.reason ?? 'coherence_gate'));
-            return;
-          }
-          // B2: weighted-size agreement floor (headcount alone insufficient).
-          const weightOf = (w: string) => buyVotes.find((v) => v.wallet === w)?.size ?? 0;
-          const wc = computeWeightedConsensus(
-            aligned.map((a) => a.wallet),
-            aligned.map((a) => a.wallet),
-            weightOf,
-          );
-          const minWeighted = Number(process.env.B2_MIN_WEIGHTED_CONSENSUS ?? 0.0);
-          if (wc.totalWeight > 0 && wc.ratio < minWeighted) {
-            this.stats.quorumSkippedWeighted = (this.stats.quorumSkippedWeighted ?? 0) + 1;
-            this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'below_weighted_consensus'));
-            return;
-          }
-          // B3: dominant-wallet concentration cap.
-          const dominantShare = computeDominantWalletShare(aligned.map((a) => a.wallet), weightOf);
-          const maxDominant = Number(process.env.B3_MAX_DOMINANT_SHARE ?? 1.0);
-          if (dominantShare > maxDominant) {
-            this.stats.quorumSkippedDominant = (this.stats.quorumSkippedDominant ?? 0) + 1;
-            this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'dominant_wallet'));
-            return;
-          }
-        }
-    // Consensus reached. Compute median entry price across all BUY votes.
+                      this.stats.quorumSkippedCoherence = (this.stats.quorumSkippedCoherence ?? 0) + 1;
+                      console.log(`[BasketQuorum] SKIP coherence(B1): ${basket.category} ${trade.conditionId ?? ''} ${coherence.reason} priceBand=${coherence.priceBandAbs.toFixed(3)} timeSpread=${coherence.timeSpreadSec.toFixed(0)}s (aligned=${buyVotes.length})`);
+                      this.planDecision(this.ledgerDecision(trade, 'quorum', false, coherence.reason ?? 'coherence_gate'));
+                      return;
+                    }
+                    // B2: weighted-size agreement floor (headcount alone insufficient).
+                    const weightOf = (w: string) => buyVotes.find((v) => v.wallet === w)?.size ?? 0;
+                    const wc = computeWeightedConsensus(
+                      aligned.map((a) => a.wallet),
+                      aligned.map((a) => a.wallet),
+                      weightOf,
+                    );
+                    const minWeighted = Number(process.env.B2_MIN_WEIGHTED_CONSENSUS ?? 0.0);
+                    if (wc.totalWeight > 0 && wc.ratio < minWeighted) {
+                      this.stats.quorumSkippedWeighted = (this.stats.quorumSkippedWeighted ?? 0) + 1;
+                      console.log(`[BasketQuorum] SKIP weighted(B2): ${basket.category} ratio=${wc.ratio.toFixed(2)} < floor=${minWeighted.toFixed(2)} alignedW=${wc.alignedWeight.toFixed(0)}/totalW=${wc.totalWeight.toFixed(0)}`);
+                      this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'below_weighted_consensus'));
+                      return;
+                    }
+                    // B3: dominant-wallet concentration cap.
+                    const dominantShare = computeDominantWalletShare(aligned.map((a) => a.wallet), weightOf);
+                    const maxDominant = Number(process.env.B3_MAX_DOMINANT_SHARE ?? 1.0);
+                    if (dominantShare > maxDominant) {
+                      this.stats.quorumSkippedDominant = (this.stats.quorumSkippedDominant ?? 0) + 1;
+                      console.log(`[BasketQuorum] SKIP dominant(B3): ${basket.category} share=${dominantShare.toFixed(2)} > cap=${maxDominant.toFixed(2)} aligned=${buyVotes.length}`);
+                      this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'dominant_wallet'));
+                      return;
+                    }
+                    // B4 — Bayesian shrinkage toward neutral (advisory, logged so the
+                              // operator sees WHY a borderline quorum passed but with low confidence).
+                              const bayes = bayesianConfidence({ alignedWeight: wc.alignedWeight, totalWeight: wc.totalWeight, prior: Number(process.env.B4_PRIOR_ALPHA ?? 50) });
+                              if (bayes.score < 0.5) {
+                                console.log(`[BasketQuorum] BAYES-LOW(B4): ${basket.category} score=${bayes.score.toFixed(2)} posterior=${bayes.posterior.toFixed(2)} alignedW=${wc.alignedWeight.toFixed(0)} totalW=${wc.totalWeight.toFixed(0)} (passes B1-B3 but with low confidence)`);
+                              }
+                              // B5 — Conflict penalty when aligned weight sits against residual weight.
+                              const conflict = computeConflictPenalty({ alignedWeight: wc.alignedWeight, totalWeight: wc.totalWeight, penaltyWeight: 1 });
+                              if (conflict > 0.25) {
+                                console.log(`[BasketQuorum] CONFLICT(B5): ${basket.category} penalty=${conflict.toFixed(2)} alignedW=${wc.alignedWeight.toFixed(0)}/totalW=${wc.totalWeight.toFixed(0)}`);
+                              }
+                  }
+              // Consensus reached. Compute median entry price across all BUY votes.
         const prices = buyVotes.map((v) => v.price).sort((a, b) => a - b);
         const mid = Math.floor(prices.length / 2);
         const consensusPrice =
@@ -1669,8 +1684,27 @@ export class BasketQuorumService {
       maxEntryPrice: this.config.maxEntryPrice,
     });
     this.planDecision(this.ledgerDecision(trade, 'quorum_reached', true, undefined, signal.outcome));
-    const decision = await engine.evaluate(signal, trade, basket);
-    if (decision.accepted && this.basketRiskConfig) {
+        const decision = await engine.evaluate(signal, trade, basket);
+        // D1/D2 — Entry-quality scoring + R-normalized sizing (execution-quality.ts).
+        // We compute the size multiplier and the R-adjusted amount from the live
+        // microstructure and surface them in the log so operators can see how
+        // entry quality reshapes the trade.
+        if (decision.accepted) {
+          const eq = computeEntryQualityScore({
+            signalEdgeBps: Math.round(((decision.value.price - 0.5) * 200)), // rough: midpoint-derived bps (0.5 = neutral)
+            spreadBps: this.marketQuality?.features(signal.tokenId ?? signal.conditionId)?.spreadBps ?? null,
+            minTopDepth: this.marketQuality?.features(signal.tokenId ?? signal.conditionId)?.depthUsd ?? null,
+            ageSeconds: Math.max(0, (Date.now() - (trade.timestamp ?? Date.now())) / 1000),
+            weights: { edge: 0.4, spread: 0.2, depth: 0.2, freshness: 0.2 },
+          });
+          const sz = resolveEdgeSizeMultiplier(eq.edgeScore * 250, { fullBps: 250, floorBps: 100 });
+          const baseUsdc = decision.value.amountUsd * sz.multiplier;
+          const stopLossPrice = Math.max(0.01, decision.value.price * 0.5); // 50% stop heuristic (no live SL endpoint)
+          const adj = applyRiskAdjustedAmount({ baseUsdc, entryPrice: decision.value.price, stopLossPrice, targetRiskUsdc: baseUsdc * 0.5 });
+          console.log(`[BasketQuorum] QUALITY(D1/D2): ${basket.category} ${signal.marketSlug} entryQ=${eq.score.toFixed(1)}/100 edge=${eq.edgeScore.toFixed(2)} spread=${eq.spreadScore.toFixed(2)} depth=${eq.depthScore.toFixed(2)} fresh=${eq.freshnessScore.toFixed(2)} sizeTier=${sz.tier} baseUsdc=${baseUsdc.toFixed(2)} adj=${adj.adjusted ? adj.amountUsdc.toFixed(2) : 'no'}`);
+          decision.value.amountUsd = adj.amountUsdc;
+        }
+        if (decision.accepted && this.basketRiskConfig) {
       const amountUsd = decision.value.amountUsd;
       const capital = this.riskManager?.currentCapital() ?? this.bankrollFor(basket.category);
       const exposure = checkExposure(capital, this.basketSpend.get(basket.category) ?? 0, 0, this.basketRiskConfig, basket.category, amountUsd);
