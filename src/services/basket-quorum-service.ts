@@ -392,8 +392,28 @@ export class BasketQuorumService {
      * spread/depth gates, freshness floors before execution. Optional.
      */
     setMarketQuality(tracker: import('./market-quality.js').MarketQualityTracker | null): void {
-      this.marketQuality = tracker;
-    }
+        this.marketQuality = tracker;
+      }
+      /**
+       * Audit 09-11 (root cause fix): median category-calibrated win rate of
+       * the VOTING wallets. Replaces the static basket.winRate prior (0.6)
+       * that made edge = 0.6 - consensus - fee negative for every favorite.
+       * Falls back to basket.winRate only when no wallet has calibration data.
+       */
+      private walletSignalWinRate(wallets: string[], category: MarketCategory): number {
+        const rates: number[] = [];
+        for (const w of wallets) {
+          const r = this.walletCategoryWinRate.get(`${w.toLowerCase()}:${category}`);
+          if (typeof r === 'number' && Number.isFinite(r) && r > 0) rates.push(r);
+        }
+        if (rates.length === 0) {
+          const basket = this.baskets.get(category);
+          return basket?.winRate ?? 0.6;
+        }
+        rates.sort((a, b) => a - b);
+        const mid = Math.floor(rates.length / 2);
+        return rates.length % 2 === 0 ? (rates[mid - 1] + rates[mid]) / 2 : rates[mid];
+      }
     /**
      * Wire the bucketed feature-snapshot store (lens #4): per-15min-bucket
      * probability/spread/depth/chop snapshots persisted for replay + gating.
@@ -1511,7 +1531,17 @@ export class BasketQuorumService {
           walletCount: primaryCount + satelliteCount,
           wallets: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').map((v) => v.wallet),
           consensusPrice,
-          winRate: basket.winRate ?? 0.6,
+          // Audit 09-11 (root cause): the old `basket.winRate ?? 0.6` static
+          // prior made edge = 0.6 - consensus - fee, which is NEGATIVE for
+          // every consensus > 0.6 — the engine rejected every favorite
+          // (NFL 2027 @0.988, Russia election @0.999) as 'edge'. Use the
+          // median of the VOTING wallets' category-calibrated win rates
+          // (walletCategoryWinRate, populated in seed()) — the actual
+          // signal confidence instead of a constant prior.
+          winRate: this.walletSignalWinRate(
+            [...outcomeVotes.values()].filter((v) => v.side === 'BUY').map((v) => v.wallet),
+            basket.category,
+          ),
                 side: 'BUY',  // consensus only formed from BUY votes (SELL filtered upstream)
                 totalSize: [...outcomeVotes.values()].filter((v) => v.side === 'BUY').reduce((sum, v) => sum + v.size, 0),
                 tokenId: trade.tokenId,

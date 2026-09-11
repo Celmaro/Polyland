@@ -104,19 +104,33 @@ export class ExecutionEngine {
       if (mul < 1) amount = amount * mul;
     }
     const tick = tickSizeToEnum(this.deps.tickSizeFor(signal.conditionId));
-    const price = quantizeBuyPrice(signal.consensusPrice * (1 + this.config.maxSlippage), tick);
+        // Audit 09-11 fix: cap the slippage-adjusted price BELOW 1.0. With
+        // maxSlippage 0.10, any consensus > 0.909 produced price >= 1.0, and
+        // computeExactSharesAndCost returns {shares:0, costUsd:0} for qPrice>=1
+        // → every heavy favorite (NFL 2027 @0.988, politics @0.999) was rejected
+        // as min_size. There is no ask at >= 1.0; the executable price for a
+        // favorite is clamped at 0.99.
+        const slippagePrice = signal.consensusPrice * (1 + this.config.maxSlippage);
+        const price = quantizeBuyPrice(Math.min(slippagePrice, 0.99), tick);
     let exact = computeExactSharesAndCost(amount, price, tick);
-    // Sizing floor-clamp: sizing is proportional to the leader's share count,
-    // so a thin leader can scale the copy below the minimum order notional.
-    // Rather than reject a real consensus outright, clamp UP to minTradeSize
-    // when the computed notional is above the $1 dust bound and the edge
-    // (checked below) is real. Caps at maxSizePerTrade. This converts the
-    // historical min_size rejections (audit: 1047) into executed paper trades.
-    if (exact.costUsd < this.config.minTradeSize && exact.costUsd >= 1 && amount < this.config.maxSizePerTrade) {
-      const clamped = Math.min(this.config.minTradeSize, this.config.maxSizePerTrade);
-      exact = computeExactSharesAndCost(clamped, price, tick);
-      if (exact.costUsd > this.config.maxSizePerTrade) exact = computeExactSharesAndCost(this.config.maxSizePerTrade, price, tick);
-    }
+        // Sizing floor-clamp: sizing is proportional to the leader's share count,
+        // so a thin leader can scale the copy below the minimum order notional.
+        // Rather than reject a real consensus outright, clamp UP to minTradeSize
+        // when the computed notional is above the $1 dust bound and the edge
+        // (checked below) is real. Caps at maxSizePerTrade. This converts the
+        // historical min_size rejections (audit: 1047) into executed paper trades.
+        // Audit 09-11: the `exact.costUsd >= 1` guard made this clamp dead code
+        // after minTradeSize dropped to 1 (costUsd < 1 && costUsd >= 1 is never
+        // true) — so sub-$1 favorites (NFL 2027 @0.988 → $0.99 notional) were
+        // rejected as min_size instead of clamped up. Clamp when the copy
+        // notional is above the 0.50 dust bound but below minTradeSize, as
+        // long as we stay under maxSizePerTrade. True dust (< $0.50) still
+        // rejects below.
+        if (exact.costUsd < this.config.minTradeSize && exact.costUsd >= 0.5 && amount < this.config.maxSizePerTrade) {
+          const clamped = Math.min(this.config.minTradeSize, this.config.maxSizePerTrade);
+          exact = computeExactSharesAndCost(clamped, price, tick);
+          if (exact.costUsd > this.config.maxSizePerTrade) exact = computeExactSharesAndCost(this.config.maxSizePerTrade, price, tick);
+        }
     if (exact.costUsd < 1) return { accepted: false, reason: 'min_size' };
     const fee = takerFeePerShare(signal.consensusPrice, this.deps.feeRateFor(signal.conditionId) || DEFAULT_FEE_RATE_BPS);
     const edge = signal.winRate - signal.consensusPrice - fee;

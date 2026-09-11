@@ -58,7 +58,7 @@ const CONFIG = {
       // via BASKET_MAX_ENTRY_PRICE so the cap is actually CONFIGURABLE (it was a
       // hardcoded engine/planner default before; the effective executed price
       // could still reach 0.90 via the CopyPlanner VWAP adoption).
-      maxEntryPrice: parseFloat(process.env.BASKET_MAX_ENTRY_PRICE ?? '0.85'),
+      maxEntryPrice: parseFloat(process.env.BASKET_MAX_ENTRY_PRICE ?? '0.95'),
       delay: 500,
       // ADD YOUR CUSTOM WALLETS HERE (will be followed in addition to leaderboard)
       customWallets: [
