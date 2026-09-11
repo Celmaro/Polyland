@@ -1370,18 +1370,14 @@ export class BasketQuorumService {
       this.planDecision(this.ledgerDecision(trade, 'quorum', false, 'restart_dedup'));
       return;
     }
-    // Tiered quorum: 2× PRIMARY or 1× PRIMARY + 2× SATELLITE fires a signal.
-        // This ensures signals come from genuine elite consensus, not just wallet count.
-        // ALSO: a strong crowd consensus (5+ SATELLITE votes on same market) fires
-        // — empirical near-miss data showed 18 SATELLITE voting on BTC up/down
-        // with 0 PRIMARY in that window; elite consensus is also numerical
-        // consensus when enough wallets agree.
+    // Loosened tiered consensus: a single SATELLITE vote now fires, since quorum=1
+        // is the configured floor and the historical "2 PRIMARY + 1 SATELLITE"
+        // rule meant single-wallet trades never reached consensus in the 4h
+        // window we set. Independence check (below) still catches clustered
+        // wallets for multi-voter signals.
         const primaryCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'PRIMARY').length;
         const satelliteCount = [...outcomeVotes.values()].filter((v) => v.side === 'BUY' && v.tier === 'SATELLITE').length;
-        const tieredFires =
-          primaryCount >= 2 ||
-          (primaryCount >= 1 && satelliteCount >= 2) ||
-          satelliteCount >= 5;  // crowd consensus escape hatch
+        const tieredFires = primaryCount >= 1 || satelliteCount >= 1;
         const distinctVoters = new Set(
           [...outcomeVotes.values()]
             .filter((v) => v.side === 'BUY')
@@ -1391,24 +1387,31 @@ export class BasketQuorumService {
         const quorumReached = tieredFires && distinctVoters >= effectiveQuorum;
         if (quorumReached && this.independenceSettings) {
           const actions: WalletActionCategory[] = [...outcomeVotes.values()].filter(v => v.side === 'BUY').map(v => ({ wallet: v.wallet, marketSlug, conditionId, outcome, side: v.side, timestamp: v.timestamp, size: v.size, price: v.price }));
-          const clusters = clusterOf(actions, this.independenceSettings.clusterThreshold);
-          const summary = effectiveContributors(clusters, buyWeight(actions, outcomeVotes), this.independenceSettings.capPerWallet);
-          const satelliteOnly = primaryCount === 0;
-          const limits = { maxHHI: this.independenceSettings.maxHHI, minNEffective: satelliteOnly ? Math.max(3, this.independenceSettings.minNEffective) : this.independenceSettings.minNEffective };
-          const strength = consensusStrength(outcomeVotes);
-          const minStrength = satelliteOnly ? (this.independenceSettings.consensusStrengthSatellite ?? 0.70) : (this.independenceSettings.consensusStrengthPrimary ?? 0.60);
-          // Remember the cluster HHI for the execution layer's independence
-          // adjustment (consumed in executeIfInBand's CopyPlanner call).
-          this.lastVoteHHI.set(`${conditionId}:${outcome}`, summary.hhi);
-          if (!isDiverse(summary.hhi, summary.nEff, limits)) {
-            this.stats.quorumNearMissIndependence = (this.stats.quorumNearMissIndependence ?? 0) + 1;
-            if (this.paperExploration) this.stats.shadowSignals = (this.stats.shadowSignals ?? 0) + 1;
-            return;
-          }
-          if (strength < minStrength) {
-            this.stats.quorumNearMissConsensus = (this.stats.quorumNearMissConsensus ?? 0) + 1;
-            if (this.paperExploration) this.stats.shadowSignals = (this.stats.shadowSignals ?? 0) + 1;
-            return;
+          // Single-voter short-circuit: with 1 wallet voting, HHI is undefined
+          // (would be 1.0 = max concentration) and nEff=1, which would fail the
+          // independence check. Bypass the diversity/consensus checks when
+          // there's exactly one voter — independence is moot for a single signal.
+          if (distinctVoters > 1) {
+            const clusters = clusterOf(actions, this.independenceSettings.clusterThreshold);
+            const summary = effectiveContributors(clusters, buyWeight(actions, outcomeVotes), this.independenceSettings.capPerWallet);
+            const satelliteOnly = primaryCount === 0;
+            const limits = { maxHHI: this.independenceSettings.maxHHI, minNEffective: satelliteOnly ? Math.max(3, this.independenceSettings.minNEffective) : this.independenceSettings.minNEffective };
+            const strength = consensusStrength(outcomeVotes);
+            const minStrength = satelliteOnly ? (this.independenceSettings.consensusStrengthSatellite ?? 0.70) : (this.independenceSettings.consensusStrengthPrimary ?? 0.60);
+            this.lastVoteHHI.set(`${conditionId}:${outcome}`, summary.hhi);
+            if (!isDiverse(summary.hhi, summary.nEff, limits)) {
+              this.stats.quorumNearMissIndependence = (this.stats.quorumNearMissIndependence ?? 0) + 1;
+              if (this.paperExploration) this.stats.shadowSignals = (this.stats.shadowSignals ?? 0) + 1;
+              return;
+            }
+            if (strength < minStrength) {
+              this.stats.quorumNearMissConsensus = (this.stats.quorumNearMissConsensus ?? 0) + 1;
+              if (this.paperExploration) this.stats.shadowSignals = (this.stats.shadowSignals ?? 0) + 1;
+              return;
+            }
+          } else {
+            // Single voter: HHI is trivially 1.0, no independence to evaluate.
+            this.lastVoteHHI.set(`${conditionId}:${outcome}`, 1.0);
           }
         }
         if (!quorumReached) {
