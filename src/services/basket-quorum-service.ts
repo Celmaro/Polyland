@@ -1582,16 +1582,19 @@ export class BasketQuorumService {
     this.executeIfInBand(trade, signal, basket, key, now);
   }
   private async executeIfInBand(
-    trade: SmartMoneyTrade,
-    signal: ConsensusSignal,
-    basket: BasketConfig,
-    key: string,
-    now: number,
-  ): Promise<void> {
-    // Fee rate: fetch-and-cache per conditionId before any edge math. Without
-    // this the cache defaults to 0 and every edge/exit calculation runs
-    // fee-free (systematically optimistic by the full taker fee).
-    if (!this.reconciled) {
+      trade: SmartMoneyTrade,
+      signal: ConsensusSignal,
+      basket: BasketConfig,
+      key: string,
+      now: number,
+    ): Promise<void> {
+      // Audit 09-11 trace: log every fire attempt so we can see WHY a market
+      // gets to consensus but doesn't fire. Previously we only logged SKIPs.
+      console.log(`[BasketQuorum][fire] ${basket.category} ${signal.marketSlug} consensus=${signal.consensusPrice.toFixed(3)} wallets=${signal.wallets.length} cond=${signal.conditionId.slice(0, 12)}`);
+      // Fee rate: fetch-and-cache per conditionId before any edge math. Without
+      // this the cache defaults to 0 and every edge/exit calculation runs
+      // fee-free (systematically optimistic by the full taker fee).
+      if (!this.reconciled) {
       this.stats.quorumSkippedRiskHalt = (this.stats.quorumSkippedRiskHalt ?? 0) + 1;
       console.warn(`[BasketQuorum] SKIP reconcile-gate: ${signal.marketSlug} — startup reconciliation incomplete`);
       this.planDecision(this.ledgerDecision(trade, 'execution', false, 'reconcile'));
@@ -1731,6 +1734,9 @@ export class BasketQuorumService {
       }
     }
     if (!decision.accepted) {
+      // Audit 09-11 trace: log the REJECTED decision reason so we can see
+      // why fires that pass B1-B3 and drift get rejected by the engine.
+      console.log(`[BasketQuorum][fire-reject] ${basket.category} ${signal.marketSlug} reason=${decision.reason ?? 'unknown'} detail=${(decision as { detail?: string }).detail ?? ''} consensus=${signal.consensusPrice.toFixed(3)}`);
       if (decision.reason === 'risk') this.stats.quorumSkippedRiskHalt++;
       else if (decision.reason === 'bankroll') this.stats.quorumSkippedBankroll++;
       else if (decision.reason === 'min_size') this.stats.quorumSkippedMinSize = (this.stats.quorumSkippedMinSize ?? 0) + 1;
