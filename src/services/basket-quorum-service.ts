@@ -2000,10 +2000,17 @@ export class BasketQuorumService {
       skipped_negative_edge: s.quorumSkippedNegativeEdge ?? 0,
       skipped_min_size: s.quorumSkippedMinSize ?? 0,
       // Audit 09-09 skip taxonomy: fail-closed gates counted separately from
-      // real order failures (failed=6 was actually 6× no-depth liquidity skips).
-      skipped_stale_quote: s.quorumSkippedStaleQuote ?? 0,
-      skipped_feed_stale: s.quorumSkippedFeedStale ?? 0,
-      skipped_quality: s.quorumSkippedQuality ?? 0,
+          // real order failures (failed=6 was actually 6× no-depth liquidity skips).
+          skipped_stale_quote: s.quorumSkippedStaleQuote ?? 0,
+          skipped_feed_stale: s.quorumSkippedFeedStale ?? 0,
+          skipped_quality: s.quorumSkippedQuality ?? 0,
+          // Audit 09-10: B1/B2/B3 quorum-quality gates were invisible in the funnel
+          // header — 1613 B1 skips over 6h were hidden. Add them so the dominant
+          // gate is visible to operators.
+          skipped_b1_coherence: s.quorumSkippedCoherence ?? 0,
+          skipped_b2_weighted: s.quorumSkippedWeighted ?? 0,
+          skipped_b3_dominant: s.quorumSkippedDominant ?? 0,
+          skipped_5m_crypto: s.ignoredDisabledDomain ?? 0,
       near_miss_ind: s.quorumNearMissIndependence ?? 0,
       near_miss_cons: s.quorumNearMissConsensus ?? 0,
       near_miss_exec: s.quorumNearMissExecution ?? 0,
@@ -2032,7 +2039,11 @@ export class BasketQuorumService {
         `liq=${funnel.skipped_thin_liquidity} negEdge=${funnel.skipped_negative_edge} ` +
         `minSize=${funnel.skipped_min_size} ` +
         `execSkips=${funnel.skipped_stale_quote}/${funnel.skipped_feed_stale}/${funnel.skipped_quality} ` +
-        `nearMiss=${funnel.near_miss_ind}/${funnel.near_miss_cons}/${funnel.near_miss_exec} ` +
+                // Audit 09-10: surface B1/B2/B3 quorum-quality + 5m crypto kills so the
+                // dominant gate is visible (previously hidden inside `ignored`).
+                `b1=${funnel.skipped_b1_coherence} b2=${funnel.skipped_b2_weighted} b3=${funnel.skipped_b3_dominant} ` +
+                `5mCrypto=${funnel.skipped_5m_crypto} ` +
+                `nearMiss=${funnel.near_miss_ind}/${funnel.near_miss_cons}/${funnel.near_miss_exec} ` +
         `executed=${funnel.executed} failed=${funnel.failed} ` +
         `feedAge=${(funnel.feed_age_ms / 1000).toFixed(0)}s ` +
         `conversion=${funnel.conversion_pct}% accounted=${funnel.accounted_pct}%` +
