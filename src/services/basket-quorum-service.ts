@@ -1446,7 +1446,7 @@ export class BasketQuorumService {
           const coherence = evaluateConsensusGate({
             aligned,
             minAligned,
-            maxPriceBand: Number(process.env.B1_MAX_PRICE_BAND ?? 0.15),
+            maxPriceBand: Number(process.env.B1_MAX_PRICE_BAND ?? 0.50),
             maxTimeSpreadSec: Number(process.env.B1_MAX_TIME_SPREAD_SEC ?? 3600),
           });
           if (!coherence.ok) {

@@ -143,15 +143,21 @@ export class SignalAuditStore {
   }
 
   appendJsonl(event: string, data: Record<string, unknown>): void {
-    const path = SignalAuditStore.jsonlPath;
-    if (!path) return;
-    try {
+      const path = SignalAuditStore.jsonlPath;
       const line = JSON.stringify({ ts: Date.now(), event, ...data }) + '\n';
-      fs.appendFileSync(path, line, 'utf8');
-    } catch {
-      // audit logging must never break trading
+      if (path) {
+        try { fs.appendFileSync(path, line, 'utf8'); }
+        catch { /* audit logging must never break trading */ }
+      }
+      // Audit 09-10: persist audit history beyond container lifetime. If
+      // AUDIT_WEBHOOK_URL is set, POST each line there. JSONL is the source of
+      // truth, this is a mirror for cross-restart survival.
+      const url = process.env.AUDIT_WEBHOOK_URL;
+      if (url) {
+        // Fire-and-forget; never block trading on a slow webhook.
+        fetch(url, { method: 'POST', body: line, headers: { 'content-type': 'application/json' } }).catch(() => undefined);
+      }
     }
-  }
 
   // --------------------------------------------------------------------------
   // Recording
@@ -520,14 +526,34 @@ export class SignalAuditStore {
    * redeploys instead of silently resetting to zero. Idempotent — the same
    * guards used by the live paths (settledAt, dedupe) apply.
    */
-  replayJsonl(path: string): void {
-    if (!fs.existsSync(path)) return;
-    let lines: string[];
-    try {
-      lines = fs.readFileSync(path, 'utf8').split('\n').filter(Boolean);
-    } catch {
-      return;
-    }
+  async replayJsonl(path: string): Promise<void> {
+      if (!fs.existsSync(path)) return;
+      let lines: string[];
+      try {
+        lines = fs.readFileSync(path, 'utf8').split('\n').filter(Boolean);
+      } catch {
+        return;
+      }
+      // Audit 09-10: pull additional lines from the webhook mirror if configured.
+      // Append-only after local — remote wins for any newer timestamps not in
+      // the local file. If webhook returns nothing, fall back to local-only.
+      const url = process.env.AUDIT_WEBHOOK_URL;
+      if (url) {
+        try {
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 5000);
+          try {
+            const r = await fetch(url, { method: 'GET', signal: ctrl.signal });
+            clearTimeout(t);
+            if (r.ok) {
+              const text = await r.text();
+              const remoteLines = text.split('\n').filter(Boolean);
+              const seen = new Set(lines.map((l) => l.slice(0, 80)));
+              for (const rl of remoteLines) if (!seen.has(rl.slice(0, 80))) lines.push(rl);
+            }
+          } catch { /* ignore */ }
+        } catch { /* ignore */ }
+      }
     for (const line of lines) {
       let evt: { event?: string; ts?: number; [k: string]: unknown };
       try {

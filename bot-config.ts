@@ -159,7 +159,7 @@ const BASKET_QUORUM_CONFIG: BasketQuorumConfig = {
   defaultQuorum: 2,
     defaultWindowMs: 4 * 60 * 60 * 1000,   // 4-hour rolling window — accumulate more votes
     maxPriceDrift: 0.30,                   // loosened from 0.05 — drift=297/10min was the #1 kill
-    fireCooldownMs: 10 * 60 * 1000,
+    fireCooldownMs: Number(process.env.FIRE_COOLDOWN_MS ?? 120_000),
     sizeScale: CONFIG.smartMoney.sizeScale,
     maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
     maxSlippage: CONFIG.smartMoney.maxSlippage,

@@ -128,22 +128,34 @@ export class ExecutionEngine {
     if (signal.consensusPrice > maxEntry) return { accepted: false, reason: 'edge', detail: `price_ceiling ${signal.consensusPrice.toFixed(3)} > ${maxEntry}` };
     const phase = this.deps.phaseEdge(signal);
     if (edge <= phase.minEdge || signal.winRate < phase.minProb) return { accepted: false, reason: 'edge' };
-    // D1: composite entry-quality gate (opt-in). Reject low-quality entries.
-    const eqMin = this.config.entryQualityMinScore ?? 0;
-    if (eqMin > 0) {
-      const ageSeconds = signal.observedAt !== undefined ? (Date.now() - signal.observedAt) / 1000 : 0;
-      const eq = computeEntryQualityScore({
-        signalEdgeBps: edge * 10_000,
-        spreadBps: null,
-        minTopDepth: null,
-        ageSeconds,
-        weights: { edge: 0.4, spread: 0.3, depth: 0.2, freshness: 0.1 },
-      });
-      if (eq.score < eqMin) {
-        this.skipped.quality++;
-        return { accepted: false, reason: 'quality', detail: `entry_quality ${eq.score.toFixed(1)} < ${eqMin}` };
-      }
-    }
+    // D1: composite entry-quality gate. Only runs when features are available —
+        // previously passed `spreadBps: null, minTopDepth: null` and the gate
+        // produced degenerate scores (entryQ=40/100 max). Audit 09-10: 212 QUALITY
+        // hits with entryQ stuck at the floor meant the gate was never actually
+        // gating anything. Now: when quality tracker has features for this token,
+        // use real spreadBps + depth; when it doesn't, skip the gate entirely
+        // (advisory log only).
+        const eqMin = this.config.entryQualityMinScore ?? 0;
+        if (eqMin > 0) {
+          const tokenId = trade?.tokenId ?? signal.conditionId;
+          const book = this.deps.bookLookup ? await this.deps.bookLookup(tokenId).catch(() => null) : null;
+          const qf = this.deps.quality?.features(tokenId, book ?? undefined) ?? null;
+          if (qf && (qf.spreadBps !== null || qf.depthUsd > 0)) {
+            const ageSeconds = signal.observedAt !== undefined ? (Date.now() - signal.observedAt) / 1000 : 0;
+            const eq = computeEntryQualityScore({
+              signalEdgeBps: edge * 10_000,
+              spreadBps: qf.spreadBps,
+              minTopDepth: qf.depthUsd,
+              ageSeconds,
+              weights: { edge: 0.4, spread: 0.3, depth: 0.2, freshness: 0.1 },
+            });
+            if (eq.score < eqMin) {
+              this.skipped.quality++;
+              return { accepted: false, reason: 'quality', detail: `entry_quality ${eq.score.toFixed(1)} < ${eqMin}` };
+            }
+          }
+          // Features unavailable → skip gate (advisory) — better than gating on degenerate defaults.
+        }
     // D2: R-normalized sizing (opt-in) — cap so loss-to-stop ≈ fixed risk budget.
     if (this.config.riskSizing?.enabled) {
       const stopLoss = effectiveStopLoss({

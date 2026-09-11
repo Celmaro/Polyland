@@ -116,7 +116,7 @@ export class PolylandRuntime {
           });
           console.log('[PolylandRuntime] live wallet config validated (signer/funder/signature-type explicit)');
         }
-    SignalAuditStore.enableJsonl('./data/signal-audit.jsonl'); signalAuditStore.setStateStore(this.stateStore); signalAuditStore.replayJsonl('./data/signal-audit.jsonl');
+    SignalAuditStore.enableJsonl('./data/signal-audit.jsonl'); signalAuditStore.setStateStore(this.stateStore); void signalAuditStore.replayJsonl('./data/signal-audit.jsonl');
     this.rebuildSnapshotFromAudit();
     this.ledger = new DecisionLedger();
     const ledgerRecords = await this.ledger.start();
@@ -202,16 +202,21 @@ export class PolylandRuntime {
       console.warn(`[PolylandRuntime] HOLDING ${buffer.length} buffered trade(s) — reconciliation required before copy decisions resume`);
     }
     this.funnelTimer = setInterval(() => {
-      this.quorum?.logFunnel();
-      const metrics = this.config.botMetrics;
-      if (metrics) {
-        if (this.clob) metrics.mirrorClobIntegrity(this.clob.getIntegrityState());
-        metrics.setFeedLagSeconds(this.quorum ? Math.max(0, (Date.now() - this.quorum.getLastFeedEventAt()) / 1000) : 0);
-      }
-    }, 300000); this.scheduleRefresh(21600000, ingestion, screening, key);
-  }
-  /** A1-A3: feed screened wallets through the basket lifecycle (graduated actions, capacity, promotion buffer). */
-  private feedBasketLifecycle(screened: any[]): void {
+          this.quorum?.logFunnel();
+          const metrics = this.config.botMetrics;
+          if (metrics) {
+            if (this.clob) metrics.mirrorClobIntegrity(this.clob.getIntegrityState());
+            metrics.setFeedLagSeconds(this.quorum ? Math.max(0, (Date.now() - this.quorum.getLastFeedEventAt()) / 1000) : 0);
+          }
+          // Audit 09-10: 9-hour NodeNotReady outage left the bot silent. Add a
+          // watchdog: if no trade events for >30 min AND WS is disconnected,
+          // force a reconnect + log. This won't recover from infra-level node
+          // death (Zeabur/k8s handles that), but it catches silent WS death.
+          this.checkFeedStallWatchdog();
+                  }, 300000); this.scheduleRefresh(21600000, ingestion, screening, key);
+            }
+            /** A1-A3: feed screened wallets through the basket lifecycle (graduated actions, capacity, promotion buffer). */
+            private feedBasketLifecycle(screened: any[]): void {
     if (!this.basketLifecycle) return;
     const assignments = screened
       .filter((w) => w && typeof w.score === 'number' && typeof w.category === 'string')
@@ -347,11 +352,44 @@ export class PolylandRuntime {
       const actions = evaluateRebalance(this.basketLifecycleCfg, exposure);
       return actions.map((a) => ({ topic: a.topic, reason: a.reason }));
     }
-    async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder();
-    // Idempotency & cleanup audit: on shutdown in LIVE mode, cancel all open
-    // CLOB orders so no resting/dangling orders are left exposed (mirrors
-    // the systemd drain-then-exit pattern). DRY_RUN skips (no real orders).
-    if (!this.config.dryRun) {
+    /**
+       * Audit 09-10 watchdog: if no trade events arrived in the last 30 minutes
+       * AND the CLOB WS state machine isn't already CONNECTED/LIVE, force a
+       * reconnect. The CLOB WS often silently dies after reconnects; without
+       * this, the bot looks alive (status=DRY RUN ACTIVE) but stops receiving
+       * trades. Won't help with infra-level node death — that's Zeabur/k8s.
+       */
+      private checkFeedStallWatchdog(): void {
+        const lastEventAt = this.quorum?.getLastFeedEventAt() ?? 0;
+            const stallMs = Date.now() - lastEventAt;
+            if (stallMs < 30 * 60_000) return;
+            // Stall detected. Check CLOB connection state.
+            const integrity = this.clob?.getIntegrityState();
+            const connState = integrity?.connectionState ?? 'unknown';
+            if (connState === 'live') {
+              console.warn(`[PolylandRuntime] FEED STALL: ${(stallMs / 60_000).toFixed(0)}min no events but CLOB live — possible upstream data-api issue`);
+              return;
+            }
+            console.warn(`[PolylandRuntime] FEED STALL WATCHDOG: ${(stallMs / 60_000).toFixed(0)}min no events, CLOB state=${connState} — forcing restart`);
+            try {
+              this.clob?.stop();
+              this.clob = new ClobMarketWsService();
+              const clob = this.clob; // narrow for closure
+              clob.onMid(({ assetId, price }) => {
+                this.quorum?.observeMid(assetId, price);
+                this.marketQuality?.record(assetId, price);
+              });
+              if (this.quorum) this.quorum.onMidInterest = (tokenId) => clob?.subscribe([tokenId]);
+              console.warn('[PolylandRuntime] FEED STALL WATCHDOG: CLOB WS re-instantiated');
+            } catch (e) {
+              console.warn('[PolylandRuntime] FEED STALL WATCHDOG: restart failed:', e instanceof Error ? e.message : e);
+            }
+          }
+      async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder();
+          // Idempotency & cleanup audit: on shutdown in LIVE mode, cancel all open
+          // CLOB orders so no resting/dangling orders are left exposed (mirrors
+          // the systemd drain-then-exit pattern). DRY_RUN skips (no real orders).
+          if (!this.config.dryRun) {
       try {
         const cancel = await Promise.race([
           this.sdk.tradingService.cancelAllOrders(),
