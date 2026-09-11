@@ -323,7 +323,9 @@ export class ExecutionEngine {
         if (fill.verdict !== 'filled' || fill.executableSize <= 0) {
           this.skipped.noDepth++;
           release();
-          console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} has no executable level`);
+          const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
+          const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
+          console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)}`);
           return { ok: false, reason: 'no_depth' };
         }
         auditPrice = fill.executableVwap;
@@ -340,6 +342,7 @@ export class ExecutionEngine {
       this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category, signalId: signal.signalId });
       this.deps.onPositionOpened(trade?.tokenId, placedUsd, auditShares, auditPrice, signal);
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
+      console.log(`[ExecutionEngine] PAPER FILL: ${signal.marketSlug} order=${result.orderId} shares=${auditShares.toFixed(2)} price=${auditPrice.toFixed(3)} usd=${placedUsd.toFixed(2)} dryRun=${decision.value.dryRun}`);
       if (trade?.tokenId) this.deps.onAntiSniperFire(trade.tokenId);
       return { ok: true, orderId: result.orderId };
     } catch {
