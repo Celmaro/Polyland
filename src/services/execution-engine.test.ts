@@ -130,7 +130,17 @@ describe('ExecutionEngine', () => {
     expect(first.ok).toBe(false);
     expect(engine.failed).toBe(1);
 
-    const second = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    // R7: a retry of the SAME signal must NOT re-submit (dispatched-set guard).
+    const retrySame = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(retrySame.ok).toBe(false);
+    expect(calls).toBe(1); // no re-submission
+
+    // Reservation release is still verified: a DIFFERENT signal can reserve+fill.
+    const different = {
+      accepted: true,
+      value: { signal: { ...SIGNAL, signalId: 'sig-1b', conditionId: 'cond-1b', consensusPrice: 0.40 }, amountUsd: 5, price: 0.40, dryRun: false },
+    } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>;
+    const second = await engine.execute(different, { ...TRADE, conditionId: 'cond-1b', tokenId: 'tok-1b' }, BASKET);
     expect(second.ok).toBe(true);
     expect(calls).toBe(2);
   });
@@ -343,5 +353,83 @@ describe('ExecutionEngine complement mirroring (R2)', () => {
     const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
     expect(result.ok).toBe(false); // no-depth, not mirrored
     expect(engine.mirrored).toBe(false);
+  });
+});
+
+describe('R7 — idempotency under faults (no double-fill)', () => {
+  const decisionFor = (signalId: string) => ({
+    accepted: true,
+    value: { signal: { ...SIGNAL, signalId, consensusPrice: 0.40 }, amountUsd: 5, price: 0.40, dryRun: false },
+  } as unknown as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>);
+
+  it('never double-spends when a retry follows a thrown timeout', async () => {
+    let orderCalls = 0;
+    let spent = 0;
+    const flaky: TradingService = {
+      createMarketOrder: async () => { orderCalls++; throw new Error('fetch failed: connect timeout'); },
+    } as unknown as TradingService;
+    const deps = makeDeps({ basketSpendAdd: (_c, amount) => { spent += amount; } });
+    const engine = new ExecutionEngine(flaky, null, deps, { ...CONFIG, dryRun: false });
+    const d = decisionFor('sig-timeout');
+    // First attempt: timeout -> unknown -> reconciliation required, no retry.
+    await engine.execute(d, TRADE, BASKET);
+    const callCountAfterFirst = orderCalls;
+    const spentAfterFirst = spent;
+    // Retry same signal (as a client would after a timeout): must NOT double-fire.
+    await engine.execute(d, TRADE, BASKET);
+    await engine.execute(d, TRADE, BASKET);
+    expect(orderCalls).toBe(callCountAfterFirst); // no further venue submissions
+    expect(spent).toBe(spentAfterFirst);          // no double-spend
+  });
+
+  it('never double-spends on an HTTP 429 retry of the same signal', async () => {
+    let orderCalls = 0;
+    let spent = 0;
+    const rateLimited: TradingService = {
+      createMarketOrder: async () => { orderCalls++; return { success: false, orderId: undefined, error: 'rate limit 429' }; },
+    } as unknown as TradingService;
+    const deps = makeDeps({ basketSpendAdd: (_c, amount) => { spent += amount; } });
+    const engine = new ExecutionEngine(rateLimited, null, deps, { ...CONFIG, dryRun: false });
+    const d = decisionFor('sig-429');
+    await engine.execute(d, TRADE, BASKET);
+    const calls = orderCalls;
+    const sp = spent;
+    await engine.execute(d, TRADE, BASKET); // client retries after 429
+    expect(orderCalls).toBe(calls);
+    expect(spent).toBe(sp);
+  });
+
+  it('marks the signal executed on a successful fill so a WS-drop re-delivery cannot double-fill', async () => {
+    let orderCalls = 0;
+    let spent = 0;
+    const trading: TradingService = {
+      createMarketOrder: async () => { orderCalls++; return { success: true, orderId: 'ord-ws' }; },
+    } as unknown as TradingService;
+    const deps = makeDeps({ basketSpendAdd: (_c, amount) => { spent += amount; } });
+    const engine = new ExecutionEngine(trading, null, deps, { ...CONFIG, dryRun: false });
+    const d = decisionFor('sig-wsdrop');
+    const first = await engine.execute(d, TRADE, BASKET);
+    expect(first.ok).toBe(true);
+    const spentAfterFill = spent;
+    // WS drops the ack; the caller re-sends the same signal — must be rejected.
+    const redeliver = await engine.execute(d, TRADE, BASKET);
+    expect(redeliver.ok).toBe(false);
+    expect(spent).toBe(spentAfterFill);
+  });
+
+  it('rejects retry-after-submit (ambiguous success then duplicate dispatch)', async () => {
+    let orderCalls = 0;
+    let spent = 0;
+    const trading: TradingService = {
+      createMarketOrder: async () => { orderCalls++; return { success: true, orderId: 'ord-ambig' }; },
+    } as unknown as TradingService;
+    const deps = makeDeps({ basketSpendAdd: (_c, amount) => { spent += amount; } });
+    const engine = new ExecutionEngine(trading, null, deps, { ...CONFIG, dryRun: false });
+    const d = decisionFor('sig-ambig');
+    await engine.execute(d, TRADE, BASKET);
+    const spentAfterFirst = spent;
+    // Re-dispatch (retry after submit ack) must not double-spend.
+    await engine.execute(d, TRADE, BASKET);
+    expect(spent).toBe(spentAfterFirst);
   });
 });

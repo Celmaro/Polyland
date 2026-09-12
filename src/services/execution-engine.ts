@@ -83,6 +83,10 @@ export class ExecutionEngine {
    *  execute() for the same signal is rejected BEFORE any reservation/order,
    *  so a double-dispatch (retry, re-entrancy) can never double-fill. */
   private readonly executedSignalIds = new Set<string>();
+  /** R7: signalIds for which a venue submission was ATTEMPTED (even if the
+   *   outcome was a timeout / 429 / unknown). A retry of the same signal must
+   *   NOT re-submit — reconciliation must resolve the true venue outcome. */
+  private readonly dispatchedSignalIds = new Set<string>();
   /** Per-category rate-limit state for bankroll-saturation warnings. */
   private _lastBankrollLogAt = new Map<string, number>();
   constructor(
@@ -206,9 +210,9 @@ export class ExecutionEngine {
     // Idempotency audit: never execute the same signal twice in-process, even
     // if the caller double-dispatches (retry/re-entrancy). The signalId is
     // unique per fire; this guard makes a duplicate fill impossible here.
-    if (signal.signalId && this.executedSignalIds.has(signal.signalId)) {
+    if (signal.signalId && (this.executedSignalIds.has(signal.signalId) || this.dispatchedSignalIds.has(signal.signalId))) {
       this.skipped.staleQuote++; // counted as a fail-closed skip, not a failure
-      console.warn(`[ExecutionEngine] SKIP duplicate-signal: ${signal.marketSlug} ${signal.signalId} — already executed`);
+      console.warn(`[ExecutionEngine] SKIP duplicate-signal: ${signal.marketSlug} ${signal.signalId} — already dispatched/executed`);
       return { ok: false, reason: 'stale_quote', detail: 'duplicate_signal_execution' };
     }
     // Defense-in-depth: the planner may replace the engine's initial price
@@ -274,7 +278,12 @@ export class ExecutionEngine {
       let result: OrderResult;
       if (decision.value.dryRun) result = { success: true, orderId: `dry_run_${Date.now()}` };
       else if (!trade?.tokenId) throw new Error('missing tokenId');
-      else result = await this.tradingService.createMarketOrder({ tokenId: trade.tokenId, side: 'BUY', amount: amountUsd, price, orderType: this.config.orderType });
+      else {
+        // R7: mark dispatched BEFORE the venue call so a timeout / 429 /
+        // ambiguous-submit retry of the SAME signal cannot double-submit.
+        if (signal.signalId) this.dispatchedSignalIds.add(signal.signalId);
+        result = await this.tradingService.createMarketOrder({ tokenId: trade.tokenId, side: 'BUY', amount: amountUsd, price, orderType: this.config.orderType });
+      }
       const classification = classifySubmission(result);
       if (classification !== 'accepted') {
         if (classification === 'unknown') {
