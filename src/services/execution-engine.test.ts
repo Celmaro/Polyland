@@ -307,3 +307,41 @@ describe('ExecutionEngine depth-aware dry-run fills (P1-5 shared fill engine)', 
     expect(fired!.pricePaid).toBe(SIGNAL.consensusPrice); // legacy: consensus, no book
   });
 });
+
+describe('ExecutionEngine complement mirroring (R2)', () => {
+  it('mirrors to the complement when the target ask is walled', async () => {
+    let fired: Record<string, unknown> | null = null;
+    const deps = makeDeps({
+      auditStore: { recordFire: (params: Record<string, unknown>) => { fired = params; return 'id'; } },
+      onPositionOpened: () => {},
+      // target book: ask walled at 0.99
+      bookLookup: async () => ({ asks: [{ price: 0.99, size: 100 }], bids: [{ price: 0.5, size: 10 }], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      // complement (NO) book: real ask at 0.41
+      complementBookLookup: async () => ({ asks: [{ price: 0.41, size: 1000 }], bids: [], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      complementTokenFor: async () => 'no-tok',
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true, complementMirror: true, maxSlippage: 0.03 });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(true);
+    expect(engine.mirrored).toBe(true);
+    // audit tagged mirrored, fill at complement ~0.41
+    expect(fired!.mirrored).toBe(true);
+    expect(fired!.pricePaid).toBeLessThan(0.5);
+  });
+
+  it('does not mirror when complement mirroring is disabled', async () => {
+    const deps = makeDeps({
+      bookLookup: async () => ({ asks: [{ price: 0.99, size: 100 }], bids: [], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      complementBookLookup: async () => ({ asks: [{ price: 0.41, size: 1000 }], bids: [], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      complementTokenFor: async () => 'no-tok',
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true, complementMirror: false });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(false); // no-depth, not mirrored
+    expect(engine.mirrored).toBe(false);
+  });
+});

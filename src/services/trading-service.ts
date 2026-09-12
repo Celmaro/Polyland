@@ -598,6 +598,33 @@ export class TradingService {
     });
   }
 
+  /**
+   * R2: fetch the YES/NO token ids for a market by conditionId. Returns null
+   * when the market is unavailable or has fewer than 2 tokens (not binary).
+   */
+  async getMarketTokens(conditionId: string): Promise<{ yesTokenId: string; noTokenId: string } | null> {
+    const client = await this.ensureInitialized();
+    return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
+      try {
+        // @ts-ignore — clob-client versions vary; tokens is Array<{tokenId,outcome}>.
+        const market = await (client as any).getMarket(conditionId);
+        const tokens: Array<{ tokenId?: string; outcome?: string }> = market?.tokens ?? market?.outcomes ?? [];
+        let yes: string | null = null;
+        let no: string | null = null;
+        for (const t of tokens) {
+          const outcome = String(t.outcome ?? '').toLowerCase();
+          if (!t.tokenId) continue;
+          if (outcome === 'yes') yes = t.tokenId;
+          else if (outcome === 'no') no = t.tokenId;
+        }
+        if (!yes || !no) return null;
+        return { yesTokenId: yes, noTokenId: no };
+      } catch {
+        return null;
+      }
+    });
+  }
+
   async getEarningsForDay(date: string): Promise<UserEarning[]> {
     const client = await this.ensureInitialized();
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {

@@ -1726,10 +1726,39 @@ export class BasketQuorumService {
           return null;
         }
       },
+      // R2: complement-side mirroring hooks (binary markets).
+      complementBookLookup: async (tokenId) => {
+        try {
+          const book = await this.tradingService.getPublicOrderBook(tokenId);
+          if (!book || !Array.isArray(book.asks) || book.asks.length === 0) return null;
+          const level = (l: { price: string | number; size: string | number }) => ({
+            price: typeof l.price === 'number' ? l.price : parseFloat(l.price),
+            size: typeof l.size === 'number' ? l.size : parseFloat(l.size),
+          });
+          return {
+            asks: book.asks.map(level),
+            bids: Array.isArray(book.bids) ? book.bids.map(level) : [],
+            minOrderSize: 0,
+            tickSize: this.tickSizeCache.get(tokenId) ?? 0.01,
+            timestamp: Date.now(),
+          };
+        } catch {
+          return null;
+        }
+      },
+      complementTokenFor: async (conditionId) => {
+        try {
+          const tokens = await this.tradingService.getMarketTokens(conditionId);
+          return tokens?.noTokenId ?? null;
+        } catch {
+          return null;
+        }
+      },
     }, {
       dryRun: this.config.dryRun, orderType: this.config.orderType, maxSlippage: this.config.maxSlippage,
       minTradeSize: this.config.minTradeSize, maxSizePerTrade: this.config.maxSizePerTrade, sizeScale: this.config.sizeScale,
       maxEntryPrice: this.config.maxEntryPrice,
+      complementMirror: process.env.COMPLEMENT_MIRROR_ENABLED === 'true',
     });
     this.planDecision(this.ledgerDecision(trade, 'quorum_reached', true, undefined, signal.outcome));
         const decision = await engine.evaluate(signal, trade, basket);

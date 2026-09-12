@@ -7,6 +7,7 @@ import type { ConsensusSignal, ExecutionDecision, PipelineDecision, RejectReason
 import { BankrollReservationLedger } from './bankroll-reservation.js';
 import { computeExactSharesAndCost, quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
 import { executeAgainstBook, type FillBook } from './fill-engine.js';
+import { planComplementMirror } from './complement-mirror.js';
 import { computeEntryQualityScore, applyRiskAdjustedAmount, effectiveStopLoss } from './execution-quality.js';
 import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 import { classifySubmission } from './submission-pipeline.js';
@@ -26,6 +27,8 @@ export interface ExecutionEngineConfig {
   entryQualityMinScore?: number;
   /** D2 R-normalized sizing (opt-in): cap so loss-to-stop ≈ target risk. */
   riskSizing?: { enabled: boolean; targetRiskUsdc: number; stopLossPct: number; absoluteFloor?: number };
+  /** R2 complement-mirroring (opt-in): fill the complement side when the target ask is walled. */
+  complementMirror?: boolean;
 }
 export interface ExecutionEngineDeps {
   tickSizeFor: (conditionId: string) => number;
@@ -48,6 +51,10 @@ export interface ExecutionEngineDeps {
    *  known. Null when unavailable (market metadata fetch failed). */
   marketVolume24h?: (conditionId: string) => Promise<{ volume24hr: number; liquidity: number } | null>;
   auditStore: { recordFire: (params: Record<string, unknown>) => unknown };
+  /** R2: fetch the complement token book for mirroring (binary markets). */
+  complementBookLookup?: (complementTokenId: string) => Promise<FillBook | null>;
+  /** R2: derive the complement token id for a binary market. */
+  complementTokenFor?: (conditionId: string, side: 'BUY' | 'SELL') => Promise<string | null>;
 }
 
 export type ExecuteResult =
@@ -68,6 +75,8 @@ export class ExecutionEngine {
   private readonly ledger: BankrollReservationLedger<string>;
   /** Genuine order failures ONLY (venue reject / throw). Skips are not failures. */
   public failed = 0;
+  /** R2: true when the last fill was a complement-mirrored order. */
+  public mirrored = false;
   /** Fail-closed skips by reason — visible in the funnel, not conflated with failed. */
   public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0, entryCeiling: 0 };
   /** Idempotency audit: signalIds already executed this process — a duplicate
@@ -283,6 +292,7 @@ export class ExecutionEngine {
       // recorded instead of assuming the limit ceiling fills in full.
       let auditPrice = signal.consensusPrice;
       let auditShares = amountUsd / signal.consensusPrice;
+      let mirroredPath = false;
       let placedUsd = amountUsd;
       const depthAware = this.config.depthAwareFills ?? this.config.dryRun;
       if (depthAware && decision.value.dryRun && trade?.tokenId && this.deps.bookLookup) {
@@ -321,12 +331,72 @@ export class ExecutionEngine {
         const sizeForBook = computeExactSharesAndCost(amountUsd, price, tickSizeToEnum(this.deps.tickSizeFor(signal.conditionId))).shares;
         const fill = executeAgainstBook({ side: 'BUY', size: sizeForBook, maxPrice: price }, book);
         if (fill.verdict !== 'filled' || fill.executableSize <= 0) {
-          this.skipped.noDepth++;
-          release();
-          const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
-          const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
-          console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)}`);
-          return { ok: false, reason: 'no_depth' };
+          // ---- R2: complement-side mirroring (binary markets) ----
+          // Target ask is walled. If enabled, try expressing the same
+          // directional delta via the complement token's executable ask.
+          if (this.config.complementMirror && signal.conditionId && this.deps.complementBookLookup && this.deps.complementTokenFor) {
+            const compTokenRaw = await this.deps.complementTokenFor(signal.conditionId, 'BUY');
+            const compToken: string | null = compTokenRaw ?? null;
+            const compBook: FillBook | null = compToken ? await this.deps.complementBookLookup(compToken) : null;
+            const plan = (compToken && compBook)
+              ? planComplementMirror({
+                  target: {
+                    tokenId: signal.conditionId,
+                    side: 'BUY',
+                    outcome: signal.outcome,
+                    consensusPrice: signal.consensusPrice,
+                    targetAskBest: book.asks[0] ? book.asks[0].price : 0.99,
+                    targetBidBest: book.bids[0] ? book.bids[0].price : 0,
+                  },
+                  complement: {
+                    tokenId: compToken,
+                    complementSide: 'BUY',
+                    complementAskBest: compBook.asks[0] ? compBook.asks[0].price : 0.99,
+                    complementBidBest: compBook.bids[0] ? compBook.bids[0].price : 0,
+                    askSize: compBook.asks[0] ? compBook.asks[0].size : 0,
+                  },
+                  takerFeeBps: this.deps.feeRateFor(signal.conditionId) || 200,
+                  minPositionUsd: this.config.minTradeSize,
+                  maxSlippageBps: this.config.maxSlippage * 10_000,
+                })
+              : { ok: false as const, reason: 'complement_not_fillable' as const };
+
+            if (plan.ok && compBook) {
+              // Execute the complement mirror as a paper fill at the
+              // complement's executable ask. Tag side=mirrored in audit.
+              const compFill = executeAgainstBook({ side: plan.order.side, size: plan.order.size, maxPrice: plan.order.price }, compBook);
+              if (compFill.verdict === 'filled' && compFill.executableSize > 0) {
+                this.skipped.noDepth++; // still counts the direct target as non-fillable
+                release();
+                auditPrice = compFill.executableVwap;
+                auditShares = compFill.executableSize;
+                placedUsd = compFill.executableVwap * compFill.executableSize;
+                this.mirrored = true;
+                console.log(`[ExecutionEngine] MIRROR fill: ${signal.marketSlug} target ask=${book.asks[0]?.price ?? 0.99} -> complement ${compToken} ask=${compBook.asks[0]?.price ?? 0.99} vwap=${auditPrice.toFixed(3)} shares=${auditShares.toFixed(2)}`);
+                // fall through to audit recording with mirrored flag
+                mirroredPath = true;
+              } else {
+                this.skipped.noDepth++;
+                release();
+                console.warn(`[ExecutionEngine] SKIP no-depth+mismatch: ${signal.marketSlug} complement ${compToken} also unfillable`);
+                return { ok: false, reason: 'no_depth' };
+              }
+            } else {
+              this.skipped.noDepth++;
+              release();
+              const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
+              const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
+              console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)} mirror=${!plan.ok ? plan.reason : 'plan_ok'}`);
+              return { ok: false, reason: 'no_depth' };
+            }
+          } else {
+            this.skipped.noDepth++;
+            release();
+            const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
+            const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
+            console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)}`);
+            return { ok: false, reason: 'no_depth' };
+          }
         }
         auditPrice = fill.executableVwap;
         auditShares = fill.executableSize;
@@ -339,10 +409,10 @@ export class ExecutionEngine {
       if (signal.signalId) this.executedSignalIds.add(signal.signalId);
       // Audit pricePaid = the honest executable estimate: consensus when the
       // book is not used, otherwise the true depth-aware fill VWAP.
-      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category, signalId: signal.signalId });
+      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category, signalId: signal.signalId, mirrored: mirroredPath || undefined });
       this.deps.onPositionOpened(trade?.tokenId, placedUsd, auditShares, auditPrice, signal);
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
-      console.log(`[ExecutionEngine] PAPER FILL: ${signal.marketSlug} order=${result.orderId} shares=${auditShares.toFixed(2)} price=${auditPrice.toFixed(3)} usd=${placedUsd.toFixed(2)} dryRun=${decision.value.dryRun}`);
+      console.log(`[ExecutionEngine] PAPER FILL: ${signal.marketSlug} order=${result.orderId} shares=${auditShares.toFixed(2)} price=${auditPrice.toFixed(3)} usd=${placedUsd.toFixed(2)} dryRun=${decision.value.dryRun}${mirroredPath ? ' side=mirrored' : ''}`);
       if (trade?.tokenId) this.deps.onAntiSniperFire(trade.tokenId);
       return { ok: true, orderId: result.orderId };
     } catch {
