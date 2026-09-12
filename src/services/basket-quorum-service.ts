@@ -62,6 +62,7 @@ import { DecisionLedger } from './decision-ledger.js';
 import { ExecutionEngine } from './execution-engine.js';
 import { CopyPlanner, type CopyBook, type MarketMeta } from './copy-planner.js';
 import { PositionStateMachine, evaluateExit } from './position-state-machine.js';
+import { RestingOrderBook, type RestingOrder } from './resting-order.js';
 import { clusterOf, effectiveContributors, isDiverse, type WalletActionCategory } from './independence-metrics.js';
 import { evaluateConsensusGate, computeWeightedConsensus, computeDominantWalletShare, bayesianConfidence, computeConflictPenalty, classifyMarketRegime } from './quorum-quality.js';
 import { computeEntryQualityScore, resolveEdgeSizeMultiplier, applyRiskAdjustedAmount, shouldPostEntryInvalidate } from './execution-quality.js';
@@ -1059,6 +1060,10 @@ export class BasketQuorumService {
   private exitTimer: ReturnType<typeof setInterval> | null = null;
   /** Replacement exit layer: position lifecycle state machine. */
   private readonly posMachine = new PositionStateMachine();
+  /** Resting limit orders (fired=0 fix): fills when asks return to the band. */
+  private readonly restingBook = new RestingOrderBook();
+  onRestingFill?: (orderId: string, price: number, shares: number) => void;
+  onRestingSnapshot?: (orders: RestingOrder[]) => void;
   /** P0-7: copy decisions stay blocked until startup reconciliation succeeds. */
   private reconciled = false;
   /** P0-5: called with the current open-position records whenever they change. */
@@ -1108,12 +1113,125 @@ export class BasketQuorumService {
   }
 
   /** Start the exit ladder loop (15s). Idempotent. */
+  /**
+   * Record a resting-limit fill through the same audit/position path as a
+   * direct paper fill. This is the point where resting fills become fired>0.
+   */
+  private recordRestingFill(orderId: string, fillPrice: number, fillShares: number): void {
+    const order = this.restingBook.snapshot().find((o) => o.id === orderId);
+    if (!order || !(fillShares > 0) || !(fillPrice > 0)) return;
+    const meta = order.metadata;
+    if (!meta) {
+      console.warn(`[BasketQuorum][resting] fill ${orderId} missing audit metadata — refusing to count`);
+      return;
+    }
+    const usdc = fillPrice * fillShares;
+    const category = meta.category as MarketCategory;
+    this.basketSpend.set(category, (this.basketSpend.get(category) ?? 0) + usdc);
+    signalAuditStore.recordFire({
+      conditionId: order.conditionId,
+      marketSlug: meta.marketSlug,
+      outcome: order.outcome,
+      side: order.side,
+      pricePaid: fillPrice,
+      size: fillShares,
+      winRate: meta.winRate,
+      basket: meta.basketName,
+      wallets: meta.wallets,
+      category: meta.category,
+      entrySignal: 'resting_limit_fill',
+      signalAttribution: 'resting_order',
+    });
+    this.trackOpenPosition(
+      order.tokenId,
+      usdc,
+      fillShares,
+      fillPrice,
+      meta.marketSlug,
+      order.outcome,
+      order.conditionId,
+      meta.basketName,
+      category,
+      meta.signalId,
+      meta.wallets,
+    );
+    this._lastProcessedFire.set(`${this.config.dryRun ? 'paper' : 'live'}:${order.conditionId}:${order.outcome}`, Date.now());
+    this.planDecision(this.ledgerDecision(
+      { ...({} as SmartMoneyTrade), conditionId: order.conditionId, marketSlug: meta.marketSlug, outcome: order.outcome, side: order.side as 'BUY' | 'SELL', price: fillPrice, size: fillShares } as SmartMoneyTrade,
+      'resting_fill', true, undefined, order.outcome,
+    ));
+    this.stats.quorumFired++;
+    this.stats.executed++;
+    if (this.botMetrics) {
+      this.botMetrics.observeEntryPrice(String(meta.category ?? 'unknown'), String(meta.basketName ?? 'all'), fillPrice);
+    }
+    this._schedulePersist();
+    console.log(`[BasketQuorum][resting] PAPER FILL fired=1 ${meta.marketSlug} order=${orderId} shares=${fillShares.toFixed(2)} price=${fillPrice.toFixed(3)} usd=${usdc.toFixed(2)} side=resting`);
+  }
+
+  /** Durable restore of resting orders (fired=0 fix: survive restarts). */
+  restoreRestingOrders(orders: RestingOrder[]): void {
+    if (Array.isArray(orders) && orders.length > 0) {
+      this.restingBook.restore(orders);
+      console.log(`[BasketQuorum][resting] restored ${orders.length} resting order(s)`);
+    }
+  }
+
+  getRestingOrders(): RestingOrder[] {
+    return this.restingBook.snapshot();
+  }
+
+  /**
+   * Resting refill pass: for each open resting order, pull the live book and
+   * fill if the best ask has returned to/inside the ceiling. Records a PAPER
+   * FILL (position open + audit + dedup) exactly like a direct fire — so a
+   * resting fill counts as fired>0 with honest price/size.
+   */
+  private async runRestingRefill(): Promise<void> {
+    const open = this.restingBook.openOrders();
+    if (open.length === 0) return;
+    for (const order of open) {
+      try {
+        const book = await this.tradingService.getPublicOrderBook(order.tokenId);
+        if (!book) continue;
+        const refillBook = {
+          tokenId: order.tokenId,
+          asks: (book.asks ?? []).map((l: { price: string | number; size: string | number }) => ({
+            price: typeof l.price === 'number' ? l.price : parseFloat(l.price),
+            size: typeof l.size === 'number' ? l.size : parseFloat(l.size),
+          })),
+          bids: (book.bids ?? []).map((l: { price: string | number; size: string | number }) => ({
+            price: typeof l.price === 'number' ? l.price : parseFloat(l.price),
+            size: typeof l.size === 'number' ? l.size : parseFloat(l.size),
+          })),
+        };
+        const fills = this.restingBook.refill(refillBook, Date.now());
+        for (const f of fills) {
+          console.log(`[BasketQuorum][resting] FILLED ${order.tokenId} ${f.shares.toFixed(2)} @ ${f.price.toFixed(3)} (order ${order.id})`);
+          this.onRestingFill?.(order.id, f.price, f.shares);
+        }
+        try { this.onRestingSnapshot?.(this.restingBook.snapshot()); } catch { /* non-fatal */ }
+      } catch (err) {
+        console.warn(`[BasketQuorum][resting] book fetch failed for ${order.tokenId}:`, err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
   startExitLadder(): void {
     if (this.exitTimer) return;
+    if (!this.onRestingFill) {
+      this.onRestingFill = (orderId, fillPrice, fillShares) => {
+        this.recordRestingFill(orderId, fillPrice, fillShares);
+      };
+    }
     // Items 1–4: one unified pass handles both live and DRY-RUN exits.
     this.exitTimer = setInterval(() => {
       this.runExitPass().catch((err) => {
         console.warn('[BasketQuorum][exit] pass error:', err instanceof Error ? err.message : err);
+      });
+      // Fired=0 fix: fill resting limit orders when asks return to the band.
+      this.runRestingRefill().catch((err) => {
+        console.warn('[BasketQuorum][resting] refill error:', err instanceof Error ? err.message : err);
       });
     }, 15_000);
     console.log(`[BasketQuorum][exit] ladder started (15s interval${this.config.dryRun ? ', DRY-RUN simulation' : ''})`);
@@ -1754,11 +1872,22 @@ export class BasketQuorumService {
           return null;
         }
       },
+      // Resting orders (fired=0 fix): place at the consensus ceiling on no-depth.
+      restingPlace: (order: RestingOrder) => {
+        const placed = this.restingBook.place(order);
+        if (placed) {
+          try { this.onRestingSnapshot?.(this.restingBook.snapshot()); } catch { /* non-fatal */ }
+        }
+        return placed;
+      },
     }, {
       dryRun: this.config.dryRun, orderType: this.config.orderType, maxSlippage: this.config.maxSlippage,
       minTradeSize: this.config.minTradeSize, maxSizePerTrade: this.config.maxSizePerTrade, sizeScale: this.config.sizeScale,
       maxEntryPrice: this.config.maxEntryPrice,
       complementMirror: process.env.COMPLEMENT_MIRROR_ENABLED === 'true',
+      // Fired=0 fix: rest a limit order at the ceiling when the ask is walled.
+      restingOrders: process.env.RESTING_ORDERS_ENABLED !== 'false',
+      restingTtlMs: Number(process.env.RESTING_ORDER_TTL_MS ?? 15 * 60_000),
     });
     this.planDecision(this.ledgerDecision(trade, 'quorum_reached', true, undefined, signal.outcome));
         const decision = await engine.evaluate(signal, trade, basket);

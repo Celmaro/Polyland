@@ -170,6 +170,16 @@ export class PolylandRuntime {
     if (!reconciliation.ok) {
       console.warn(`[PolylandRuntime] RECONCILIATION BLOCKED: ${reconciliation.error} — no copy decisions until resolved`);
     }
+    // Resting orders (fired=0 fix): persist snapshots so a pod replacement
+    // resumes the resting book and can still fill when asks return.
+    this.quorum.onRestingSnapshot = (orders) => {
+      void this.stateStore?.save({ restingOrders: orders as never }).catch((err: unknown) => {
+        console.warn('[PolylandRuntime] resting snapshot persist failed:', err instanceof Error ? err.message : err);
+      });
+    };
+    if (Array.isArray(persistedState?.restingOrders)) {
+      this.quorum.restoreRestingOrders(persistedState.restingOrders as import('./resting-order.js').RestingOrder[]);
+    }
 
     if (process.env.TWAP_ENABLED === 'true') { const twap = new ChainlinkTwapOracle({ autoReconnect: true, reconnectDelayMs: 3000, pingIntervalMs: 5000, maxStalenessMs: 30000 }); this.quorum.setTwapOracle(twap); void twap.connect(); }
     const buffer: SmartMoneyTrade[] = []; this.tradeSub = this.sdk.smartMoney.subscribeSmartMoneyTrades(t => {

@@ -8,6 +8,7 @@ import { BankrollReservationLedger } from './bankroll-reservation.js';
 import { computeExactSharesAndCost, quantizeBuyPrice, tickSizeToEnum } from '../utils/price-utils.js';
 import { executeAgainstBook, type FillBook } from './fill-engine.js';
 import { planComplementMirror } from './complement-mirror.js';
+import type { RestingOrder } from './resting-order.js';
 import { computeEntryQualityScore, applyRiskAdjustedAmount, effectiveStopLoss } from './execution-quality.js';
 import { takerFeePerShare, feePerShare, DEFAULT_FEE_RATE_BPS } from '../utils/fee-math.js';
 import { classifySubmission } from './submission-pipeline.js';
@@ -29,6 +30,10 @@ export interface ExecutionEngineConfig {
   riskSizing?: { enabled: boolean; targetRiskUsdc: number; stopLossPct: number; absoluteFloor?: number };
   /** R2 complement-mirroring (opt-in): fill the complement side when the target ask is walled. */
   complementMirror?: boolean;
+  /** Resting: rest a limit order at the consensus ceiling on no-depth (the fired=0 fix). */
+  restingOrders?: boolean;
+  /** Resting order lifetime before expiry. */
+  restingTtlMs?: number;
 }
 export interface ExecutionEngineDeps {
   tickSizeFor: (conditionId: string) => number;
@@ -55,11 +60,13 @@ export interface ExecutionEngineDeps {
   complementBookLookup?: (complementTokenId: string) => Promise<FillBook | null>;
   /** R2: derive the complement token id for a binary market. */
   complementTokenFor?: (conditionId: string, side: 'BUY' | 'SELL') => Promise<string | null>;
+  /** Resting: place a limit order at the consensus ceiling when the fire cannot fill now. */
+  restingPlace?: (order: RestingOrder) => boolean;
 }
 
 export type ExecuteResult =
   | { ok: true; orderId?: string }
-  | { ok: false; reason: RejectReason | 'order' | 'depth_unknown' | 'no_depth' | 'quality' | 'entry_ceiling'; detail?: string };
+  | { ok: false; reason: RejectReason | 'order' | 'depth_unknown' | 'no_depth' | 'quality' | 'entry_ceiling' | 'resting_order'; detail?: string };
 
 /** Skip/failure taxonomy — the audit's failed=N conflation fix. */
 export interface ExecutionSkips {
@@ -69,6 +76,8 @@ export interface ExecutionSkips {
   noDepth: number;
   quality: number;
   entryCeiling: number;
+  /** R-fire: no-depth fires that became resting limit orders (not failures). */
+  resting: number;
 }
 
 export class ExecutionEngine {
@@ -78,7 +87,7 @@ export class ExecutionEngine {
   /** R2: true when the last fill was a complement-mirrored order. */
   public mirrored = false;
   /** Fail-closed skips by reason — visible in the funnel, not conflated with failed. */
-  public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0, entryCeiling: 0 };
+  public readonly skipped: ExecutionSkips = { staleQuote: 0, bankroll: 0, depthUnknown: 0, noDepth: 0, quality: 0, entryCeiling: 0, resting: 0 };
   /** Idempotency audit: signalIds already executed this process — a duplicate
    *  execute() for the same signal is rejected BEFORE any reservation/order,
    *  so a double-dispatch (retry, re-entrancy) can never double-fill. */
@@ -388,6 +397,11 @@ export class ExecutionEngine {
                 this.skipped.noDepth++;
                 release();
                 console.warn(`[ExecutionEngine] SKIP no-depth+mismatch: ${signal.marketSlug} complement ${compToken} also unfillable`);
+                if (this.restOrder(signal, price, sizeForBook)) {
+                  this.skipped.resting++;
+                  console.log(`[ExecutionEngine] RESTING order: ${signal.marketSlug} ceiling=${price.toFixed(3)} size=${sizeForBook.toFixed(2)} ttl=${(this.config.restingTtlMs ?? 15*60_000)/1000}s`);
+                  return { ok: false, reason: 'resting_order', detail: 'resting_at_ceiling' };
+                }
                 return { ok: false, reason: 'no_depth' };
               }
             } else {
@@ -396,6 +410,11 @@ export class ExecutionEngine {
               const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
               const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
               console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)} mirror=${!plan.ok ? plan.reason : 'plan_ok'}`);
+              if (this.restOrder(signal, price, sizeForBook)) {
+                this.skipped.resting++;
+                console.log(`[ExecutionEngine] RESTING order: ${signal.marketSlug} ceiling=${price.toFixed(3)} size=${sizeForBook.toFixed(2)} ttl=${(this.config.restingTtlMs ?? 15*60_000)/1000}s`);
+                return { ok: false, reason: 'resting_order', detail: 'resting_at_ceiling' };
+              }
               return { ok: false, reason: 'no_depth' };
             }
           } else {
@@ -404,6 +423,11 @@ export class ExecutionEngine {
             const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
             const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
             console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)}`);
+            if (this.restOrder(signal, price, sizeForBook)) {
+              this.skipped.resting++;
+              console.log(`[ExecutionEngine] RESTING order: ${signal.marketSlug} ceiling=${price.toFixed(3)} size=${sizeForBook.toFixed(2)} ttl=${(this.config.restingTtlMs ?? 15*60_000)/1000}s`);
+              return { ok: false, reason: 'resting_order', detail: 'resting_at_ceiling' };
+            }
             return { ok: false, reason: 'no_depth' };
           }
         }
@@ -428,6 +452,42 @@ export class ExecutionEngine {
       this.failed++;
       release();
       return { ok: false, reason: 'order' };
+    }
+  }
+
+  /**
+   * Resting-order fallback (the fired=0 fix): when a fire cannot fill now
+   * (ask walled), rest a limit order at the consensus ceiling so the quorum's
+   * refill pass can fill it when asks return into the band. Returns true when
+   * placed. Does NOT spend bankroll — the refill pass does that at fill time.
+   */
+  private restOrder(signal: ConsensusSignal, price: number, sizeForBook: number): boolean {
+    if (!this.config.restingOrders || !this.deps.restingPlace || !signal.signalId) return false;
+    if (!(sizeForBook > 0) || !signal.conditionId) return false;
+    const order: RestingOrder = {
+      id: `ro-${signal.signalId}`,
+      conditionId: signal.conditionId,
+      tokenId: signal.tokenId ?? signal.conditionId,
+      outcome: signal.outcome,
+      side: 'BUY',
+      ceiling: price,
+      size: sizeForBook,
+      placedAt: Date.now(),
+      ttlMs: this.config.restingTtlMs ?? 15 * 60_000,
+      signalId: signal.signalId,
+      metadata: {
+        marketSlug: signal.marketSlug,
+        basketName: signal.basketName,
+        category: signal.category,
+        wallets: signal.wallets ?? [],
+        winRate: signal.winRate ?? 0.5,
+        signalId: signal.signalId,
+      },
+    };
+    try {
+      return this.deps.restingPlace(order);
+    } catch {
+      return false;
     }
   }
 }
