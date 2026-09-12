@@ -14,6 +14,7 @@ import { ClobMarketWsService } from './clob-market-ws.js';
 import { reconcileDryRunOrders } from './reconciliation.js';
 import { BasketWalletManager, evaluateRebalance, computeBasketOverlapHealth, type BasketMembership, type BasketLifecycleConfig } from './basket-lifecycle.js';
 import { WalletIngestor, type WalletRecord } from './wallet-ingestion.js';
+import { buildHeartbeatPayload, evaluateStartupStall } from './platform-heartbeat.js';
 import type { OrderLifecycleRecord } from './state-store.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
@@ -54,6 +55,8 @@ export class PolylandRuntime {
   private marketSnapshots: MarketSnapshotStore | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private funnelTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private stallAlarmFiredAt: number | null = null;
   private refreshing = false;
   private readonly startedAt = Date.now();
   private readonly snapshot: RuntimeStateSnapshot;
@@ -203,6 +206,12 @@ export class PolylandRuntime {
     }
     this.funnelTimer = setInterval(() => {
           this.quorum?.logFunnel();
+          // R8: external heartbeat — ping HEARTBEAT_URL so an uptime monitor
+          // alerts when the POD stops responding (NodeNotReady class).
+          this.pingHeartbeat();
+          // R8: startup-stall alarm — alive-but-deaf pod fires the audit
+          // webhook once if no feed events within the boot window.
+          this.checkStartupStallAlarm();
           const metrics = this.config.botMetrics;
           if (metrics) {
             if (this.clob) metrics.mirrorClobIntegrity(this.clob.getIntegrityState());
@@ -359,6 +368,42 @@ export class PolylandRuntime {
        * this, the bot looks alive (status=DRY RUN ACTIVE) but stops receiving
        * trades. Won't help with infra-level node death — that's Zeabur/k8s.
        */
+      /** R8: ping the external heartbeat URL (uptime monitor liveness). */
+      private pingHeartbeat(): void {
+        const url = process.env.HEARTBEAT_URL;
+        if (!url) return;
+        const payload = buildHeartbeatPayload({
+          uptimeSec: (Date.now() - this.startedAt) / 1000,
+          feedAgeSec: this.quorum ? (Date.now() - this.quorum.getLastFeedEventAt()) / 1000 : -1,
+          mode: this.config.dryRun ? 'DRY RUN' : 'LIVE',
+        });
+        // Fire-and-forget; never block the funnel tick on a slow endpoint.
+        fetch(url, { method: 'POST', body: JSON.stringify(payload), headers: { 'content-type': 'application/json' } })
+          .catch(() => undefined);
+      }
+
+      /** R8: alive-but-deaf startup alarm — fires the audit webhook once. */
+      private checkStartupStallAlarm(): void {
+        const startStallMs = Number(process.env.STARTUP_STALL_ALARM_MS ?? 180_000);
+        if (!(startStallMs > 0)) return;
+        const result = evaluateStartupStall({
+          startedAt: this.startedAt,
+          now: Date.now(),
+          lastFeedEventAt: this.quorum?.getLastFeedEventAt() ?? 0,
+          startStallMs,
+          alarmFiredAt: this.stallAlarmFiredAt,
+        });
+        if (!result.alarm) return;
+        this.stallAlarmFiredAt = result.at ?? Date.now();
+        // Persist + webhook via the existing audit store path.
+        signalAuditStore.appendJsonl('platform.stall', {
+          reason: result.reason,
+          startedAt: this.startedAt,
+          uptimeMs: Date.now() - this.startedAt,
+        });
+        console.warn(`[PolylandRuntime] STARTUP STALL ALARM: ${result.reason}`);
+      }
+
       private checkFeedStallWatchdog(): void {
         const lastEventAt = this.quorum?.getLastFeedEventAt() ?? 0;
             const stallMs = Date.now() - lastEventAt;
@@ -385,7 +430,7 @@ export class PolylandRuntime {
               console.warn('[PolylandRuntime] FEED STALL WATCHDOG: restart failed:', e instanceof Error ? e.message : e);
             }
           }
-      async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder();
+      async stop(): Promise<void> { if (this.refreshTimer) clearTimeout(this.refreshTimer); if (this.funnelTimer) clearInterval(this.funnelTimer); if (this.heartbeatTimer) clearInterval(this.heartbeatTimer); this.tradeSub?.unsubscribe(); this.gamma?.stop(); this.clob?.stop(); this.quorum?.stopExitLadder();
           // Idempotency & cleanup audit: on shutdown in LIVE mode, cancel all open
           // CLOB orders so no resting/dangling orders are left exposed (mirrors
           // the systemd drain-then-exit pattern). DRY_RUN skips (no real orders).
