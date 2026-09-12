@@ -63,6 +63,7 @@ import { ExecutionEngine } from './execution-engine.js';
 import { CopyPlanner, type CopyBook, type MarketMeta } from './copy-planner.js';
 import { PositionStateMachine, evaluateExit } from './position-state-machine.js';
 import { RestingOrderBook, type RestingOrder } from './resting-order.js';
+import { emptyPriceHistogram, addPrice, formatPriceHistogram, type PriceHistogram } from './price-observability.js';
 import { clusterOf, effectiveContributors, isDiverse, type WalletActionCategory } from './independence-metrics.js';
 import { evaluateConsensusGate, computeWeightedConsensus, computeDominantWalletShare, bayesianConfidence, computeConflictPenalty, classifyMarketRegime } from './quorum-quality.js';
 import { computeEntryQualityScore, resolveEdgeSizeMultiplier, applyRiskAdjustedAmount, shouldPostEntryInvalidate } from './execution-quality.js';
@@ -178,6 +179,12 @@ export interface QuorumStats {
   ignoredDisabledDomain?: number;
   /** Votes that survived pre-vote filters and were recorded. */
   votesRecorded: number;
+  /** Price distribution of raw feed events (before any filter). */
+  priceFeed: PriceHistogram;
+  /** Price distribution of recorded votes. */
+  priceRecorded: PriceHistogram;
+  /** Price distribution of quorum-fired signals. */
+  priceFired: PriceHistogram;
   voters: number;
   quorumFired: number;
   quorumSkippedDrift: number;
@@ -269,6 +276,9 @@ export class BasketQuorumService {
     ignoredInvalidMarket: 0,
     votesRecorded: 0,
     voters: 0,
+    priceFeed: emptyPriceHistogram(),
+    priceRecorded: emptyPriceHistogram(),
+    priceFired: emptyPriceHistogram(),
     quorumFired: 0,
     quorumSkippedDrift: 0,
     quorumSkippedCooldown: 0,
@@ -791,6 +801,7 @@ export class BasketQuorumService {
   onTrade(trade: SmartMoneyTrade): void {
     // Count every raw incoming trade exactly once.
     this.stats.feedReceived++
+    addPrice(this.stats.priceFeed, trade.price ?? 0);
     if (trade.timestamp) this._lastFeedEventAt = Math.max(this._lastFeedEventAt, trade.timestamp);
     // Feed-burst window counter (resets each minute; consumed by the L10
     // staleness pressure valve below).
@@ -969,6 +980,7 @@ export class BasketQuorumService {
     });
     this.stats.voters = this.votes.size;
     this.stats.votesRecorded++
+    addPrice(this.stats.priceRecorded, votePrice);
     this.planDecision(this.ledgerDecision({ ...trade, outcome: voteOutcome, price: votePrice, side: voteSide }, 'vote_recorded', true, undefined, voteOutcome));
     this._schedulePersist();
     // 7. Evaluate quorum.
@@ -2073,6 +2085,7 @@ export class BasketQuorumService {
       this.planDecision(this.ledgerDecision(trade, 'executed', true, undefined, signal.outcome));
       this.stats.quorumFired++;
       this.stats.executed++;
+      addPrice(this.stats.priceFired, signal.consensusPrice);
       this._schedulePersist();
       // Feed the Prometheus histogram with the entry price. `decision.value.price`
       // is the audited price (the consensus/limit price before slippage) — that's
@@ -2240,7 +2253,9 @@ export class BasketQuorumService {
                 `nearMiss=${funnel.near_miss_ind}/${funnel.near_miss_cons}/${funnel.near_miss_exec} ` +
         `executed=${funnel.executed} failed=${funnel.failed} ` +
         `feedAge=${(funnel.feed_age_ms / 1000).toFixed(0)}s ` +
-        `conversion=${funnel.conversion_pct}% accounted=${funnel.accounted_pct}%` +
+        `conversion=${funnel.conversion_pct}% accounted=${funnel.accounted_pct}% ` +
+        `priceFeed=[${formatPriceHistogram(s.priceFeed)}] priceVotes=[${formatPriceHistogram(s.priceRecorded)}] priceFired=[${formatPriceHistogram(s.priceFired)}] ` +
+        `unaccounted=${Math.max(0, s.feedReceived - (funnel.ignored_no_basket + funnel.ignored_not_member + funnel.ignored_unsupported_side + funnel.ignored_invalid_market + (s.ignoredDisabledDomain ?? 0) + s.votesRecorded + s.quorumSkippedThinEdge + s.quorumSkippedStaleMarket))}` +
         (edgeStats.signalsSettled > 0
           ? ` | edge: exp=${edgeStats.meanExpectedEdge.toFixed(4)} ` +
             `real=${edgeStats.meanRealizedEdge.toFixed(4)} ` +
@@ -2293,6 +2308,9 @@ export class BasketQuorumService {
       ignoredInvalidMarket: 0,
       votesRecorded: 0,
       voters: 0,
+      priceFeed: emptyPriceHistogram(),
+      priceRecorded: emptyPriceHistogram(),
+      priceFired: emptyPriceHistogram(),
       quorumFired: 0,
       quorumSkippedDrift: 0,
       quorumSkippedCooldown: 0,
