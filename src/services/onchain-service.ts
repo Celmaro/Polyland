@@ -85,6 +85,21 @@ export interface OnchainServiceConfig {
   txTimeout?: number;
 }
 
+
+/** R6: resolve the ordered RPC endpoint list for failover (primary first). */
+export function resolveRpcEndpoints(config: { rpcUrl?: string; rpcUrls?: string[] }): string[] {
+  const list = config.rpcUrls?.length
+    ? config.rpcUrls
+    : (config.rpcUrl
+        ? [config.rpcUrl]
+        : [
+            'https://polygon-bor-rpc.publicnode.com',
+            'https://polygon.drpc.org',
+            'https://polygon-rpc.com',
+          ]);
+  return Array.from(new Set(list.filter(Boolean)));
+}
+
 export interface ReadyStatus {
   ready: boolean;
   usdcEBalance: string;
@@ -146,15 +161,7 @@ export class OnchainService {
   private swapService: SwapService;
 
   constructor(config: OnchainServiceConfig) {
-    const rpcUrls = config.rpcUrls?.length
-      ? config.rpcUrls
-      : (config.rpcUrl
-          ? [config.rpcUrl]
-          : [
-              'https://polygon-bor-rpc.publicnode.com',
-              'https://polygon.drpc.org',
-              'https://polygon-rpc.com',
-            ]);
+    const rpcUrls = resolveRpcEndpoints(config);
     const rpcUrl = rpcUrls[0];
 
     // Create shared provider and wallet — multi-endpoint FallbackProvider so
