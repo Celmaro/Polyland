@@ -397,7 +397,7 @@ export class ExecutionEngine {
                 this.skipped.noDepth++;
                 release();
                 console.warn(`[ExecutionEngine] SKIP no-depth+mismatch: ${signal.marketSlug} complement ${compToken} also unfillable`);
-                if (this.restOrder(signal, price, sizeForBook)) {
+                if (this.restOrder(signal, price, sizeForBook, trade?.tokenId)) {
                   this.skipped.resting++;
                   console.log(`[ExecutionEngine] RESTING order: ${signal.marketSlug} ceiling=${price.toFixed(3)} size=${sizeForBook.toFixed(2)} ttl=${(this.config.restingTtlMs ?? 15*60_000)/1000}s`);
                   return { ok: false, reason: 'resting_order', detail: 'resting_at_ceiling' };
@@ -410,7 +410,7 @@ export class ExecutionEngine {
               const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
               const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
               console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)} mirror=${!plan.ok ? plan.reason : 'plan_ok'}`);
-              if (this.restOrder(signal, price, sizeForBook)) {
+              if (this.restOrder(signal, price, sizeForBook, trade?.tokenId)) {
                 this.skipped.resting++;
                 console.log(`[ExecutionEngine] RESTING order: ${signal.marketSlug} ceiling=${price.toFixed(3)} size=${sizeForBook.toFixed(2)} ttl=${(this.config.restingTtlMs ?? 15*60_000)/1000}s`);
                 return { ok: false, reason: 'resting_order', detail: 'resting_at_ceiling' };
@@ -423,7 +423,7 @@ export class ExecutionEngine {
             const bestAsk = book.asks[0] ? book.asks[0].price : NaN;
             const bestAskSize = book.asks[0] ? book.asks[0].size : NaN;
             console.warn(`[ExecutionEngine] SKIP no-depth: ${signal.marketSlug} ceiling ${price.toFixed(3)} bestAsk=${Number.isFinite(bestAsk) ? bestAsk.toFixed(3) : 'none'} askSize=${Number.isFinite(bestAskSize) ? bestAskSize.toFixed(1) : 'none'} asks=${book.asks.length} want=${sizeForBook} verdict=${fill.verdict} fillable=${fill.executableSize.toFixed(2)}`);
-            if (this.restOrder(signal, price, sizeForBook)) {
+            if (this.restOrder(signal, price, sizeForBook, trade?.tokenId)) {
               this.skipped.resting++;
               console.log(`[ExecutionEngine] RESTING order: ${signal.marketSlug} ceiling=${price.toFixed(3)} size=${sizeForBook.toFixed(2)} ttl=${(this.config.restingTtlMs ?? 15*60_000)/1000}s`);
               return { ok: false, reason: 'resting_order', detail: 'resting_at_ceiling' };
@@ -461,13 +461,13 @@ export class ExecutionEngine {
    * refill pass can fill it when asks return into the band. Returns true when
    * placed. Does NOT spend bankroll — the refill pass does that at fill time.
    */
-  private restOrder(signal: ConsensusSignal, price: number, sizeForBook: number): boolean {
+  private restOrder(signal: ConsensusSignal, price: number, sizeForBook: number, tokenId?: string): boolean {
     if (!this.config.restingOrders || !this.deps.restingPlace || !signal.signalId) return false;
     if (!(sizeForBook > 0) || !signal.conditionId) return false;
     const order: RestingOrder = {
       id: `ro-${signal.signalId}`,
       conditionId: signal.conditionId,
-      tokenId: signal.tokenId ?? signal.conditionId,
+      tokenId: tokenId ?? signal.tokenId ?? signal.conditionId,
       outcome: signal.outcome,
       side: 'BUY',
       ceiling: price,

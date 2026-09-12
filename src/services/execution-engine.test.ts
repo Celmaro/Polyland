@@ -6,6 +6,7 @@ import { ExecutionEngine, type ExecutionEngineConfig, type ExecutionEngineDeps }
 import type { ConsensusSignal, ExecutionDecision, PipelineDecision } from './pipeline-types.js';
 import type { TradingService } from './trading-service.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
+import type { RestingOrder } from './resting-order.js';
 
 const CONFIG: ExecutionEngineConfig = {
   dryRun: true, orderType: 'FAK', maxSlippage: 0.03,
@@ -353,6 +354,57 @@ describe('ExecutionEngine complement mirroring (R2)', () => {
     const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
     expect(result.ok).toBe(false); // no-depth, not mirrored
     expect(engine.mirrored).toBe(false);
+  });
+});
+
+describe('ExecutionEngine resting orders (LOOP-1 fired=0 fix)', () => {
+  it('places a resting order at the clamped ceiling when the ask is walled and resting is enabled', async () => {
+    let placed: RestingOrder | null = null;
+    const deps = makeDeps({
+      bookLookup: async () => ({ asks: [{ price: 0.99, size: 100 }], bids: [], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      restingPlace: (order: RestingOrder) => { placed = order; return true; },
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true, restingOrders: true, maxSlippage: 0.03 });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('resting_order');
+    expect(placed).not.toBeNull();
+    // ceiling = min(consensus * 1.03, 0.99) = 0.618, floored to tick 0.01
+    expect(placed!.ceiling).toBeCloseTo(0.61, 2);
+    expect(placed!.tokenId).toBe('tok-1');
+    expect(placed!.side).toBe('BUY');
+    expect(engine.skipped.resting).toBe(1);
+  });
+
+  it('does NOT place a resting order when resting is disabled (legacy no-depth)', async () => {
+    let placed = false;
+    const deps = makeDeps({
+      bookLookup: async () => ({ asks: [{ price: 0.99, size: 100 }], bids: [], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      restingPlace: () => { placed = true; return true; },
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true, restingOrders: false });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    expect(evaluated.accepted).toBe(true);
+    const result = await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('no_depth');
+    expect(placed).toBe(false);
+  });
+
+  it('captures audit metadata on the resting order for the fill record', async () => {
+    let placed: RestingOrder | null = null;
+    const deps = makeDeps({
+      bookLookup: async () => ({ asks: [{ price: 0.99, size: 100 }], bids: [], minOrderSize: 0, tickSize: 0.01, timestamp: Date.now() }),
+      restingPlace: (order: RestingOrder) => { placed = order; return true; },
+    });
+    const engine = new ExecutionEngine(makeTrading(), null, deps, { ...CONFIG, depthAwareFills: true, restingOrders: true });
+    const evaluated = await engine.evaluate(SIGNAL, TRADE, BASKET);
+    await engine.execute(evaluated as Extract<PipelineDecision<ExecutionDecision>, { accepted: true }>, TRADE, BASKET);
+    expect(placed!.metadata?.marketSlug).toBe('will-x');
+    expect(placed!.metadata?.winRate).toBe(SIGNAL.winRate);
+    expect(placed!.signalId).toBe('sig-1');
   });
 });
 
