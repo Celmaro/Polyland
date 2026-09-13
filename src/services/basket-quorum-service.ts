@@ -1169,7 +1169,17 @@ export class BasketQuorumService {
     );
     this._lastProcessedFire.set(`${this.config.dryRun ? 'paper' : 'live'}:${order.conditionId}:${order.outcome}`, Date.now());
     this.planDecision(this.ledgerDecision(
-      { ...({} as SmartMoneyTrade), conditionId: order.conditionId, marketSlug: meta.marketSlug, outcome: order.outcome, side: order.side as 'BUY' | 'SELL', price: fillPrice, size: fillShares } as SmartMoneyTrade,
+      {
+        traderAddress: meta.wallets[0] ?? 'resting-order',
+        conditionId: order.conditionId,
+        marketSlug: meta.marketSlug,
+        tokenId: order.tokenId,
+        outcome: order.outcome,
+        side: order.side as 'BUY' | 'SELL',
+        price: fillPrice,
+        size: fillShares,
+        timestamp: Date.now(),
+      } as SmartMoneyTrade,
       'resting_fill', true, undefined, order.outcome,
     ));
     this.stats.quorumFired++;
