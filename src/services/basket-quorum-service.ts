@@ -1184,6 +1184,7 @@ export class BasketQuorumService {
     ));
     this.stats.quorumFired++;
     this.stats.executed++;
+    addPrice(this.stats.priceFired, fillPrice);
     if (this.botMetrics) {
       this.botMetrics.observeEntryPrice(String(meta.category ?? 'unknown'), String(meta.basketName ?? 'all'), fillPrice);
     }
