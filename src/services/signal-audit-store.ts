@@ -63,10 +63,12 @@ export interface FiredSignal {
   cluster: string;       // = conditionId for clustering
   category?: string;
   tier?: string;
-  entrySignal?: string;
-  signalAttribution?: string;
-  ageBucket?: string;
-}
+    entrySignal?: string;
+    signalAttribution?: string;
+    ageBucket?: string;
+    /** true = simulated/paper fill (DRY_RUN); false/undefined = real venue fill. */
+    simulated?: boolean;
+  }
 
 /** Summary stats exposed to logFunnel() */
 export interface EdgeStats {
@@ -81,6 +83,8 @@ export interface EdgeStats {
   tStat: number;
   clusterCount: number;       // number of distinct markets (for Bonferroni denom)
   brierScore: number;         // PT2: mean (p̂ − outcome)² — lower = better calibrated (0 = perfect, 0.25 = coin flip)
+  paperSettledPnL?: number;   // summed realized P&L from SIMULATED (paper) fills — DRY_RUN
+  liveSettledPnL?: number;    // summed realized P&L from REAL venue fills — LIVE mode
 }
 
 interface SignalMap {
@@ -178,60 +182,64 @@ export class SignalAuditStore {
     basket: string;
     wallets: string[];
     feePerShare?: number;   // optional: the taker fee the execution gate used
-    category?: string;
-    tier?: string;
-    entrySignal?: string;
-    signalAttribution?: string;
-  }): string {
-    const id = `${params.conditionId}-${params.outcome}-${Date.now()}-${nextFireSeq()}`;
-    const impliedProb = params.side === 'BUY' ? params.pricePaid : (1 - params.pricePaid);
-    // Dynamic Polymarket fee (feeRateBps × p × (1-p)) so audited edge matches
-    // the execution gate — unless the caller passes the fee it actually used.
-    const fee = params.feePerShare ?? takerFeePerShare(params.pricePaid, DEFAULT_FEE_RATE_BPS);
-    const expectedEdge = params.winRate - impliedProb - fee;
+        category?: string;
+        tier?: string;
+        entrySignal?: string;
+        signalAttribution?: string;
+        /** true = simulated/paper fill (DRY_RUN). Defaults to false (real). */
+        simulated?: boolean;
+      }): string {
+        const id = `${params.conditionId}-${params.outcome}-${Date.now()}-${nextFireSeq()}`;
+        const impliedProb = params.side === 'BUY' ? params.pricePaid : (1 - params.pricePaid);
+        // Dynamic Polymarket fee (feeRateBps × p × (1-p)) so audited edge matches
+        // the execution gate — unless the caller passes the fee it actually used.
+        const fee = params.feePerShare ?? takerFeePerShare(params.pricePaid, DEFAULT_FEE_RATE_BPS);
+        const expectedEdge = params.winRate - impliedProb - fee;
 
-    const signal: FiredSignal = {
-      id,
-      conditionId: params.conditionId,
-      marketSlug: params.marketSlug,
-      outcome: params.outcome,
-      side: params.side,
-      pricePaid: params.pricePaid,
-      size: params.size,
-      feePerShare: fee,
-      expectedEdge,
-      winRate: params.winRate,
-      basket: params.basket,
-      wallets: params.wallets,
-      firedAt: Date.now(),
-      cluster: params.conditionId,
-      category: params.category,
-      tier: params.tier,
-      entrySignal: params.entrySignal,
-      signalAttribution: params.signalAttribution,
-    };
+        const signal: FiredSignal = {
+          id,
+          conditionId: params.conditionId,
+          marketSlug: params.marketSlug,
+          outcome: params.outcome,
+          side: params.side,
+          pricePaid: params.pricePaid,
+          size: params.size,
+          feePerShare: fee,
+          expectedEdge,
+          winRate: params.winRate,
+          basket: params.basket,
+          wallets: params.wallets,
+          firedAt: Date.now(),
+          cluster: params.conditionId,
+          category: params.category,
+          tier: params.tier,
+          entrySignal: params.entrySignal,
+          signalAttribution: params.signalAttribution,
+          simulated: params.simulated ?? false,
+        };
 
-    this.pruneOldSignals();
-    this.signals[id] = signal;
-    const list = this.byConditionId.get(params.conditionId) ?? [];
-    list.push(id);
-    this.byConditionId.set(params.conditionId, list);
-    this.appendJsonl('fire', {
-      id,
-      conditionId: params.conditionId,
-      marketSlug: params.marketSlug,
-      outcome: params.outcome,
-      side: params.side,
-      pricePaid: params.pricePaid,
-      size: params.size,
-      feePerShare: fee,
-      winRate: params.winRate,
-      expectedEdge,
-      basket: params.basket,
-      wallets: params.wallets,
-    });
-    return id;
-  }
+        this.pruneOldSignals();
+        this.signals[id] = signal;
+        const list = this.byConditionId.get(params.conditionId) ?? [];
+        list.push(id);
+        this.byConditionId.set(params.conditionId, list);
+        this.appendJsonl('fire', {
+          id,
+          conditionId: params.conditionId,
+          marketSlug: params.marketSlug,
+          outcome: params.outcome,
+          side: params.side,
+          pricePaid: params.pricePaid,
+          size: params.size,
+          feePerShare: fee,
+          winRate: params.winRate,
+          expectedEdge,
+          basket: params.basket,
+          wallets: params.wallets,
+          simulated: params.simulated ?? false,
+        });
+        return id;
+      }
 
   /**
    * Record settlement for a condition.  All signals on this conditionId share
@@ -360,6 +368,8 @@ export class SignalAuditStore {
         tStat: 0,
         clusterCount: 0,
         brierScore: 0,
+        paperSettledPnL: 0,
+        liveSettledPnL: 0,
       };
     }
 
@@ -417,6 +427,11 @@ export class SignalAuditStore {
       tStat: Math.round(tStat * 100) / 100,
       clusterCount: clusters.size,
       brierScore: Math.round(brierScore * 10000) / 10000,
+      // #8: separate simulated (paper) from real (live) realized P&L so an
+      // operator can see exactly what DRY_RUN earned vs what a live venue
+      // fill earned — never conflated. realizedEdge is dollar P&L × size.
+      paperSettledPnL: Math.round(settled.filter(s => s.simulated !== false).reduce((a, s) => a + (s.realizedEdge ?? 0), 0) * 100) / 100,
+      liveSettledPnL: Math.round(settled.filter(s => s.simulated === false).reduce((a, s) => a + (s.realizedEdge ?? 0), 0) * 100) / 100,
     };
   }
 
@@ -580,6 +595,7 @@ export class SignalAuditStore {
     id: string; conditionId: string; marketSlug: string; outcome: string;
     side: SignalSide; pricePaid: number; size: number; feePerShare?: number;
     winRate: number; expectedEdge: number; basket: string; wallets: string[]; ts?: number;
+    simulated?: boolean;
   }): void {
     if (this.signals[evt.id]) return; // already present
     const fee = evt.feePerShare ?? takerFeePerShare(evt.pricePaid, DEFAULT_FEE_RATE_BPS);
@@ -598,6 +614,7 @@ export class SignalAuditStore {
       wallets: evt.wallets ?? [],
       firedAt: evt.ts ?? Date.now(),
       cluster: evt.conditionId,
+      simulated: evt.simulated ?? false,
     };
     this.signals[evt.id] = signal;
     const list = this.byConditionId.get(evt.conditionId) ?? [];
@@ -623,7 +640,7 @@ export class SignalAuditStore {
     s.exitPrice = evt.exitPrice;
     s.exitReason = evt.reason;
   }
-  }
+}
 
   // ============================================================================
   // Math helpers

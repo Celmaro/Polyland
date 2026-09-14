@@ -442,7 +442,7 @@ export class ExecutionEngine {
       if (signal.signalId) this.executedSignalIds.add(signal.signalId);
       // Audit pricePaid = the honest executable estimate: consensus when the
       // book is not used, otherwise the true depth-aware fill VWAP.
-      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category, signalId: signal.signalId, mirrored: mirroredPath || undefined });
+      this.deps.auditStore.recordFire({ conditionId: signal.conditionId, marketSlug: signal.marketSlug, outcome: signal.outcome, side: signal.side, pricePaid: auditPrice, size: auditShares, winRate: signal.winRate, basket: signal.basketName, wallets: signal.wallets, category: signal.category, signalId: signal.signalId, mirrored: mirroredPath || undefined, simulated: decision.value.dryRun });
       this.deps.onPositionOpened(trade?.tokenId, placedUsd, auditShares, auditPrice, signal);
       this.deps.onDedupFire(`${signal.conditionId}:${signal.outcome}`, Date.now());
       console.log(`[ExecutionEngine] PAPER FILL: ${signal.marketSlug} order=${result.orderId} shares=${auditShares.toFixed(2)} price=${auditPrice.toFixed(3)} usd=${placedUsd.toFixed(2)} dryRun=${decision.value.dryRun}${mirroredPath ? ' side=mirrored' : ''}`);

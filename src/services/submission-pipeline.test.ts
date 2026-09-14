@@ -13,6 +13,15 @@ describe('classifySubmission', () => {
     expect(classifySubmission(rejected('fetch failed'))).toBe('unknown');
     expect(classifySubmission(rejected('connect timeout'))).toBe('unknown');
   });
+  it('maps HTTP 429 / rate-limit to unknown (mutation may have landed)', () => {
+    expect(classifySubmission(rejected('429 Too Many Requests'))).toBe('unknown');
+    expect(classifySubmission(rejected('rate limited'))).toBe('unknown');
+  });
+  it('maps WS-drop / RPC-disconnect to unknown (never assume rejected)', () => {
+    expect(classifySubmission(rejected('socket hang up'))).toBe('unknown');
+    expect(classifySubmission(rejected('ECONNRESET'))).toBe('unknown');
+    expect(classifySubmission(rejected('connection reset'))).toBe('unknown');
+  });
   it('maps deterministic client errors to rejected', () => {
     expect(classifySubmission(rejected('invalid price'))).toBe('rejected');
     expect(classifySubmission(rejected('missing tokenId'))).toBe('rejected');

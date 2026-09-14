@@ -36,7 +36,11 @@ export interface SubmissionOutcome {
   submittedOnce: true;
 }
 
-const AMBIGUOUS_MARKERS = ['timeout', 'timed out', 'fetch failed', 'connect timeout', 'econnrefused', 'econnreset', 'socket'];
+const AMBIGUOUS_MARKERS = [
+  'timeout', 'timed out', 'fetch failed', 'connect timeout',
+  'econnrefused', 'econnreset', 'socket', '429', 'rate limit', 'rate limited',
+  'connection reset', 'connection refused', 'reset by peer',
+];
 
 /** Deterministic client error → rejected; timeout/network → unknown. */
 export function classifySubmission(result: OrderResult): SubmissionClassification {

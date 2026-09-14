@@ -106,3 +106,37 @@ describe('RestingOrderBook — refill pass (the fired=0 fix)', () => {
     expect(book2.openOrders()).toHaveLength(1);
   });
 });
+
+describe('RestingOrderBook — LIVE reconcile close/cancel (item #2)', () => {
+  it('close() marks a fully-matched order filled', () => {
+    const book = new RestingOrderBook();
+    book.place(restingOrder({ size: 10 }));
+    expect(book.close('ro-1', 10)).toBe(true);
+    expect(book.openOrders()).toHaveLength(0);
+    expect(book.closedOrders()).toHaveLength(1);
+  });
+
+  it('close() with partial shares keeps the order open (partial fill)', () => {
+    const book = new RestingOrderBook();
+    book.place(restingOrder({ size: 10 }));
+    expect(book.close('ro-1', 4)).toBe(true);
+    const rem = book.openOrders()[0];
+    expect(rem).toBeDefined();
+    expect(rem.filledShares).toBe(4);
+  });
+
+  it('close() is a no-op on an already-terminal order', () => {
+    const book = new RestingOrderBook();
+    book.place(restingOrder({ size: 10 }));
+    book.close('ro-1', 10);
+    expect(book.close('ro-1', 5)).toBe(false);
+  });
+
+  it('cancel() expires an open order so it no longer rests', () => {
+    const book = new RestingOrderBook();
+    book.place(restingOrder());
+    expect(book.cancel('ro-1')).toBe(true);
+    expect(book.openOrders()).toHaveLength(0);
+    expect(book.expiredCount()).toBe(1);
+  });
+});

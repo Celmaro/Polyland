@@ -83,6 +83,29 @@ export class RestingOrderBook {
     return [...this.orders.values()].filter((o) => o.status === 'expired').length;
   }
 
+  /**
+   * Close an order as FILLED at a given matched share count (or the full size
+   * when unspecified). Used by LIVE reconciliation to absorb a venue-confirmed
+   * fill/partial fill that the simulated refill pass may not have observed.
+   * No-op if the order is already terminal or unknown.
+   */
+  close(id: string, matchedShares?: number): boolean {
+    const entry = this.orders.get(id);
+    if (!entry || entry.status !== 'open') return false;
+    const matched = matchedShares ?? entry.size;
+    entry.filledShares = Math.max(entry.filledShares, Math.min(matched, entry.size));
+    entry.status = entry.filledShares >= entry.size ? 'filled' : 'open';
+    return true;
+  }
+
+  /** Cancel/expire an order so it is no longer open (LIVE reconcile cleanup). */
+  cancel(id: string): boolean {
+    const entry = this.orders.get(id);
+    if (!entry || entry.status !== 'open') return false;
+    entry.status = 'expired';
+    return true;
+  }
+
   /** Durable restore across restarts. */
   restore(snapshot: RestingOrder[]): void {
     this.orders.clear();

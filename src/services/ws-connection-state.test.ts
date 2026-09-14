@@ -15,7 +15,11 @@ describe('WsConnectionStateMachine', () => {
   });
 
   it('disconnect schedules backoff with capped, jittered delay', () => {
-    const m = new WsConnectionStateMachine({ baseBackoffMs: 500, maxBackoffMs: 30_000 });
+    // Deterministic jitter (0.9 ± none) so a later draw is never smaller than an
+    // earlier one — the bare `random()*max` form makes this test flaky: d1 can hit
+    // near-max (500) while d2 lands near 0, violating d2 ≥ d1*0.8. Pinning random
+    // keeps the "grows with retry" intent without the probabilistic failure.
+    const m = new WsConnectionStateMachine({ baseBackoffMs: 500, maxBackoffMs: 30_000, random: () => 0.9 });
     m.onConnecting(); m.onConnected(); m.onSubscribed(); m.onSnapshotReceived();
     m.onDisconnect();
     expect(m.state).toBe('backoff');

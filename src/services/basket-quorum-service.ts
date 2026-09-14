@@ -63,6 +63,8 @@ import { ExecutionEngine } from './execution-engine.js';
 import { CopyPlanner, type CopyBook, type MarketMeta } from './copy-planner.js';
 import { PositionStateMachine, evaluateExit } from './position-state-machine.js';
 import { RestingOrderBook, type RestingOrder } from './resting-order.js';
+import { complementExitPrice } from './exit-fallback.js';
+import { reconcileLiveResting, type LiveVenueOrder } from './live-reconcile.js';
 import { emptyPriceHistogram, addPrice, formatPriceHistogram, type PriceHistogram } from './price-observability.js';
 import { clusterOf, effectiveContributors, isDiverse, type WalletActionCategory } from './independence-metrics.js';
 import { evaluateConsensusGate, computeWeightedConsensus, computeDominantWalletShare, bayesianConfidence, computeConflictPenalty, classifyMarketRegime } from './quorum-quality.js';
@@ -1056,6 +1058,35 @@ export class BasketQuorumService {
     if (!Number.isFinite(unix) || unix < 1_600_000_000) return null;
     return unix * 1000;
   }
+  /**
+   * Paper-only exit-liquidity fallback: derive a synthetic sell price for a
+   * long position whose own token book has no bid, by pricing the complement
+   * (NO) side. Selling YES ≡ buying NO at (1 − P), so `1 − NO.bestAsk` is a
+   * real, executable exit price. Returns null when unavailable. LIVE callers
+   * must never use this synthetic price for a real order.
+   */
+  private async tryComplementExit(
+    pos: { conditionId: string; outcome: string },
+    ownTokenId: string,
+  ): Promise<number | null> {
+    try {
+      // If we're long YES, the complement is NO. Use the market's token map.
+      const tokens = await this.tradingService.getMarketTokens(pos.conditionId);
+      if (!tokens) return null;
+      const compTokenId = tokens.noTokenId ?? tokens.yesTokenId;
+      if (!compTokenId || compTokenId === ownTokenId) return null;
+      const compBook = await this.tradingService.getPublicOrderBook(compTokenId);
+      if (!compBook || compBook.asks.length === 0) return null;
+      const feeRateBps = this.feeRateCache.get(pos.conditionId) ?? 0;
+      return complementExitPrice(
+        compBook.asks.map((l) => ({ price: parseFloat(String(l.price)), size: parseFloat(String(l.size)) })),
+        feeRateBps || DEFAULT_FEE_RATE_BPS,
+      );
+    } catch {
+      return null;
+    }
+  }
+
   // ==========================================================================
   // L1: Exit ladder (KaustubhPatange/polymarket-trade-engine simulation.ts)
   //     - Late-TP: any open position whose market price >= 0.96 is sold
@@ -1153,6 +1184,7 @@ export class BasketQuorumService {
       category: meta.category,
       entrySignal: 'resting_limit_fill',
       signalAttribution: 'resting_order',
+      simulated: this.config.dryRun,
     });
     this.trackOpenPosition(
       order.tokenId,
@@ -1240,6 +1272,70 @@ export class BasketQuorumService {
     }
   }
 
+  /**
+   * LIVE-only reconciliation of the resting book against the CLOB venue
+   * (item #2). Pulls the venue's open orders, derives per-order verdicts via
+   * the pure `reconcileLiveResting` helper, then:
+   *   - partial_fill / venue_filled_confirm → absorb the venue's matched count
+   *     into the book so PnL and the exit ladder see the true shares
+   *   - expired_cancel / venue_missing_cancel → cancel on the venue and drop
+   *     from the book (never assume a fill)
+   * DRY_RUN is untouched (simulated refill drives the book).
+   */
+  private async reconcileLiveRestingOrders(): Promise<void> {
+    const open = this.restingBook.openOrders();
+    if (open.length === 0) return;
+    let venueOrders: import('./trading-service.js').Order[] = [];
+    try {
+      venueOrders = await this.tradingService.getOpenOrders();
+    } catch (err) {
+      console.warn('[BasketQuorum][resting] getOpenOrders failed (skipping reconcile):', err instanceof Error ? err.message : err);
+      return;
+    }
+    const venueByToken = new Map(venueOrders.map((o) => [o.id, o]));
+    const venueMapped: LiveVenueOrder[] = venueOrders.map((o) => ({
+      id: o.id,
+      filledShares: o.filledSize,
+      originalSize: o.originalSize,
+      status: o.status,
+      isOpen: !(o.status === 'FILLED' || o.status === 'CANCELLED' || o.status === 'CANCELED'),
+    }));
+    const verdicts = reconcileLiveResting({ bookOrders: open, venueOrders: venueMapped });
+    for (const { orderId, verdict } of verdicts) {
+      const order = this.restingBook.snapshot().find((o) => o.id === orderId);
+      if (!order) continue;
+      switch (verdict.action) {
+        case 'partial_fill':
+        case 'venue_filled_confirm': {
+          const venue = venueByToken.get(orderId);
+          const matched = verdict.filledShares ?? venue?.filledSize ?? 0;
+          console.log(`[BasketQuorum][resting] reconcile: ${orderId} ${verdict.action} — venue matched ${matched.toFixed(2)} (book ${(order.filledShares ?? 0).toFixed(2)})`);
+          // Absorb the venue-confirmed match into the book (fills/partial fills).
+          const fullyFilled = this.restingBook.close(orderId, matched);
+          if (fullyFilled) {
+            console.log(`[BasketQuorum][resting] reconcile: ${orderId} closed as filled @ ${matched.toFixed(2)}`);
+          }
+          break;
+        }
+        case 'expired_cancel':
+        case 'venue_missing_cancel': {
+          console.warn(`[BasketQuorum][resting] reconcile: ${orderId} ${verdict.action} — ${verdict.reason}`);
+          // Cancel on the venue (best-effort) then drop from the book.
+          try {
+            if (venueByToken.has(orderId)) await this.tradingService.cancelOrder(orderId);
+          } catch (err) {
+            console.warn(`[BasketQuorum][resting] cancel ${orderId} failed:`, err instanceof Error ? err.message : err);
+          }
+          this.restingBook.cancel(orderId);
+          break;
+        }
+        case 'open_match':
+          break;
+      }
+    }
+    try { this.onRestingSnapshot?.(this.restingBook.snapshot()); } catch { /* non-fatal */ }
+  }
+
   startExitLadder(): void {
     if (this.exitTimer) return;
     if (!this.onRestingFill) {
@@ -1256,6 +1352,13 @@ export class BasketQuorumService {
       this.runRestingRefill().catch((err) => {
         console.warn('[BasketQuorum][resting] refill error:', err instanceof Error ? err.message : err);
       });
+      // Item #2 (LIVE): reconcile the resting book against the venue so
+      // partial fills are absorbed and stale/expired orders are cancelled.
+      if (!this.config.dryRun) {
+        this.reconcileLiveRestingOrders().catch((err) => {
+          console.warn('[BasketQuorum][resting] live reconcile error:', err instanceof Error ? err.message : err);
+        });
+      }
     }, 15_000);
     console.log(`[BasketQuorum][exit] ladder started (15s interval${this.config.dryRun ? ', DRY-RUN simulation' : ''})`);
   }
@@ -1325,6 +1428,41 @@ export class BasketQuorumService {
         // price the exit" from "decided to hold" (audit: 13 positions, zero
         // [exit] lines). Count/log it and record an audit event instead.
         if (!book || book.bids.length === 0) {
+          // Paper-only exit-liquidity fallback: a long position whose own token
+          // has no live bid would otherwise sit open forever (`exit_liquidity_blocked`,
+          // 550×/window in prod, 91/92 positions never settling → streak stuck).
+          // Selling YES ≡ buying NO at (1 − P), so price the paper exit via the
+          // complement (NO) side's best ask. LIVE never uses this synthetic price.
+          if (this.config.dryRun) {
+            const compPrice = await this.tryComplementExit(pos, tokenId);
+            if (compPrice !== null && compPrice > 0) {
+              console.log(
+                `[BasketQuorum][exit] DRY RUN SYNTH_EXIT (complement) ${pos.marketSlug} ` +
+                `${pos.outcome}: entry=${pos.entryPrice.toFixed(3)} synthBid=${compPrice.toFixed(3)} ` +
+                `size=${pos.size.toFixed(1)} pnl=$${((compPrice - pos.entryPrice) * pos.size).toFixed(2)}`
+              );
+              signalAuditStore.appendJsonl('exit_simulated', {
+                tokenId, conditionId: pos.conditionId, marketSlug: pos.marketSlug,
+                outcome: pos.outcome, entryPrice: pos.entryPrice, exitPrice: compPrice,
+                size: pos.size, pnl: (compPrice - pos.entryPrice) * pos.size,
+                reason: 'SYNTH_EXIT', synthetic: true, firedAt: pos.firedAt, ts: Date.now(),
+              });
+              const pnl = (compPrice - pos.entryPrice) * pos.size;
+              this.recordSettledTrade(pnl, Date.now(), 'SELL');
+              try {
+                this.posMachine.apply(tokenId, { type: 'EXIT', shares: pos.size, reason: 'synth_exit', time: Date.now() });
+                this.posMachine.apply(tokenId, { type: 'FILL', shares: pos.size, state: 'full' });
+              } catch (e) {
+                console.warn('[BasketQuorum][exit] posMachine synth-exit failed:', e instanceof Error ? e.message : e);
+              }
+              signalAuditStore.markExited(pos.conditionId, compPrice, 'SYNTH_EXIT', pos.outcome);
+              this.openPositions.delete(tokenId);
+              const spent = this.basketSpend.get(pos.basketCategory) ?? 0;
+              this.basketSpend.set(pos.basketCategory, Math.max(0, spent - pos.usdc));
+              try { this.onPositionsSnapshot?.(this.getOpenPositionRecords()); } catch { /* non-fatal */ }
+              continue;
+            }
+          }
           this.stats.exitLiquidityBlocked = (this.stats.exitLiquidityBlocked ?? 0) + 1;
           console.warn(`[BasketQuorum][exit] exit_liquidity_blocked ${pos.marketSlug} (${tokenId}): no live bid`);
           signalAuditStore.appendJsonl('exit_liquidity_blocked', {
