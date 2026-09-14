@@ -360,7 +360,7 @@ function displayStatus(runtime: PolylandRuntime) {
   }
   lines.push(e.signalsSettled > 0 ? `[edge] exp=${e.meanExpectedEdge.toFixed(4)} real=${e.meanRealizedEdge.toFixed(4)} alpha=${e.edgeAlpha.toFixed(4)} sig=${e.isSignificant} (n=${e.signalsSettled} settled/${e.signalsFired} fired) paperPnl=$${(e.paperSettledPnL ?? 0).toFixed(2)} livePnl=$${(e.liveSettledPnL ?? 0).toFixed(2)}` : `[edge] no settled signals yet (fired=${e.signalsFired}) paperPnl=$${(e.paperSettledPnL ?? 0).toFixed(2)} livePnl=$${(e.liveSettledPnL ?? 0).toFixed(2)}`);
     lines.push(runtime.goLiveStatusLine());
-    lines.push(`[risk] daily=${(snapshot.dailyPnL / CONFIG.capital.totalUsd * 100).toFixed(1)}% monthly=${(snapshot.monthlyPnL / CONFIG.capital.totalUsd * 100).toFixed(1)}% drawdown=${(snapshot.currentDrawdown * 100).toFixed(1)}% streak=${snapshot.consecutiveLosses}L/${snapshot.consecutiveWins}W`);
+    lines.push(`[risk] daily=${(snapshot.dailyPnL / CONFIG.capital.totalUsd * 100).toFixed(1)}% monthly=${(snapshot.monthlyPnL / CONFIG.capital.totalUsd * 100).toFixed(1)}% drawdown=${(snapshot.currentDrawdown * 100).toFixed(1)}% streak=${snapshot.consecutiveLosses}L/${snapshot.consecutiveWins}W total=${snapshot.totalLosses}L/${snapshot.totalWins}W/${snapshot.scratchTrades}S`);
   console.log(lines.join('\n'));
 }
 // ============================================================================

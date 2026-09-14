@@ -33,6 +33,7 @@
 
 import * as fs from 'node:fs';
 import type { StateStore } from './state-store.js';
+import { updateStreak } from '../utils/streak.js';
 
 // ============================================================================
 // Config
@@ -185,10 +186,13 @@ export interface RiskSnapshot {
   currentPositionPct: number;      // base * multiplier, clamped
 
   // Stats
-  totalTrades: number;
-  consecutiveLosses: number;
-  consecutiveWins: number;
-}
+    totalTrades: number;
+    consecutiveLosses: number;
+    consecutiveWins: number;
+    totalWins: number;
+    totalLosses: number;
+    scratchTrades: number;
+  }
 
 
 // ============================================================================
@@ -230,6 +234,9 @@ export class RiskManager {
   private _peakCapital: number;
   private _consecutiveLosses = 0;
   private _consecutiveWins = 0;
+  private _totalWins = 0;
+  private _totalLosses = 0;
+  private _scratchTrades = 0;
   private _sizeMultiplier = 1.0;
   private _haltedUntilMs: number | null = null;
   /** Expiring market/category/wallet locks, keyed by `${scope}:${key}`. */
@@ -302,7 +309,10 @@ export class RiskManager {
         return;
       }
       this._consecutiveLosses = raw.consecutiveLosses ?? 0;
-      this._consecutiveWins = 0;
+            this._consecutiveWins = 0;
+            this._totalWins = typeof raw.totalWins === 'number' ? raw.totalWins : 0;
+            this._totalLosses = typeof raw.totalLosses === 'number' ? raw.totalLosses : 0;
+            this._scratchTrades = typeof raw.scratchTrades === 'number' ? raw.scratchTrades : 0;
       this._sizeMultiplier = typeof raw.sizeMultiplier === 'number' ? raw.sizeMultiplier : 1.0;
       this._haltedUntilMs = typeof raw.haltedUntilMs === 'number' ? raw.haltedUntilMs : null;
 
@@ -372,9 +382,12 @@ export class RiskManager {
       const payload = JSON.stringify({
         savedAt: Date.now(),
         realizedPnl: this._realizedPnl,
-        peakCapital: this._peakCapital,
-        consecutiveLosses: this._consecutiveLosses,
-        sizeMultiplier: this._sizeMultiplier,
+                peakCapital: this._peakCapital,
+                consecutiveLosses: this._consecutiveLosses,
+                totalWins: this._totalWins,
+                totalLosses: this._totalLosses,
+                scratchTrades: this._scratchTrades,
+                sizeMultiplier: this._sizeMultiplier,
         haltedUntilMs: this._haltedUntilMs,
         // Trade history — the DAILY/MONTHLY halt windows depend on it.
         trades: this.trades.slice(-20_000),
@@ -495,16 +508,16 @@ export class RiskManager {
     const current = this.currentCapital();
     if (current > this._peakCapital) this._peakCapital = current;
 
-    // Update streak
-    if (t.pnlUsd < 0) {
-      this._consecutiveLosses++;
-      this._consecutiveWins = 0;
-    } else if (t.pnlUsd > 0) {
-      this._consecutiveWins++;
-      this._consecutiveLosses = 0;
-    } else {
-      // scratch trade: doesn't break streaks but doesn't grow them either
-    }
+    // Update streak + cumulative tally (shared semantics with runtime snapshot).
+        // updateStreak returns a new state set; reassign the fields back.
+        {
+          const s = updateStreak({ consecutiveLosses: this._consecutiveLosses, consecutiveWins: this._consecutiveWins, totalWins: this._totalWins, totalLosses: this._totalLosses, scratchTrades: this._scratchTrades }, t.pnlUsd);
+          this._consecutiveLosses = s.consecutiveLosses;
+          this._consecutiveWins = s.consecutiveWins;
+          this._totalWins = s.totalWins;
+          this._totalLosses = s.totalLosses;
+          this._scratchTrades = s.scratchTrades;
+        }
 
     // Incremental windowed P&L (O(1) amortized; no full rescans).
     // Add the new trade before eviction so an out-of-window trade cannot be
@@ -664,9 +677,12 @@ export class RiskManager {
       sizeMultiplier: this._sizeMultiplier,
       currentPositionPct: this.config.basePositionPct * this._sizeMultiplier,
       totalTrades: this.trades.length,
-      consecutiveLosses: this._consecutiveLosses,
-      consecutiveWins: this._consecutiveWins,
-    };
+            consecutiveLosses: this._consecutiveLosses,
+            consecutiveWins: this._consecutiveWins,
+            totalWins: this._totalWins,
+            totalLosses: this._totalLosses,
+            scratchTrades: this._scratchTrades,
+          };
   }
 
   /** Current capital = starting + realized P&L. */

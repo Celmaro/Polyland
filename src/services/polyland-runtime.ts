@@ -16,6 +16,7 @@ import { BasketWalletManager, evaluateRebalance, computeBasketOverlapHealth, typ
 import { WalletIngestor, type WalletRecord } from './wallet-ingestion.js';
 import { buildHeartbeatPayload, evaluateStartupStall } from './platform-heartbeat.js';
 import type { OrderLifecycleRecord } from './state-store.js';
+import { updateStreak } from '../utils/streak.js';
 import { GammaResolutionPoller } from './gamma-resolution-poller.js';
 import type { SmartMoneyTrade } from './smart-money-service.js';
 import { TradeDetector, FileSeenTradeLedger } from './trade-detector.js';
@@ -34,7 +35,7 @@ export interface PolylandRuntimeConfig {
   basketRisk?: import('./basket-risk.js').BasketRiskConfig;
   paperExploration?: boolean;
 }
-export interface RuntimeStateSnapshot { startTime: number; dailyPnL: number; totalPnL: number; monthlyPnL: number; consecutiveLosses: number; consecutiveWins: number; currentCapital: number; peakCapital: number; currentDrawdown: number; permanentlyHalted: boolean; isPaused: boolean; reconciled: boolean; }
+export interface RuntimeStateSnapshot { startTime: number; dailyPnL: number; totalPnL: number; monthlyPnL: number; consecutiveLosses: number; consecutiveWins: number; totalWins: number; totalLosses: number; scratchTrades: number; currentCapital: number; peakCapital: number; currentDrawdown: number; permanentlyHalted: boolean; isPaused: boolean; reconciled: boolean; }
 type ScreeningConfig = Record<string, unknown>;
 export class PolylandRuntime {
   private quorum: BasketQuorumService | null = null;
@@ -61,7 +62,7 @@ export class PolylandRuntime {
   private readonly startedAt = Date.now();
   private readonly snapshot: RuntimeStateSnapshot;
   constructor(private readonly sdk: PolymarketSDK, private readonly config: PolylandRuntimeConfig, private readonly screeningConfig: ScreeningConfig, private readonly quorumConfig: BasketQuorumConfig, private readonly onSettledTrade?: (pnl: number) => void) {
-    this.snapshot = { startTime: this.startedAt, dailyPnL: 0, totalPnL: 0, monthlyPnL: 0, consecutiveLosses: 0, consecutiveWins: 0, currentCapital: config.capital.totalUsd, peakCapital: config.capital.totalUsd, currentDrawdown: 0, permanentlyHalted: false, isPaused: false, reconciled: false };
+    this.snapshot = { startTime: this.startedAt, dailyPnL: 0, totalPnL: 0, monthlyPnL: 0, consecutiveLosses: 0, consecutiveWins: 0, totalWins: 0, totalLosses: 0, scratchTrades: 0, currentCapital: config.capital.totalUsd, peakCapital: config.capital.totalUsd, currentDrawdown: 0, permanentlyHalted: false, isPaused: false, reconciled: false };
   }
   async start(): Promise<void> {
     if (!this.config.smartMoney.enabled) return;
@@ -303,7 +304,7 @@ export class PolylandRuntime {
     setBonferroniGroups(this.quorum.getBasketCount()); await mkdir('./data', { recursive: true }); await writeFile('./data/wallet-screening.json', JSON.stringify({ savedAt: Date.now(), cacheKey: key, screened }), 'utf8').catch(() => undefined); await this.stateStore?.save({ walletUniverse: screened }); }
   private scheduleRefresh(delay: number, ingestion: WalletIngestionService, screening: WalletScreeningService, key: string): void { this.refreshTimer = setTimeout(async () => { if (!this.refreshing) { this.refreshing = true; try { const candidates = await ingestion.collect(); const screened = await screening.score(candidates); const nextKey = JSON.stringify({ version: 1, candidates: candidates.map(c => ({ address: c.address, source: c.source, autoRank: c.autoRank })).sort((a,b) => a.address.localeCompare(b.address)), config: this.screeningConfig }); await this.seed(screened, nextKey); } catch (e) { console.warn('[PolylandRuntime] screening refresh failed:', e instanceof Error ? e.message : e); } finally { this.refreshing = false; } } this.scheduleRefresh(21600000, ingestion, screening, key); }, delay); }
   /** Mutate the P&L/streak snapshot for one settled trade (no callback). */
-  private applySettled(pnl: number): void { const s = this.snapshot; s.totalPnL += pnl; s.dailyPnL += pnl; s.monthlyPnL += pnl; if (pnl < 0) { s.consecutiveLosses++; s.consecutiveWins = 0; } else { s.consecutiveWins++; s.consecutiveLosses = 0; } s.currentCapital = this.config.capital.totalUsd + s.totalPnL; s.peakCapital = Math.max(s.peakCapital, s.currentCapital); s.currentDrawdown = (s.peakCapital - s.currentCapital) / s.peakCapital; }
+  private applySettled(pnl: number): void { const s = this.snapshot; s.totalPnL += pnl; s.dailyPnL += pnl; s.monthlyPnL += pnl; updateStreak(s, pnl); s.currentCapital = this.config.capital.totalUsd + s.totalPnL; s.peakCapital = Math.max(s.peakCapital, s.currentCapital); s.currentDrawdown = (s.peakCapital - s.currentCapital) / s.peakCapital; }
   private recordSettled(pnl: number): void { this.applySettled(pnl); this.onSettledTrade?.(pnl); }
   /**
    * Reconcile the runtime P&L/streak snapshot with the replayed audit trail on
@@ -317,7 +318,7 @@ export class PolylandRuntime {
   private rebuildSnapshotFromAudit(): void {
       const s = this.snapshot;
       s.startTime = this.startedAt; s.dailyPnL = 0; s.totalPnL = 0; s.monthlyPnL = 0;
-      s.consecutiveLosses = 0; s.consecutiveWins = 0;
+      s.consecutiveLosses = 0; s.consecutiveWins = 0; s.totalWins = 0; s.totalLosses = 0; s.scratchTrades = 0;
       s.currentCapital = this.config.capital.totalUsd;
       s.peakCapital = this.config.capital.totalUsd; s.currentDrawdown = 0;
       s.permanentlyHalted = false; s.isPaused = false;
